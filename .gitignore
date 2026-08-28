@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+np560-web-qemu.log
+
+# Local firmware inputs and emulator runtime artifacts.
+/NP560+V3.80版系统升级程序/
+/tmp/
+
+# Maintained as its own Git repository.
+/qemu-dmcu/
