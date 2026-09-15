@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NP560+ QEMU</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="app-shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">NOAH NP560+ / QEMU</p>
+        <h1>网络学习机</h1>
+      </div>
+      <div class="run-state"><span id="status-dot"></span><span id="status">连接中</span></div>
+      <div class="run-controls" aria-label="模拟器运行控制">
+        <button type="button" data-action="resume">运行</button>
+        <button type="button" data-action="pause">暂停</button>
+        <button type="button" data-action="reset">复位</button>
+      </div>
+      <div class="audio-controls">
+        <button type="button" id="audio-toggle" aria-pressed="false">启用声音</button>
+        <span id="audio-status" role="status">声音未启用</span>
+      </div>
+    </header>
+
+    <section class="device" aria-label="NP560+ 虚拟设备">
+      <div class="screen-bezel">
+        <div class="screen-header"><span>240 × 120 + 段码 · ST7529 硬件 LCD</span><span id="frame-address">CMD F00001 · DATA F00003</span></div>
+        <canvas id="lcd" width="240" height="132" role="img" aria-label="NP560+ LCD 主画面与玻璃段码状态栏"></canvas>
+        <div class="screen-footer">
+          <label for="backlight">背光</label>
+          <input id="backlight" type="range" min="0" max="2" value="2" step="1">
+          <span id="fps">0 fps</span>
+        </div>
+      </div>
+
+      <div class="input-deck">
+        <div class="input-deck-heading">
+          <h2>实体按键（已恢复映射）</h2>
+          <p>Home 是原厂主界面/开始键：学习页可切到开始菜单，其它页面可能先返回学习页。按住时保持真实矩阵电平。</p>
+        </div>
+        <div class="softkeys" aria-label="功能键">
+          <button type="button" data-key="F1">F1</button><button type="button" data-key="F2">F2</button>
+          <button type="button" data-key="F3">F3</button><button type="button" data-key="F4">F4</button>
+          <button type="button" data-key="StartMenu" title="对应 Home；由原厂程序决定返回主界面或切换开始菜单">主界面 / 开始</button>
+        </div>
+        <div class="navigation" aria-label="五维导航键">
+          <button type="button" data-key="ArrowUp" class="up">▲</button>
+          <button type="button" data-key="ArrowLeft" class="left">◀</button>
+          <button type="button" data-key="Enter" class="enter">确认</button>
+          <button type="button" data-key="ArrowRight" class="right">▶</button>
+          <button type="button" data-key="ArrowDown" class="down">▼</button>
+        </div>
+        <div id="keyboard" class="keyboard" aria-label="仿真键盘"></div>
+        <p class="unmapped-note">只启用已由 V3.80 事件表确认的实体键；照片中其余侧键仍标记为未映射，不会向 guest 发送事件。</p>
+      </div>
+    </section>
+
+    <details class="debug-panel" open>
+      <summary>LCD 与调试</summary>
+      <div class="debug-grid">
+        <form id="frame-settings" class="settings">
+          <label>画面来源
+            <select id="source"><option value="lcd">ST7529 控制器</option><option value="memory">物理内存诊断</option></select>
+          </label>
+          <label class="memory-setting" hidden>物理基址 <input id="base" value="0xEF0000" inputmode="text"></label>
+          <label class="memory-setting" hidden>像素格式
+            <select id="bpp"><option value="1">1 bpp</option><option value="2">2 bpp</option><option value="4">4 bpp</option><option value="8">8 bpp</option></select>
+          </label>
+          <label class="memory-setting" hidden>步幅（字节） <input id="stride" value="0" inputmode="numeric"></label>
+          <label class="check"><input id="invert" type="checkbox">反色</label>
+          <div class="scan-buttons memory-setting" hidden>
+            <button type="button" id="page-back">− 0x1000</button>
+            <button type="submit">应用</button>
+            <button type="button" id="page-next">+ 0x1000</button>
+          </div>
+          <div class="scan-buttons">
+            <button type="button" id="save-nand" disabled>保存 NAND</button>
+            <span id="nand-save-state">NAND 保存未启用</span>
+          </div>
+          <p id="rom-identity" class="rom-identity">SoC ROM：等待连接…</p>
+          <p id="device-identity" class="rom-identity">设备：等待连接…</p>
+          <p>默认读取 ST7529 内部显示 RAM；物理内存模式仅用于检查显式启用的 ROM-HLE 诊断位图。</p>
+        </form>
+        <div>
+          <pre id="lcd-state" aria-label="ST7529 状态">等待 LCD…</pre>
+          <pre id="registers" aria-label="DMCU 寄存器">等待 QEMU…</pre>
+        </div>
+      </div>
+    </details>
+  </main>
+  <script src="keyboard_input.js"></script>
+  <script src="audio_output.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

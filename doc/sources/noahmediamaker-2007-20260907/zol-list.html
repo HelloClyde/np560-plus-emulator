@@ -1,0 +1,837 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="gbk" />
+<meta name="applicable-device" content="pc">
+<meta http-equiv="Cache-Control" content="no-siteapp"/>
+<meta http-equiv="Cache-Control" content="no-transform"/>
+<meta http-equiv="X-UA-Compatible" content="IE=EmulateIE7" />
+   
+<meta name="referrer" content="unsafe-url"> <title>免费多媒体(音视频|多媒体播放器) 第226页-ZOL软件下载</title>
+            <meta name="keywords" content="多媒体,音视频|多媒体播放器" />
+            <meta name="description" content="多媒体下载提供音视频|多媒体播放器等相关下载软件，多媒体用户热评软件排行，新鲜软件排行等向您推荐最受关注和最新的多媒体工具。更多多媒体尽在中关村在线下载频道。" /><link href="//s.zol-img.com.cn/d/Xiazai/Xiazai_Category.css?v=13514" rel="stylesheet" type="text/css" />
+<link href="https://icon.zol-img.com.cn/xiazai/css/compare.css" rel="stylesheet" type="text/css" />
+<script src="https://p.zol-img.com.cn/download/download_sub.js"></script>
+
+<link href="https://icon.zol-img.com.cn/src/open-components/down-detail-mol/z.component.down-list-search.1.0.0.css" rel="stylesheet">
+
+</head>
+<body> 
+<!-- site-nav -->
+<script type="text/javascript" src="https://icon.zol-img.com.cn/sj/js/webHeadNew.js"></script>
+<link type="text/css" href="https://icon.zol-img.com.cn/sj/css/webHead.css" rel="stylesheet" />
+<link href="https://icon.zol-img.com.cn/cms/css/channel-public-nav_980.css" rel="stylesheet" />
+<link href="https://icon.zol-img.com.cn/xiazai/css/publicmenu.css" rel="stylesheet" />
+<!-- header -->
+<style>
+.anniversary20 {float: left;width: 50px;height: 36px;margin: -6px 0 0 10px;background: url(https://icon.zol-img.com.cn/xiazai/logo/anniversary.png) no-repeat center;}
+.anniversary-home .logo-mall {float: left;width: 114px;height: 38px;padding-left: 10px;margin: 40px 0 0 10px;overflow: hidden;border-left: 1px solid #e6e6e6;}
+</style>
+<div class="container" style="background: url('') no-repeat center 100px;">
+<div class="header clearfix" style="z-index: 999;">
+	<div class="logo-box">
+        <a class="logo" href="//xiazai.zol.com.cn/">
+          <img src="https://icon.zol-img.com.cn/mainpage/2019logo/logo-rjxz.png" width="214" height="32" alt="ZOL软件下载">
+        </a>
+    </div>
+	<div class="sub-links"><span></span>
+        <a href="//xiazai.zol.com.cn/detail/43/428274.shtml" target="_blank"  title="QQ2024">QQ2024</a><a href="//xiazai.zol.com.cn/detail/43/428288.shtml" target="_blank"  title="微信">微信</a>    </div>
+    
+	<div class="searchbox">
+		<form  action="//xiazai.zol.com.cn/search" target="_blank">
+			<div class="stext">
+				<input id="softSearch"   type="text" name="wd" autocomplete="off" placeholder="请输入软件名称" />
+			</div>
+            <input  type="hidden" name="type" value="1" />
+	    <input type="hidden" name="workType" value="1">
+			<input class="sbtn" type="submit" value="搜索" />
+		</form>
+        <div class="result" id="result">
+        </div>
+	</div>
+</div>
+<script type="text/javascript">
+    if (window.jQuery)
+    {
+        $('#softSearch').on('click',function () {
+            upperCase(this)
+        })
+        $('body').on('click', function (e) {
+            if ($(e.target).closest('.searchbox').get(0) != $('.searchbox').get(0) ) {
+                $('#result').html('')
+            }
+        })
+        $('#softSearch').on('keyup',function () {
+            upperCase(this)
+        })
+    }
+
+    function upperCase(obj){
+        var softName = '';
+        var keyword = obj.value==='' ? softName : obj.value;
+        var resultbox = $('#result');
+        if(keyword!=''){
+            $.ajax({
+                type : "get",
+                url : "/index.php?c=Ajax_Search&a=GetRelSoft&keyword="+encodeURI(keyword),
+                success : function(data) {
+                    var data = JSON.parse(data);
+                    if(data){
+                        resultbox.css('display','block');
+                        var str = '<ul>';
+                        for (var i=0; i<data.length; i++){
+                            var url = "https://xiazai.zol.com.cn/detail/"+Math.ceil(data[i]['id']/10000)+"/"+data[i]['id']+".shtml";
+                            var downUrl = mainUrl + '&pos=downloader_search&flag=1&rand=' + (~~(Math.random() * (1 << 24))).toString(16);
+                            str += '<li class="item no-pic" >';
+                            str += '<a href="'+url+'" target="_blank" class="title" onclick=zol_niux_tongji("xiazai_zs_search_title")>'+data[i]['name']+'</a>   <a class="down" href="'+downUrl+'" onclick=zol_niux_tongji("xiazai_zs_search_downbutton")><i></i>下载</a>';
+                            str += '</li>';
+                        }
+                        str += '</ul>';
+                        resultbox.html(str);
+                    }
+                },
+                error : function(e){
+                    console.log(e)
+                }
+            });
+        }else{
+            resultbox.css('display','none');
+        }
+    }
+
+</script>
+<!-- //header -->
+<!-- navbox -->
+<div class="nav-box" style="z-index: 100;">
+	<div class="nav-inner clearfix">
+		<ul id="J_MainNav" class="nav"> 
+					<li><a href="//xiazai.zol.com.cn/" target="_self">下载首页</a></li>
+			<li><a href="/word_index.html" target="_self" class="home">软件分类</a></li> 
+			<li><a href="/cy.html" target="_blank">装机必备</a></li>
+			<li></li>
+			<li class="trigger">
+				<a href="//sj.zol.com.cn/" target="_blank">手机软件<i class="icon-more"></i></a>
+				<ul class="nav-list menu-5 column-3">
+					<li><a href="//sj.zol.com.cn/series/list114_1_1.html" target="_blank">直播</a></li>
+					<li><a href="//sj.zol.com.cn/series/list72_1_1.html" target="_blank">影音</a></li>
+					<li><a href="//sj.zol.com.cn/series/list107_1_1.html" target="_blank">电子书</a></li>
+					<li><a href="//sj.zol.com.cn/series/list80_1_1.html" target="_blank">社交</a></li>
+					<li><a href="//sj.zol.com.cn/series/list108_1_1.html" target="_blank">刷机</a></li>
+					<li><a href="//sj.zol.com.cn/series/list115_1_1.html" target="_blank">浏览器</a></li>
+					<li><a href="//sj.zol.com.cn/series/list109_1_1.html" target="_blank">健身</a></li>
+					<li><a href="//sj.zol.com.cn/series/list85_1_1.html" target="_blank">理财</a></li>
+					<li><a href="//sj.zol.com.cn/series/list76_1_1.html" target="_blank">工具</a></li>
+					<li><a href="//sj.zol.com.cn/series/list74_1_1.html" target="_blank">安全</a></li>
+					<li><a href="//sj.zol.com.cn/series/list79_1_1.html" target="_blank">娱乐</a></li>
+					<!--<li><a href="//sj.zol.com.cn/series/list69_1_1.html" target="_blank">文件</a></li>-->
+					<li><a href="//vrdown.zol.com.cn/" target="_blank">VR</a></li>
+				</ul>
+			</li>
+			<li>
+				<a href="//driver.zol.com.cn/" target="_blank">驱动下载</a>
+			</li>
+			
+<!--			<li class="trigger">-->
+<!--				<a href="//desk.zol.com.cn/" target="_blank">桌面壁纸<i class="icon-more"></i></a>-->
+<!--				<ul class="nav-list menu-6 column-4">-->
+<!--					<li><a href="//desk.zol.com.cn/fengjing/" target="_blank">风景壁纸</a></li>-->
+<!--					<li><a href="//desk.zol.com.cn/dongman/" target="_blank">动漫壁纸</a></li>-->
+<!--					<li><a href="//desk.zol.com.cn/meinv/" target="_blank">美女壁纸</a></li>-->
+<!--					<li><a href="//desk.zol.com.cn/nb/" target="_blank">笔记本壁纸</a></li>-->
+<!--					<li><a href="//xiaohua.zol.com.cn/" target="_blank">笑话大全</a></li>-->
+<!--				</ul>-->
+<!--			</li>-->
+            <li class="trigger">
+				<a href="//soft.zol.com.cn/" target="_blank">软件资讯<i class="icon-more"></i></a>
+				<ul class="nav-list menu-6 column-4">
+				    <li><a href="//xiazai.zol.com.cn/jiqiao/p_1.shtml" target="_blank">软件技巧</a></li>
+					<li><a href="//soft.zol.com.cn/school/" target="_blank">网络学院</a></li>
+					</li><li><a href="//soft.zol.com.cn/topic/5317672.html" target="_blank">Win10频道</a></li>
+                    <li><a href="//xiaohua.zol.com.cn/" target="_blank">笑话大全</a></li>
+                </ul>
+			</li>
+		</ul>
+		<div class="other-channel"><a href="//xiazai.zol.com.cn/renew/all_1.html" target="_blank">今日更新</a><a href="//xiazai.zol.com.cn/author/" target="_blank">软件发布</a></div>
+	</div>
+</div>
+<!-- //navbox --><!-- //site-nav -->
+
+<!-- location -->
+<div class="wrapper location clearfix"> 
+        <a style="cursor: pointer;" class="collect" target="_blank" id="myXiazaiCenter" rel="nofollow"></a>
+    <a href="//xiazai.zol.com.cn/">下载首页</a><i> &gt; </i><a href="/word_index.html">软件分类</a><i> &gt; </i><h1>多媒体</h1></div>
+<!-- //location --> 
+
+<!-- wrapper -->
+<div class="wrapper clearfix" id="cateInfo" cateName="media" order="free">
+	<!-- aside -->
+	<div class="aside list-aside"> 
+		<!-- classification -->
+		<div class="section classification">
+			<div class="section-header">
+				<a class="morelink" href="//xiazai.zol.com.cn/word_index.html">全部&raquo;</a>
+				<h3>软件分类</h3>
+			</div>
+			<!-- classification-items -->
+			<div class="classification-items">
+				<ul class="items-list detail-items-list"> 
+					<li class="item">
+                                                <h3 class="current"><a href="/download_cate_media/media_page_1.html"><span>多媒体</span><em>(23458)</em></a></h3>
+						<ul class="down-links-box clearfix"> 
+                            <li ><a href='/netmovie_soft_index/netmovie_page_1.html' title='网络电视'><span>网络电视<em>(370)</em></span></a></li><li ><a href='/zhibo_soft_index/zhibo_page_1.html' title='直播软件'><span>直播软件<em>(174)</em></span></a></li><li ><a href='/mediaplay_soft_index/mediaplay_page_1.html' title='视频播放'><span>视频播放<em>(1766)</em></span></a></li><li ><a href='/mediaconvert_soft_index/mediaconvert_page_1.html' title='视频格式'><span>视频格式<em>(9221)</em></span></a></li><li ><a href='/audioplayer_soft_index/audioplayer_page_1.html' title='音乐播放'><span>音乐播放<em>(862)</em></span></a></li><li ><a href='/audioconvert_soft_index/audioconvert_page_1.html' title='音频转换'><span>音频转换<em>(802)</em></span></a></li><li ><a href='/audio_soft_index/audio_page_1.html' title='音频处理'><span>音频处理<em>(2636)</em></span></a></li><li ><a href='/videomaker_soft_index/videomaker_page_1.html' title='视频编辑'><span>视频编辑<em>(1775)</em></span></a></li><li ><a href='/radio_soft_index/radio_page_1.html' title='网络电台'><span>网络电台<em>(34)</em></span></a></li><li ><a href='/mediamake_soft_index/mediamake_page_1.html' title='K歌软件'><span>K歌软件<em>(214)</em></span></a></li><li ><a href='/reading_soft_index/reading_page_1.html' title='阅读软件'><span>阅读软件<em>(1798)</em></span></a></li><li ><a href='/pdftools_soft_index/pdftools_page_1.html' title='PDF软件'><span>PDF软件<em>(1168)</em></span></a></li><li ><a href='/writer_soft_index/writer_page_1.html' title='文字处理'><span>文字处理<em>(2125)</em></span></a></li><li ><a href='/moviecapture_soft_index/moviecapture_page_1.html' title='录屏软件'><span>录屏软件<em>(513)</em></span></a></li>						</ul>
+					</li> 
+				</ul>
+			</div>
+			<!-- //classification-items -->
+		</div>
+		<!-- //classification -->
+
+                <div class="section">
+			<div style="width: 180px;margin:0 auto;">
+    			<script type="text/javascript">
+    				write_ad("xiazai_list_aside_bottom");
+    			</script>
+			</div>
+		</div>
+		<!-- section -->
+        		<div class="section">
+			<div class="section-header"> 
+				<h3>热门软件推荐</h3>
+			</div> 
+			<ul class="news-list">
+                <li><a target='_blank' href='/detail/5/45793.shtml' title='紫光华宇拼音输入法官方下载'>紫光华宇拼音输入法官方下载</a></li><li><a target='_blank' href='/detail/14/134583.shtml' title='Windows Media player12下载'>Windows Media player12下载</a></li><li><a target='_blank' href='/detail/13/122361.shtml' title='Adobe Reader XI'>Adobe Reader XI</a></li><li><a target='_blank' href='/detail/12/114617.shtml' title='Word2003'>Word2003</a></li><li><a target='_blank' href='/detail/6/50184.shtml' title='PS CS5官方下载'>PS CS5官方下载</a></li><li><a target='_blank' href='/detail/27/266066.shtml' title='瑞星杀毒软件官方下载'>瑞星杀毒软件官方下载</a></li><li><a target='_blank' href='/detail/14/131245.shtml' title='百度音乐官方下载'>百度音乐官方下载</a></li><li><a target='_blank' href='/detail/6/55072.shtml' title='比特彗星'>比特彗星</a></li><li><a target='_blank' href='/detail/9/88014.shtml' title='王码五笔输入法'>王码五笔输入法</a></li><li><a target='_blank' href='/detail/15/144230.shtml' title='风行视频下载 官方版'>风行视频下载 官方版</a></li><li><a target='_blank' href='/detail/16/154275.shtml' title='飞信下载 电脑版'>飞信下载 电脑版</a></li><li><a target='_blank' href='/detail/12/116604.shtml' title='windows优化大师官方下载'>windows优化大师官方下载</a></li><li><a target='_blank' href='/detail/11/108321.shtml' title='万能五笔输入法下载 官方最新版'>万能五笔输入法下载 官方最新版</a></li><li><a target='_blank' href='/detail/14/132013.shtml' title='鼠标指针下载'>鼠标指针下载</a></li><li><a target='_blank' href='/detail/33/322084.shtml' title='360安全浏览器下载 官方最新版'>360安全浏览器下载 官方最新版</a></li><li><a target='_blank' href='/detail/6/55225.shtml' title='nero8中文版下载'>nero8中文版下载</a></li><li><a target='_blank' href='/detail/11/102559.shtml' title='VeryCD电驴下载'>VeryCD电驴下载</a></li><li><a target='_blank' href='/detail/13/120398.shtml' title='超级兔子下载 官方版'>超级兔子下载 官方版</a></li><li><a target='_blank' href='/detail/15/149497.shtml' title='一键还原精灵官方下载'>一键还原精灵官方下载</a></li><li><a target='_blank' href='/detail/3/28319.shtml' title='豪杰DVD播放器下载'>豪杰DVD播放器下载</a></li>			</ul>
+		</div>
+        		<!-- //section -->
+        
+        <!-- section -->
+        		<div class="section">
+			<div class="section-header"> 
+                <a class="morelink" href="//xiazai.zol.com.cn/renew/all_1.html" rel="nofollow">更多&raquo;</a>
+				<h3>本类新增软件</h3>
+			</div> 
+			<ul class="news-list">
+                <li><a target='_blank' href='/detail/72/711026.shtml' title='米牛视频批量截图提取导出高清图片 2.5.1'>米牛视频批量截图提取导出高清图片 2.5.1</a></li><li><a target='_blank' href='/detail/72/711024.shtml' title='盯播直播录制助手 Lite 1.0.0'>盯播直播录制助手 Lite 1.0.0</a></li><li><a target='_blank' href='/detail/72/710988.shtml' title='极客播放器Mac版 2.0.0.2'>极客播放器Mac版 2.0.0.2</a></li><li><a target='_blank' href='/detail/72/710929.shtml' title='极客播放器 2.0.1.2'>极客播放器 2.0.1.2</a></li><li><a target='_blank' href='/detail/72/710420.shtml' title='背景音乐合成助手 5.3'>背景音乐合成助手 5.3</a></li><li><a target='_blank' href='/detail/72/710399.shtml' title='兔兔剪辑视频批量混剪工具 v6'>兔兔剪辑视频批量混剪工具 v6</a></li><li><a target='_blank' href='/detail/72/710392.shtml' title='白鲨录屏大师 1.0.0.16'>白鲨录屏大师 1.0.0.16</a></li><li><a target='_blank' href='/detail/72/710387.shtml' title='VST下载器 1.0'>VST下载器 1.0</a></li><li><a target='_blank' href='/detail/72/710389.shtml' title='T-Racks（恐龙母带） 5.0'>T-Racks（恐龙母带） 5.0</a></li><li><a target='_blank' href='/detail/72/710390.shtml' title='Snap Camera汉化版 1.38'>Snap Camera汉化版 1.38</a></li>			</ul>
+		</div>
+        		<!-- //section -->
+		
+	</div>
+	<!-- //aside -->
+	
+	<!-- main -->
+	<div class="main list-main"> 
+		<!-- soft-tabs -->
+		<div class="section soft-tabs"> 
+			<!-- tab-nav -->
+			<div class="tab-nav">
+				<ul class="main-nav clearfix"> 
+                    					<li ><a href="/download_cate_media/media_page_1.html">按人气排序</a></li>
+                    <li ><a href="/download_cate_media/media_date_1.html">按更新时间</a></li>
+					<li ><a href="/download_cate_media/media_good_1.html">好评软件</a></li>
+					<li class="current"><a href="/download_cate_media/media_free_1.html">只显示免费软件</a></li>
+					<li ><a href="/download_cate_media/media_win7_1.html">兼容win7软件</a></li>
+					<!-- <li ><a href="/download_cate_media/media_win10_1.html">兼容win10软件</a></li> -->
+					<li ><a href="/download_cate_media/media_win8_1.html">兼容win8软件</a></li>
+					
+				</ul>
+			</div>
+			<!-- //tab-nav -->
+			<!-- recommend-links -->
+			<div class="recommend-links clearfix"> 
+				<h3 style="font-size: 12px;margin-top: 5px;">多媒体热门合集</h3>
+                <a target="_blank" href="/heji/5000/">MP3格式转换器(29款)</a><a target="_blank" href="/heji/6930/">PDF阅读器(30款)</a><a target="_blank" href="/heji/17730/">电视直播软件(8款)</a><a target="_blank" href="/heji/7180/">PDF虚拟打印机(20款)</a><a target="_blank" href="/heji/5160/">DVD/VCD播放器(19款)</a><a target="_blank" href="/heji/9590/">会声会影(13款)</a><a target="_blank" href="/heji/7700/">万能播放器(9款)</a><a target="_blank" href="/heji/4030/">KTV点歌系统(18款)</a><a target="_blank" href="/heji/16100/">M4A转MP3(15款)</a><a target="_blank" href="/heji/6430/">MP4格式转换器(33款)</a><a target="_blank" href="/heji/16420/">MP4播放器(16款)</a><a target="_blank" href="/heji/4950/">影音播放器(22款)</a><a target="_blank" href="/heji/6490/">TXT阅读器(22款)</a><a target="_blank" href="/heji/6380/">视频解码器(17款)</a><a target="_blank" href="/heji/11270/">MP3音乐下载软件(12款)</a><a target="_blank" href="/heji/11420/">苹果M4R格式转换器(11款)</a><a target="_blank" href="/heji/15810/">Adobe Reader(8款)</a><a target="_blank" href="/heji/12120/">网络高清播放器(22款)</a><a target="_blank" href="/heji/3270/">音乐制作软件(23款)</a><a target="_blank" href="/heji/2650/">视频剪切器(12款)</a>			</div>
+			<!-- //recommend-links -->  
+			<!-- soft-list -->
+			<ul class="soft-list soft-list-special">
+                                <li class="item first">
+                      <a href='//xiazai.zol.com.cn/detail/48/470885.shtml' target='_blank' class='pic'><img src='https://xiazai-fd.zol-img.com.cn/t_s64x64/g2/M00/05/08/ChMlWl0R-4CIeJkfAAAD-GOhYrEAALPsQKAh_YAAAQQ858.jpg' alt='winff视频转码1.5.1' width='48' height='48'/></a>                      <div class="soft-header">
+                          <h4 class="soft-title"><a target="_blank" href="//xiazai.zol.com.cn/detail/48/470885.shtml">winff视频转码 1.5.1</a></h4>
+                      </div>
+                     
+                      <div class="soft-summary">
+                      <div class="down-btn-r">
+                          <script type="text/javascript">
+                          		var downUrl = 'https://xiazai.zol.com.cn/down.php?softid=470885&subcateid=103&site=10&checkStr=ae561c86b1bca75fb' + '&pos=downloader_list&flag=1&rand=' + (~~(Math.random() * (1 << 24))).toString(16);
+                                                            var buttonStr = '<a title="winff视频转码" target="_self" href="javascript:void(0)" class="down-linkb down-linkb-list-none">暂停下载</a>';
+                                                         	    document.write(buttonStr);
+                          </script>
+<!--                           <span class="earlier">高速下载器</span> -->
+                      </div>
+                          <div class="soft-infor clearfix">
+                              <div class="rate-box"><span class="rate-bar"><span style="width: 80%"></span></span></div>
+                              <span>大小：<em>16.76MB</em></span><span>更新时间：<em>2019-06-25</em></span><span>软件类型：<em>视频格式</em>&nbsp;<em>免费软件</em></span></div>
+                              <p class="text">很好用的一款视频转换工具，他能将很多视频格式进行转换，效率和质量都很高。WinFF 是 FFmpeg 的图形化界面。使用 WinFF，你可以快速、轻易地对视频文件进行转换。WinFF 支持转换时下流行的视频文件格式，并可针对多个视频文件进行一次...</p>
+                              <!--软件所属合集-->
+                             
+                        </div>
+                    </li>  
+                                <li class="item">
+                      <a href='//xiazai.zol.com.cn/detail/48/470886.shtml' target='_blank' class='pic'><img src='https://xiazai-fd.zol-img.com.cn/t_s64x64/g2/M00/05/08/ChMlWl0R-4iIewlKAAAD_rIGtKcAALPsQLPj1wAAAQW532.jpg' alt='诺亚舟视频转换器(NoahMediaMaker)1.07.0711' width='48' height='48'/></a>                      <div class="soft-header">
+                          <h4 class="soft-title"><a target="_blank" href="//xiazai.zol.com.cn/detail/48/470886.shtml">诺亚舟视频转换器(NoahMediaMaker) 1.07.0711</a></h4>
+                      </div>
+                     
+                      <div class="soft-summary">
+                      <div class="down-btn-r">
+                          <script type="text/javascript">
+                          		var downUrl = 'https://xiazai.zol.com.cn/down.php?softid=470886&subcateid=103&site=10&checkStr=dfc71beb7de0e8489' + '&pos=downloader_list&flag=1&rand=' + (~~(Math.random() * (1 << 24))).toString(16);
+                                                            var buttonStr = '<a target="_blank" href="https://softmgr.ludashi.com/downloader/soft/url?siteid=1008&softid=470886&softname=%E8%AF%BA%E4%BA%9A%E8%88%9F%E8%A7%86%E9%A2%91%E8%BD%AC%E6%8D%A2%E5%99%A8%28NoahMediaMaker%29&downurl=https%3A%2F%2Fdown10.zol.com.cn%2F20190605%2FNoahMediaMaker.zip&downname=NoahMediaMaker.zip&sourceid=zol" class="down-linkb down-btn-tongji "  data-weishi="" data-spe="https://softmgr.ludashi.com/downloader/soft/url?siteid=1008&softid=470886&softname=%E8%AF%BA%E4%BA%9A%E8%88%9F%E8%A7%86%E9%A2%91%E8%BD%AC%E6%8D%A2%E5%99%A8%28NoahMediaMaker%29&downurl=https%3A%2F%2Fdown10.zol.com.cn%2F20190605%2FNoahMediaMaker.zip&downname=NoahMediaMaker.zip&sourceid=zol" data-softid="470886"><div class="list-btn-text">安全下载</div><div class="referrer">使用鲁大师下载</div></a>';
+                                                         	    document.write(buttonStr);
+                          </script>
+<!--                           <span class="earlier">高速下载器</span> -->
+                      </div>
+                          <div class="soft-infor clearfix">
+                              <div class="rate-box"><span class="rate-bar"><span style="width: 80%"></span></span></div>
+                              <span>大小：<em>7.99MB</em></span><span>更新时间：<em>2019-11-04</em></span><span>软件类型：<em>视频格式</em>&nbsp;<em>免费软件</em></span></div>
+                              <p class="text">诺亚舟视频转换器(NoahMediaMaker)用于诺亚舟nwv格式转换，适用于np960。使用方法1. 打开应用程序NoahMediaMaker.exe，2. 修改转换类型为“NAVI媒体”，修改机型为“NP960”。3. 点击菜单的“设置”项的“参数设置”，出现“参数设置”...</p>
+                              <!--软件所属合集-->
+                             
+                        </div>
+                    </li>  
+                                <li class="item">
+                      <a href='//xiazai.zol.com.cn/detail/48/470948.shtml' target='_blank' class='pic'><img src='https://xiazai-fd.zol-img.com.cn/t_s64x64/g2/M00/06/07/ChMlWV0UXPeIdptZAAAJgoPTqUgAALTdgNbc1cAAAma282.png' alt='校园播音助手2.3.1' width='48' height='48'/></a>                      <div class="soft-header">
+                          <h4 class="soft-title"><a target="_blank" href="//xiazai.zol.com.cn/detail/48/470948.shtml">校园播音助手 2.3.1</a></h4>
+                      </div>
+                     
+                      <div class="soft-summary">
+                      <div class="down-btn-r">
+                          <script type="text/javascript">
+                          		var downUrl = 'https://xiazai.zol.com.cn/down.php?softid=470948&subcateid=1264&site=10&checkStr=43589613186914bd0' + '&pos=downloader_list&flag=1&rand=' + (~~(Math.random() * (1 << 24))).toString(16);
+                                                            var buttonStr = '<a title="校园播音助手" target="_self" href="javascript:void(0)" class="down-linkb down-linkb-list-none">暂停下载</a>';
+                                                         	    document.write(buttonStr);
+                          </script>
+<!--                           <span class="earlier">高速下载器</span> -->
+                      </div>
+                          <div class="soft-infor clearfix">
+                              <div class="rate-box"><span class="rate-bar"><span style="width: 80%"></span></span></div>
+                              <span>大小：<em>118.24MB</em></span><span>更新时间：<em>2019-06-27</em></span><span>软件类型：<em>音乐播放</em>&nbsp;<em>免费软件</em></span></div>
+                              <p class="text">校园播音助手顾名思义是一定时播音软件，能够根据设置的作息时间表来播放上下课铃声或是音乐古诗等，根据播放设置可以播完所有音频后自动关机，是一款非常不错的软件。...</p>
+                              <!--软件所属合集-->
+                             
+                        </div>
+                    </li>  
+                                <li class="item">
+                      <a href='//xiazai.zol.com.cn/detail/48/470959.shtml' target='_blank' class='pic'><img src='https://b.zol-img.com.cn/soft/7/936/ceSpIAZCLuwqE.jpg' alt='免费视频格式转换器(Video to Video Converter)2.9.6' width='48' height='48'/></a>                      <div class="soft-header">
+                          <h4 class="soft-title"><a target="_blank" href="//xiazai.zol.com.cn/detail/48/470959.shtml">免费视频格式转换器(Video to Video Converter) 2.9.6</a></h4>
+                      </div>
+                     
+                      <div class="soft-summary">
+                      <div class="down-btn-r">
+                          <script type="text/javascript">
+                          		var downUrl = 'https://xiazai.zol.com.cn/down.php?softid=470959&subcateid=103&site=10&checkStr=7ffdd1415eb0d661f' + '&pos=downloader_list&flag=1&rand=' + (~~(Math.random() * (1 << 24))).toString(16);
+                                                            var buttonStr = '<a target="_blank" href="https://softmgr.ludashi.com/downloader/soft/url?siteid=1008&softid=470959&softname=%E5%85%8D%E8%B4%B9%E8%A7%86%E9%A2%91%E6%A0%BC%E5%BC%8F%E8%BD%AC%E6%8D%A2%E5%99%A8%28Video+to+Video+Converter%29&downurl=https%3A%2F%2Fdown10.zol.com.cn%2F20190605%2FVToV.zip&downname=VToV.zip&sourceid=zol" class="down-linkb down-btn-tongji "  data-weishi="" data-spe="https://softmgr.ludashi.com/downloader/soft/url?siteid=1008&softid=470959&softname=%E5%85%8D%E8%B4%B9%E8%A7%86%E9%A2%91%E6%A0%BC%E5%BC%8F%E8%BD%AC%E6%8D%A2%E5%99%A8%28Video+to+Video+Converter%29&downurl=https%3A%2F%2Fdown10.zol.com.cn%2F20190605%2FVToV.zip&downname=VToV.zip&sourceid=zol" data-softid="470959"><div class="list-btn-text">安全下载</div><div class="referrer">使用鲁大师下载</div></a>';
+                                                         	    document.write(buttonStr);
+                          </script>
+<!--                           <span class="earlier">高速下载器</span> -->
+                      </div>
+                          <div class="soft-infor clearfix">
+                              <div class="rate-box"><span class="rate-bar"><span style="width: 80%"></span></span></div>
+                              <span>大小：<em>28.91MB</em></span><span>更新时间：<em>2019-06-27</em></span><span>软件类型：<em>视频格式</em>&nbsp;<em>免费软件</em></span></div>
+                              <p class="text">Video to Video Converter是一个windows下的免费视频转换器，通过它，你可以把视频、音频在不同格式之间转换，从而满足在不同设备上播放的要求。除了转换之外，这个软件还可以提取dvd中的视频，以及把视频刻录到DVD中哦。Video to Vid...</p>
+                              <!--软件所属合集-->
+                             
+                        </div>
+                    </li>  
+                                <li class="item">
+                      <a href='//xiazai.zol.com.cn/detail/48/470960.shtml' target='_blank' class='pic'><img src='https://b.zol-img.com.cn/soft/7/941/ce09Tues41PY.jpg' alt='WebEx转换器(WebEx Converter)2.0' width='48' height='48'/></a>                      <div class="soft-header">
+                          <h4 class="soft-title"><a target="_blank" href="//xiazai.zol.com.cn/detail/48/470960.shtml">WebEx转换器(WebEx Converter) 2.0</a></h4>
+                      </div>
+                     
+                      <div class="soft-summary">
+                      <div class="down-btn-r">
+                          <script type="text/javascript">
+                          		var downUrl = 'https://xiazai.zol.com.cn/down.php?softid=470960&subcateid=103&site=10&checkStr=5a0a078e0efe4f4e5' + '&pos=downloader_list&flag=1&rand=' + (~~(Math.random() * (1 << 24))).toString(16);
+                                                            var buttonStr = '<a target="_blank" href="https://softmgr.ludashi.com/downloader/soft/url?siteid=1008&softid=470960&softname=WebEx%E8%BD%AC%E6%8D%A2%E5%99%A8%28WebEx+Converter%29&downurl=https%3A%2F%2Fdown10.zol.com.cn%2F20190605%2Fatwrf2wmv.zip&downname=atwrf2wmv.zip&sourceid=zol" class="down-linkb down-btn-tongji "  data-weishi="" data-spe="https://softmgr.ludashi.com/downloader/soft/url?siteid=1008&softid=470960&softname=WebEx%E8%BD%AC%E6%8D%A2%E5%99%A8%28WebEx+Converter%29&downurl=https%3A%2F%2Fdown10.zol.com.cn%2F20190605%2Fatwrf2wmv.zip&downname=atwrf2wmv.zip&sourceid=zol" data-softid="470960"><div class="list-btn-text">安全下载</div><div class="referrer">使用鲁大师下载</div></a>';
+                                                         	    document.write(buttonStr);
+                          </script>
+<!--                           <span class="earlier">高速下载器</span> -->
+                      </div>
+                          <div class="soft-infor clearfix">
+                              <div class="rate-box"><span class="rate-bar"><span style="width: 80%"></span></span></div>
+                              <span>大小：<em>1.95MB</em></span><span>更新时间：<em>2019-06-27</em></span><span>软件类型：<em>视频格式</em>&nbsp;<em>免费软件</em></span></div>
+                              <p class="text">WebEx的转换工具，可以用来转换多个WebEx录制文件（WRF）为WMV格式。使用方法1、启动该工具运行atconvert.exe文件2、单击“添加”3、在新弹出对话框中单击“浏览”源文件“文本框中，选择WRF文件，你要转换4、您可以更改输出文件夹和文...</p>
+                              <!--软件所属合集-->
+                             
+                        </div>
+                    </li>  
+                                <li class="item">
+                      <a href='//xiazai.zol.com.cn/detail/48/470965.shtml' target='_blank' class='pic'><img src='https://b.zol-img.com.cn/soft/7/959/ceXB5Ojp9fzU.jpg' alt='猎豹视频转换器(Cheetah Video Converter)1.2' width='48' height='48'/></a>                      <div class="soft-header">
+                          <h4 class="soft-title"><a target="_blank" href="//xiazai.zol.com.cn/detail/48/470965.shtml">猎豹视频转换器(Cheetah Video Converter) 1.2</a></h4>
+                      </div>
+                     
+                      <div class="soft-summary">
+                      <div class="down-btn-r">
+                          <script type="text/javascript">
+                          		var downUrl = 'https://xiazai.zol.com.cn/down.php?softid=470965&subcateid=103&site=10&checkStr=1ddace3f0d08174ad' + '&pos=downloader_list&flag=1&rand=' + (~~(Math.random() * (1 << 24))).toString(16);
+                                                            var buttonStr = '<a target="_blank" href="https://softmgr.ludashi.com/downloader/soft/url?siteid=1008&softid=470965&softname=%E7%8C%8E%E8%B1%B9%E8%A7%86%E9%A2%91%E8%BD%AC%E6%8D%A2%E5%99%A8%28Cheetah+Video+Converter%29&downurl=https%3A%2F%2Fdown10.zol.com.cn%2F20190605%2FCheetahVideoConverter.zip&downname=CheetahVideoConverter.zip&sourceid=zol" class="down-linkb down-btn-tongji "  data-weishi="" data-spe="https://softmgr.ludashi.com/downloader/soft/url?siteid=1008&softid=470965&softname=%E7%8C%8E%E8%B1%B9%E8%A7%86%E9%A2%91%E8%BD%AC%E6%8D%A2%E5%99%A8%28Cheetah+Video+Converter%29&downurl=https%3A%2F%2Fdown10.zol.com.cn%2F20190605%2FCheetahVideoConverter.zip&downname=CheetahVideoConverter.zip&sourceid=zol" data-softid="470965"><div class="list-btn-text">安全下载</div><div class="referrer">使用鲁大师下载</div></a>';
+                                                         	    document.write(buttonStr);
+                          </script>
+<!--                           <span class="earlier">高速下载器</span> -->
+                      </div>
+                          <div class="soft-infor clearfix">
+                              <div class="rate-box"><span class="rate-bar"><span style="width: 80%"></span></span></div>
+                              <span>大小：<em>19.03MB</em></span><span>更新时间：<em>2019-06-27</em></span><span>软件类型：<em>视频格式</em>&nbsp;<em>免费软件</em></span></div>
+                              <p class="text">Cheetah Video Converter是一款简单易用的音频视频格式转换工具。支持将DivX, FLV, F4V, AVI, WMV, MPEG, VOB, MP4, 3GP和MOV等格式的视频转换为FLV, AVI, WMV, MP4, MOV和Gifs。也支持将视频转换为MP3, WMA和WAV。还可...</p>
+                              <!--软件所属合集-->
+                             
+                        </div>
+                    </li>  
+                                <li class="item">
+                      <a href='//xiazai.zol.com.cn/detail/48/470968.shtml' target='_blank' class='pic'><img src='https://b.zol-img.com.cn/soft/7/962/ceIO6nov26seA.jpg' alt='jov视频格式转换器(ConverToJov)1.0' width='48' height='48'/></a>                      <div class="soft-header">
+                          <h4 class="soft-title"><a target="_blank" href="//xiazai.zol.com.cn/detail/48/470968.shtml">jov视频格式转换器(ConverToJov) 1.0</a></h4>
+                      </div>
+                     
+                      <div class="soft-summary">
+                      <div class="down-btn-r">
+                          <script type="text/javascript">
+                          		var downUrl = 'https://xiazai.zol.com.cn/down.php?softid=470968&subcateid=103&site=10&checkStr=f289ef131a002a0da' + '&pos=downloader_list&flag=1&rand=' + (~~(Math.random() * (1 << 24))).toString(16);
+                                                            var buttonStr = '<a title="jov视频格式转换器(ConverToJov)" target="_self" href="javascript:void(0)" class="down-linkb down-linkb-list-none">暂停下载</a>';
+                                                         	    document.write(buttonStr);
+                          </script>
+<!--                           <span class="earlier">高速下载器</span> -->
+                      </div>
+                          <div class="soft-infor clearfix">
+                              <div class="rate-box"><span class="rate-bar"><span style="width: 80%"></span></span></div>
+                              <span>大小：<em>7.61MB</em></span><span>更新时间：<em>2019-06-27</em></span><span>软件类型：<em>视频格式</em>&nbsp;<em>免费软件</em></span></div>
+                              <p class="text">学习机里的视频格式是jov格式的，这个工具能将avi、mov、mp4、asf、wmv、3gp视频转换为jov格式。使用说明:输入要处理的单个源文件名(现能支持的文件类型:avi、mov、mp4、asf、wmv、3gp)，输入处理后的输出目标文件名(只能是jov文件)，按...</p>
+                              <!--软件所属合集-->
+                             
+                        </div>
+                    </li>  
+                                <li class="item">
+                      <a href='//xiazai.zol.com.cn/detail/48/470970.shtml' target='_blank' class='pic'><img src='https://b.zol-img.com.cn/soft/7/964/ceoAtKO5dPH6Y.jpg' alt='dts转ac3(EZmkvDTStoAC3)1.1' width='48' height='48'/></a>                      <div class="soft-header">
+                          <h4 class="soft-title"><a target="_blank" href="//xiazai.zol.com.cn/detail/48/470970.shtml">dts转ac3(EZmkvDTStoAC3) 1.1</a></h4>
+                      </div>
+                     
+                      <div class="soft-summary">
+                      <div class="down-btn-r">
+                          <script type="text/javascript">
+                          		var downUrl = 'https://xiazai.zol.com.cn/down.php?softid=470970&subcateid=103&site=10&checkStr=658477986b1c5ce1e' + '&pos=downloader_list&flag=1&rand=' + (~~(Math.random() * (1 << 24))).toString(16);
+                                                            var buttonStr = '<a target="_blank" href="https://softmgr.ludashi.com/downloader/soft/url?siteid=1008&softid=470970&softname=dts%E8%BD%ACac3%28EZmkvDTStoAC3%29&downurl=https%3A%2F%2Fdown10.zol.com.cn%2F20190605%2FEZmkvDTStoAC3.zip&downname=EZmkvDTStoAC3.zip&sourceid=zol" class="down-linkb down-btn-tongji "  data-weishi="" data-spe="https://softmgr.ludashi.com/downloader/soft/url?siteid=1008&softid=470970&softname=dts%E8%BD%ACac3%28EZmkvDTStoAC3%29&downurl=https%3A%2F%2Fdown10.zol.com.cn%2F20190605%2FEZmkvDTStoAC3.zip&downname=EZmkvDTStoAC3.zip&sourceid=zol" data-softid="470970"><div class="list-btn-text">安全下载</div><div class="referrer">使用鲁大师下载</div></a>';
+                                                         	    document.write(buttonStr);
+                          </script>
+<!--                           <span class="earlier">高速下载器</span> -->
+                      </div>
+                          <div class="soft-infor clearfix">
+                              <div class="rate-box"><span class="rate-bar"><span style="width: 80%"></span></span></div>
+                              <span>大小：<em>18.08MB</em></span><span>更新时间：<em>2019-06-27</em></span><span>软件类型：<em>视频格式</em>&nbsp;<em>免费软件</em></span></div>
+                              <p class="text">将mkv文件DTS音频格式转换为AC3格式，以便液晶电视读龋傻瓜式的操作，一键即可。现在下载的高清mkv视频基本上都是多声道的，不是ac3的就是dts的，可是支持dts的播放器却太少。不要说之前提到的海信52寸电视内置的不支持，就是现在流行的...</p>
+                              <!--软件所属合集-->
+                             
+                        </div>
+                    </li>  
+                                <li class="item">
+                      <a href='//xiazai.zol.com.cn/detail/48/470971.shtml' target='_blank' class='pic'><img src='https://b.zol-img.com.cn/soft/7/965/cecCRQ2rod5e.jpg' alt='小速xv格式转化器1.8' width='48' height='48'/></a>                      <div class="soft-header">
+                          <h4 class="soft-title"><a target="_blank" href="//xiazai.zol.com.cn/detail/48/470971.shtml">小速xv格式转化器 1.8</a></h4>
+                      </div>
+                     
+                      <div class="soft-summary">
+                      <div class="down-btn-r">
+                          <script type="text/javascript">
+                          		var downUrl = 'https://xiazai.zol.com.cn/down.php?softid=470971&subcateid=103&site=10&checkStr=7995779e90e47c630' + '&pos=downloader_list&flag=1&rand=' + (~~(Math.random() * (1 << 24))).toString(16);
+                                                            var buttonStr = '<a title="小速xv格式转化器" target="_self" href="javascript:void(0)" class="down-linkb down-linkb-list-none">暂停下载</a>';
+                                                         	    document.write(buttonStr);
+                          </script>
+<!--                           <span class="earlier">高速下载器</span> -->
+                      </div>
+                          <div class="soft-infor clearfix">
+                              <div class="rate-box"><span class="rate-bar"><span style="width: 80%"></span></span></div>
+                              <span>大小：<em>1.34MB</em></span><span>更新时间：<em>2019-06-27</em></span><span>软件类型：<em>视频格式</em>&nbsp;<em>免费软件</em></span></div>
+                              <p class="text">小速xv格式转化器是一款转换xv视频格式工具(xv视频格式一般是在使用迅雷看看看视频或电影时的缓存文件！或者是在迅雷下载频道下载的一些视频格式)使用方法1.下载软件后，解压缩并安装，运行桌面安装的快捷方式打开软件，点击“浏览”定位...</p>
+                              <!--软件所属合集-->
+                             
+                        </div>
+                    </li>  
+                                <li class="item">
+                      <a href='//xiazai.zol.com.cn/detail/48/470975.shtml' target='_blank' class='pic'><img src='https://b.zol-img.com.cn/soft/7/969/ceBZv2PRf3Ebw.jpg' alt='Swfmill0.3.1' width='48' height='48'/></a>                      <div class="soft-header">
+                          <h4 class="soft-title"><a target="_blank" href="//xiazai.zol.com.cn/detail/48/470975.shtml">Swfmill 0.3.1</a></h4>
+                      </div>
+                     
+                      <div class="soft-summary">
+                      <div class="down-btn-r">
+                          <script type="text/javascript">
+                          		var downUrl = 'https://xiazai.zol.com.cn/down.php?softid=470975&subcateid=103&site=10&checkStr=3652629221b52abcf' + '&pos=downloader_list&flag=1&rand=' + (~~(Math.random() * (1 << 24))).toString(16);
+                                                            var buttonStr = '<a target="_blank" href="https://softmgr.ludashi.com/downloader/soft/url?siteid=1008&softid=470975&softname=Swfmill&downurl=https%3A%2F%2Fdown10.zol.com.cn%2F20190605%2Fswfmillxz.zip&downname=swfmillxz.zip&sourceid=zol" class="down-linkb down-btn-tongji "  data-weishi="" data-spe="https://softmgr.ludashi.com/downloader/soft/url?siteid=1008&softid=470975&softname=Swfmill&downurl=https%3A%2F%2Fdown10.zol.com.cn%2F20190605%2Fswfmillxz.zip&downname=swfmillxz.zip&sourceid=zol" data-softid="470975"><div class="list-btn-text">安全下载</div><div class="referrer">使用鲁大师下载</div></a>';
+                                                         	    document.write(buttonStr);
+                          </script>
+<!--                           <span class="earlier">高速下载器</span> -->
+                      </div>
+                          <div class="soft-infor clearfix">
+                              <div class="rate-box"><span class="rate-bar"><span style="width: 80%"></span></span></div>
+                              <span>大小：<em>5.38MB</em></span><span>更新时间：<em>2019-06-27</em></span><span>软件类型：<em>视频格式</em>&nbsp;<em>免费软件</em></span></div>
+                              <p class="text">Swfmill是一个功能可靠使用方便的命令行工具，可以使用SWFML实现的xml和swf之间的转换，还可以利用xslt生成swf文件，也是FAMES生成SWF密不可分的一部分。SWFML是一种在SWF文件格式制定后制定的XML语言。...</p>
+                              <!--软件所属合集-->
+                             
+                        </div>
+                    </li>  
+                                <li class="item">
+                      <a href='//xiazai.zol.com.cn/detail/48/470976.shtml' target='_blank' class='pic'><img src='https://b.zol-img.com.cn/soft/7/970/ce5RV7PfZ0VHo.jpg' alt='SWF转MP4、FLV、3GP转换器3.12.00' width='48' height='48'/></a>                      <div class="soft-header">
+                          <h4 class="soft-title"><a target="_blank" href="//xiazai.zol.com.cn/detail/48/470976.shtml">SWF转MP4、FLV、3GP转换器 3.12.00</a></h4>
+                      </div>
+                     
+                      <div class="soft-summary">
+                      <div class="down-btn-r">
+                          <script type="text/javascript">
+                          		var downUrl = 'https://xiazai.zol.com.cn/down.php?softid=470976&subcateid=103&site=10&checkStr=05214a4589210eebd' + '&pos=downloader_list&flag=1&rand=' + (~~(Math.random() * (1 << 24))).toString(16);
+                                                            var buttonStr = '<a title="SWF转MP4、FLV、3GP转换器" target="_self" href="javascript:void(0)" class="down-linkb down-linkb-list-none">暂停下载</a>';
+                                                         	    document.write(buttonStr);
+                          </script>
+<!--                           <span class="earlier">高速下载器</span> -->
+                      </div>
+                          <div class="soft-infor clearfix">
+                              <div class="rate-box"><span class="rate-bar"><span style="width: 80%"></span></span></div>
+                              <span>大小：<em>25.77MB</em></span><span>更新时间：<em>2019-06-27</em></span><span>软件类型：<em>视频格式</em>&nbsp;<em>免费软件</em></span></div>
+                              <p class="text">Moyea SWF to Video Pro是一款专业的SWF转换器，这次提供的是3.12.00汉化破解版，更加实用方便。。能够将交互SWF转化为多种视频、音频和图像格式，转换过程支持RGBA透明和Alpha通道。Moyea SWF to Video Pro功能强大之处在于支持较...</p>
+                              <!--软件所属合集-->
+                             
+                        </div>
+                    </li>  
+                                <li class="item">
+                      <a href='//xiazai.zol.com.cn/detail/48/470989.shtml' target='_blank' class='pic'><img src='https://b.zol-img.com.cn/soft/7/973/ce58A1GPfHADg.jpg' alt='bik格式转换器' width='48' height='48'/></a>                      <div class="soft-header">
+                          <h4 class="soft-title"><a target="_blank" href="//xiazai.zol.com.cn/detail/48/470989.shtml">bik格式转换器 </a></h4>
+                      </div>
+                     
+                      <div class="soft-summary">
+                      <div class="down-btn-r">
+                          <script type="text/javascript">
+                          		var downUrl = 'https://xiazai.zol.com.cn/down.php?softid=470989&subcateid=103&site=10&checkStr=0164bdfe765c85c13' + '&pos=downloader_list&flag=1&rand=' + (~~(Math.random() * (1 << 24))).toString(16);
+                                                            var buttonStr = '<a target="_blank" href="https://softmgr.ludashi.com/downloader/soft/url?siteid=1008&softid=470989&softname=bik%E6%A0%BC%E5%BC%8F%E8%BD%AC%E6%8D%A2%E5%99%A8&downurl=https%3A%2F%2Fdown10.zol.com.cn%2F20190605%2FRADTools.zip&downname=RADTools.zip&sourceid=zol" class="down-linkb down-btn-tongji "  data-weishi="" data-spe="https://softmgr.ludashi.com/downloader/soft/url?siteid=1008&softid=470989&softname=bik%E6%A0%BC%E5%BC%8F%E8%BD%AC%E6%8D%A2%E5%99%A8&downurl=https%3A%2F%2Fdown10.zol.com.cn%2F20190605%2FRADTools.zip&downname=RADTools.zip&sourceid=zol" data-softid="470989"><div class="list-btn-text">安全下载</div><div class="referrer">使用鲁大师下载</div></a>';
+                                                         	    document.write(buttonStr);
+                          </script>
+<!--                           <span class="earlier">高速下载器</span> -->
+                      </div>
+                          <div class="soft-infor clearfix">
+                              <div class="rate-box"><span class="rate-bar"><span style="width: 80%"></span></span></div>
+                              <span>大小：<em>1.42MB</em></span><span>更新时间：<em>2019-11-04</em></span><span>软件类型：<em>视频格式</em>&nbsp;<em>免费软件</em></span></div>
+                              <p class="text">有很大一部分游戏都喜欢使用ｂｉｋ和ｓｍｋ这两种视频格式来做游戏的过场动画。这个工具刚好就适用于这两种视频。打开工具的主界面。其他的即便点了也会弹出对话框跳出。...</p>
+                              <!--软件所属合集-->
+                             
+                        </div>
+                    </li>  
+                                <li class="item">
+                      <a href='//xiazai.zol.com.cn/detail/48/470991.shtml' target='_blank' class='pic'><img src='https://b.zol-img.com.cn/soft/7/975/ceQKOE96FZJps.jpg' alt='步步高视频转换工具1.8' width='48' height='48'/></a>                      <div class="soft-header">
+                          <h4 class="soft-title"><a target="_blank" href="//xiazai.zol.com.cn/detail/48/470991.shtml">步步高视频转换工具 1.8</a></h4>
+                      </div>
+                     
+                      <div class="soft-summary">
+                      <div class="down-btn-r">
+                          <script type="text/javascript">
+                          		var downUrl = 'https://xiazai.zol.com.cn/down.php?softid=470991&subcateid=103&site=10&checkStr=e019ff855bb939451' + '&pos=downloader_list&flag=1&rand=' + (~~(Math.random() * (1 << 24))).toString(16);
+                                                            var buttonStr = '<a target="_blank" href="https://softmgr.ludashi.com/downloader/soft/url?siteid=1008&softid=470991&softname=%E6%AD%A5%E6%AD%A5%E9%AB%98%E8%A7%86%E9%A2%91%E8%BD%AC%E6%8D%A2%E5%B7%A5%E5%85%B7&downurl=https%3A%2F%2Fdown10.zol.com.cn%2F20190605%2Fbbgspzh.zip&downname=bbgspzh.zip&sourceid=zol" class="down-linkb down-btn-tongji "  data-weishi="" data-spe="https://softmgr.ludashi.com/downloader/soft/url?siteid=1008&softid=470991&softname=%E6%AD%A5%E6%AD%A5%E9%AB%98%E8%A7%86%E9%A2%91%E8%BD%AC%E6%8D%A2%E5%B7%A5%E5%85%B7&downurl=https%3A%2F%2Fdown10.zol.com.cn%2F20190605%2Fbbgspzh.zip&downname=bbgspzh.zip&sourceid=zol" data-softid="470991"><div class="list-btn-text">安全下载</div><div class="referrer">使用鲁大师下载</div></a>';
+                                                         	    document.write(buttonStr);
+                          </script>
+<!--                           <span class="earlier">高速下载器</span> -->
+                      </div>
+                          <div class="soft-infor clearfix">
+                              <div class="rate-box"><span class="rate-bar"><span style="width: 80%"></span></span></div>
+                              <span>大小：<em>9.02MB</em></span><span>更新时间：<em>2019-06-27</em></span><span>软件类型：<em>视频格式</em>&nbsp;<em>免费软件</em></span></div>
+                              <p class="text">步步高视频转换工具如果需要切换到高级模式,请单击上方图标中的“设置”按钮，在弹出菜单中钩寻切换到专家模式”选项，之后单击“确定”按钮，即进入“专家模式”。普通模式：专家模式：说明：“专家模式”适用于对视频有一定了解的用户，...</p>
+                              <!--软件所属合集-->
+                             
+                        </div>
+                    </li>  
+                                <li class="item">
+                      <a href='//xiazai.zol.com.cn/detail/48/470992.shtml' target='_blank' class='pic'><img src='https://b.zol-img.com.cn/soft/7/976/ceS0YD3RRecmg.jpg' alt='xv视频格式转换器(XVE7s+)1.01' width='48' height='48'/></a>                      <div class="soft-header">
+                          <h4 class="soft-title"><a target="_blank" href="//xiazai.zol.com.cn/detail/48/470992.shtml">xv视频格式转换器(XVE7s+) 1.01</a></h4>
+                      </div>
+                     
+                      <div class="soft-summary">
+                      <div class="down-btn-r">
+                          <script type="text/javascript">
+                          		var downUrl = 'https://xiazai.zol.com.cn/down.php?softid=470992&subcateid=103&site=10&checkStr=0b8ca1e16344b7a8c' + '&pos=downloader_list&flag=1&rand=' + (~~(Math.random() * (1 << 24))).toString(16);
+                                                            var buttonStr = '<a title="xv视频格式转换器(XVE7s+)" target="_self" href="javascript:void(0)" class="down-linkb down-linkb-list-none">暂停下载</a>';
+                                                         	    document.write(buttonStr);
+                          </script>
+<!--                           <span class="earlier">高速下载器</span> -->
+                      </div>
+                          <div class="soft-infor clearfix">
+                              <div class="rate-box"><span class="rate-bar"><span style="width: 80%"></span></span></div>
+                              <span>大小：<em>0.01MB</em></span><span>更新时间：<em>2019-06-27</em></span><span>软件类型：<em>视频格式</em>&nbsp;<em>免费软件</em></span></div>
+                              <p class="text">xv文件格式是迅雷公司开发的一种视频缓存格式。只有联网才能观看，XV本身无法利用播放器观看，但XVE可以使用播放器观看，希望大家可以通过文件转换，来观看你想看电影或电视剧等…软件特色XVE7s+是由伪红学家开发的xv视频格式转换器，它...</p>
+                              <!--软件所属合集-->
+                             
+                        </div>
+                    </li>  
+                                <li class="item">
+                      <a href='//xiazai.zol.com.cn/detail/48/470993.shtml' target='_blank' class='pic'><img src='https://b.zol-img.com.cn/soft/7/977/ce2w7Kh0b2js.jpg' alt='音视频格式转换器(3herosoft Audio Maker)1.1.1' width='48' height='48'/></a>                      <div class="soft-header">
+                          <h4 class="soft-title"><a target="_blank" href="//xiazai.zol.com.cn/detail/48/470993.shtml">音视频格式转换器(3herosoft Audio Maker) 1.1.1</a></h4>
+                      </div>
+                     
+                      <div class="soft-summary">
+                      <div class="down-btn-r">
+                          <script type="text/javascript">
+                          		var downUrl = 'https://xiazai.zol.com.cn/down.php?softid=470993&subcateid=1449&site=10&checkStr=b371fd696fcda2e0a' + '&pos=downloader_list&flag=1&rand=' + (~~(Math.random() * (1 << 24))).toString(16);
+                                                            var buttonStr = '<a title="音视频格式转换器(3herosoft Audio Maker)" target="_self" href="javascript:void(0)" class="down-linkb down-linkb-list-none">暂停下载</a>';
+                                                         	    document.write(buttonStr);
+                          </script>
+<!--                           <span class="earlier">高速下载器</span> -->
+                      </div>
+                          <div class="soft-infor clearfix">
+                              <div class="rate-box"><span class="rate-bar"><span style="width: 80%"></span></span></div>
+                              <span>大小：<em>5.18MB</em></span><span>更新时间：<em>2019-06-27</em></span><span>软件类型：<em>音频转换</em>&nbsp;<em>免费软件</em></span></div>
+                              <p class="text">3herosoft Audio Maker 是一款强大易用的音频转换器, CD提取器和CD刻录软件,您可以用它转换所有的流行视频和音频格式为不同的音频格式, 提取音频CD到不同的音频格式并将音乐烧录成CD.该音频制作器具有强大详细的技能,可帮您获得完美的...</p>
+                              <!--软件所属合集-->
+                             
+                        </div>
+                    </li>  
+                                <li class="item">
+                      <a href='//xiazai.zol.com.cn/detail/48/470994.shtml' target='_blank' class='pic'><img src='https://b.zol-img.com.cn/soft/7/978/ce8fXoXsIWpI.jpg' alt='视频转gif(Aoao Video to GIF Converter)3.2' width='48' height='48'/></a>                      <div class="soft-header">
+                          <h4 class="soft-title"><a target="_blank" href="//xiazai.zol.com.cn/detail/48/470994.shtml">视频转gif(Aoao Video to GIF Converter) 3.2</a></h4>
+                      </div>
+                     
+                      <div class="soft-summary">
+                      <div class="down-btn-r">
+                          <script type="text/javascript">
+                          		var downUrl = 'https://xiazai.zol.com.cn/down.php?softid=470994&subcateid=103&site=10&checkStr=4bab87fdd68574783' + '&pos=downloader_list&flag=1&rand=' + (~~(Math.random() * (1 << 24))).toString(16);
+                                                            var buttonStr = '<a title="视频转gif(Aoao Video to GIF Converter)" target="_self" href="javascript:void(0)" class="down-linkb down-linkb-list-none">暂停下载</a>';
+                                                         	    document.write(buttonStr);
+                          </script>
+<!--                           <span class="earlier">高速下载器</span> -->
+                      </div>
+                          <div class="soft-infor clearfix">
+                              <div class="rate-box"><span class="rate-bar"><span style="width: 80%"></span></span></div>
+                              <span>大小：<em>4.56MB</em></span><span>更新时间：<em>2019-06-27</em></span><span>软件类型：<em>视频格式</em>&nbsp;<em>免费软件</em></span></div>
+                              <p class="text">Aoao Video to GIF Converter是一个Windows下简单、快速的视频转图片软件,能转换所有流行的视频格式为GIF动画,可以让您以GIF图像播放视频。 支持导入的视频格式包括AVI、MPEG、MP4、MKV、WMV、MOV、3GP等。它也可以转换视频为其...</p>
+                              <!--软件所属合集-->
+                             
+                        </div>
+                    </li>  
+                                <li class="item">
+                      <a href='//xiazai.zol.com.cn/detail/48/470998.shtml' target='_blank' class='pic'><img src='https://b.zol-img.com.cn/soft/7/982/cePz91t1KemGA.jpg' alt='iFree MP4 to AVI Converter(mp4转avi)3.3.0' width='48' height='48'/></a>                      <div class="soft-header">
+                          <h4 class="soft-title"><a target="_blank" href="//xiazai.zol.com.cn/detail/48/470998.shtml">iFree MP4 to AVI Converter(mp4转avi) 3.3.0</a></h4>
+                      </div>
+                     
+                      <div class="soft-summary">
+                      <div class="down-btn-r">
+                          <script type="text/javascript">
+                          		var downUrl = 'https://xiazai.zol.com.cn/down.php?softid=470998&subcateid=103&site=10&checkStr=dc10d9cc6ae4e99db' + '&pos=downloader_list&flag=1&rand=' + (~~(Math.random() * (1 << 24))).toString(16);
+                                                            var buttonStr = '<a title="iFree MP4 to AVI Converter(mp4转avi)" target="_self" href="javascript:void(0)" class="down-linkb down-linkb-list-none">暂停下载</a>';
+                                                         	    document.write(buttonStr);
+                          </script>
+<!--                           <span class="earlier">高速下载器</span> -->
+                      </div>
+                          <div class="soft-infor clearfix">
+                              <div class="rate-box"><span class="rate-bar"><span style="width: 80%"></span></span></div>
+                              <span>大小：<em>6.03MB</em></span><span>更新时间：<em>2019-06-27</em></span><span>软件类型：<em>视频格式</em>&nbsp;<em>免费软件</em></span></div>
+                              <p class="text">iFree MP4 to AVI Converter 是一个易于使用的视频转换软件。它可以转换任何的MP4到AVI、DivX、XviD、MOV、MPG、MPEG-2、MPEG-4和WMV视频格式。也可以从视频提取音频。...</p>
+                              <!--软件所属合集-->
+                             
+                        </div>
+                    </li>  
+                                <li class="item">
+                      <a href='//xiazai.zol.com.cn/detail/48/471009.shtml' target='_blank' class='pic'><img src='https://b.zol-img.com.cn/soft/7/983/cerljlaqKxTc.jpg' alt='3D视频转2D(4Media 2D to 3D Video Converter)1.0' width='48' height='48'/></a>                      <div class="soft-header">
+                          <h4 class="soft-title"><a target="_blank" href="//xiazai.zol.com.cn/detail/48/471009.shtml">3D视频转2D(4Media 2D to 3D Video Converter) 1.0</a></h4>
+                      </div>
+                     
+                      <div class="soft-summary">
+                      <div class="down-btn-r">
+                          <script type="text/javascript">
+                          		var downUrl = 'https://xiazai.zol.com.cn/down.php?softid=471009&subcateid=103&site=10&checkStr=7a736dd8658c3c1f9' + '&pos=downloader_list&flag=1&rand=' + (~~(Math.random() * (1 << 24))).toString(16);
+                                                            var buttonStr = '<a target="_blank" href="https://softmgr.ludashi.com/downloader/soft/url?siteid=1008&softid=471009&softname=3D%E8%A7%86%E9%A2%91%E8%BD%AC2D%284Media+2D+to+3D+Video+Converter%29&downurl=https%3A%2F%2Fdown10.zol.com.cn%2F20190605%2F4Media2to3D.zip&downname=4Media2to3D.zip&sourceid=zol" class="down-linkb down-btn-tongji "  data-weishi="" data-spe="https://softmgr.ludashi.com/downloader/soft/url?siteid=1008&softid=471009&softname=3D%E8%A7%86%E9%A2%91%E8%BD%AC2D%284Media+2D+to+3D+Video+Converter%29&downurl=https%3A%2F%2Fdown10.zol.com.cn%2F20190605%2F4Media2to3D.zip&downname=4Media2to3D.zip&sourceid=zol" data-softid="471009"><div class="list-btn-text">安全下载</div><div class="referrer">使用鲁大师下载</div></a>';
+                                                         	    document.write(buttonStr);
+                          </script>
+<!--                           <span class="earlier">高速下载器</span> -->
+                      </div>
+                          <div class="soft-infor clearfix">
+                              <div class="rate-box"><span class="rate-bar"><span style="width: 80%"></span></span></div>
+                              <span>大小：<em>31.35MB</em></span><span>更新时间：<em>2019-06-27</em></span><span>软件类型：<em>视频格式</em>&nbsp;<em>免费软件</em></span></div>
+                              <p class="text">4Media 2D to 3D Video Converter 是 4Media 软件工作室开发的一款3D视频转换工具。它通过特别的程序算法对图像进行渲染，给你的左右眼显示相对应的图像。你可以根据需要输出单一的视频文件（如一个左眼的文件，一个右眼的文件），或者...</p>
+                              <!--软件所属合集-->
+                             
+                        </div>
+                    </li>  
+                                <li class="item">
+                      <a href='//xiazai.zol.com.cn/detail/48/471010.shtml' target='_blank' class='pic'><img src='https://b.zol-img.com.cn/soft/7/984/cehY5NByfmRI.jpg' alt='HTML5视频转换器' width='48' height='48'/></a>                      <div class="soft-header">
+                          <h4 class="soft-title"><a target="_blank" href="//xiazai.zol.com.cn/detail/48/471010.shtml">HTML5视频转换器 </a></h4>
+                      </div>
+                     
+                      <div class="soft-summary">
+                      <div class="down-btn-r">
+                          <script type="text/javascript">
+                          		var downUrl = 'https://xiazai.zol.com.cn/down.php?softid=471010&subcateid=103&site=10&checkStr=7cee4ef8b01ffad5a' + '&pos=downloader_list&flag=1&rand=' + (~~(Math.random() * (1 << 24))).toString(16);
+                                                            var buttonStr = '<a title="HTML5视频转换器" target="_self" href="javascript:void(0)" class="down-linkb down-linkb-list-none">暂停下载</a>';
+                                                         	    document.write(buttonStr);
+                          </script>
+<!--                           <span class="earlier">高速下载器</span> -->
+                      </div>
+                          <div class="soft-infor clearfix">
+                              <div class="rate-box"><span class="rate-bar"><span style="width: 80%"></span></span></div>
+                              <span>大小：<em>18.47MB</em></span><span>更新时间：<em>2019-06-27</em></span><span>软件类型：<em>视频格式</em>&nbsp;<em>免费软件</em></span></div>
+                              <p class="text">Free Video Converter 是一款视频转换软件，新增对 HTML5 的支持，包含 Ogg, Theora, WebM, H.264 四种格式，自动生成网页代码，方便发布。当然 Free Video Converter 还包含其他视频格式的转换，什么 AVI, MKV,WMV 等等近 200+ 种...</p>
+                              <!--软件所属合集-->
+                             
+                        </div>
+                    </li>  
+                                <li class="item">
+                      <a href='//xiazai.zol.com.cn/detail/48/471011.shtml' target='_blank' class='pic'><img src='https://b.zol-img.com.cn/soft/7/985/ceOQXbSlPztNc.jpg' alt='电影王kmv格式转换器(KingMovie)1.03' width='48' height='48'/></a>                      <div class="soft-header">
+                          <h4 class="soft-title"><a target="_blank" href="//xiazai.zol.com.cn/detail/48/471011.shtml">电影王kmv格式转换器(KingMovie) 1.03</a></h4>
+                      </div>
+                     
+                      <div class="soft-summary">
+                      <div class="down-btn-r">
+                          <script type="text/javascript">
+                          		var downUrl = 'https://xiazai.zol.com.cn/down.php?softid=471011&subcateid=103&site=10&checkStr=f08055bf4ad18ab65' + '&pos=downloader_list&flag=1&rand=' + (~~(Math.random() * (1 << 24))).toString(16);
+                                                            var buttonStr = '<a target="_blank" href="https://softmgr.ludashi.com/downloader/soft/url?siteid=1008&softid=471011&softname=%E7%94%B5%E5%BD%B1%E7%8E%8Bkmv%E6%A0%BC%E5%BC%8F%E8%BD%AC%E6%8D%A2%E5%99%A8%28KingMovie%29&downurl=https%3A%2F%2Fdown10.zol.com.cn%2F20190605%2FKMVConverter.zip&downname=KMVConverter.zip&sourceid=zol" class="down-linkb down-btn-tongji "  data-weishi="" data-spe="https://softmgr.ludashi.com/downloader/soft/url?siteid=1008&softid=471011&softname=%E7%94%B5%E5%BD%B1%E7%8E%8Bkmv%E6%A0%BC%E5%BC%8F%E8%BD%AC%E6%8D%A2%E5%99%A8%28KingMovie%29&downurl=https%3A%2F%2Fdown10.zol.com.cn%2F20190605%2FKMVConverter.zip&downname=KMVConverter.zip&sourceid=zol" data-softid="471011"><div class="list-btn-text">安全下载</div><div class="referrer">使用鲁大师下载</div></a>';
+                                                         	    document.write(buttonStr);
+                          </script>
+<!--                           <span class="earlier">高速下载器</span> -->
+                      </div>
+                          <div class="soft-infor clearfix">
+                              <div class="rate-box"><span class="rate-bar"><span style="width: 80%"></span></span></div>
+                              <span>大小：<em>67.59MB</em></span><span>更新时间：<em>2019-06-27</em></span><span>软件类型：<em>视频格式</em>&nbsp;<em>免费软件</em></span></div>
+                              <p class="text">（KingMovie）电影王影音压缩转换软件是深圳市彪骐数码科技有限公司提供的一种高压缩比视频格式，同时提供了字幕清晰处理技术和内嵌电影信息。客户获得彪骐授权，可以在系列手机产品中使用这一技术，使得终端消费者能够在有限的手机存储空...</p>
+                              <!--软件所属合集-->
+                             
+                        </div>
+                    </li>  
+                				
+			</ul>
+			<!-- //soft-list -->
+			                         <!-- recommend-links -->
+                        <div class="recommend-links clearfix">
+ 						<a target="_blank" href="https://xiazai.zol.com.cn/detail/34/333261.shtml">鲁大师</a><a target="_blank" href="https://xiazai.zol.com.cn/detail/33/325408.shtml">格式工厂</a><a target="_blank" href="https://xiazai.zol.com.cn/detail/33/327560.shtml">谷歌浏览器</a><a target="_blank" href="//xiazai.zol.com.cn/detail/11/105643.shtml">磁力下载工具</a><a target="_blank" href="//xiazai.zol.com.cn/detail/45/446436.shtml">雷神加速器</a><a target="_blank" href="//xiazai.zol.com.cn/detail/35/344930.shtml">按键精灵</a><a target="_blank" href="//xiazai.zol.com.cn/heji/11190/">植物大战僵尸</a><a target="_blank" href="//xiazai.zol.com.cn/detail/39/383798.shtml">益盟操盘手</a><a target="_blank" href="//xiazai.zol.com.cn/detail/33/328754.shtml">快播</a><a target="_blank" href="//xiazai.zol.com.cn/detail/33/329363.shtml">驱动精灵</a>                        
+                        </div>
+                        <!-- //recommend-links -->
+           		</div>
+		<!-- //soft-tabs -->
+		
+		<!-- page-box -->
+        			<div class="page-box clearfix">
+				<div class="page">
+                    <a href='//xiazai.zol.com.cn/download_cate_media/media_free_225.html'>上一页</a><a href='//xiazai.zol.com.cn/download_cate_media/media_free_1.html'>1</a><span class='morelink'>...</span><a href='//xiazai.zol.com.cn/download_cate_media/media_free_224.html'>224</a><a href='//xiazai.zol.com.cn/download_cate_media/media_free_225.html'>225</a><span class='now'>226</span><a href='//xiazai.zol.com.cn/download_cate_media/media_free_227.html'>227</a><a href='//xiazai.zol.com.cn/download_cate_media/media_free_228.html'>228</a><span class='morelink'>...</span><a href='//xiazai.zol.com.cn/download_cate_media/media_free_227.html'>下一页</a>				</div>
+                				<span class="tip">可用“&larr;”或“&rarr;”方向键快速翻页</span>
+                			</div>
+            		<!-- //page-box -->
+		
+		<div class="section">
+			<div style="width:728px;margin: 0 auto;">
+			<script type="text/javascript">
+				write_ad("xiazai_list_paging_bottom");
+			</script>
+			</div>
+		</div>
+
+		<!-- recommend-area -->
+        		<div class="recommend-area clearfix"> 
+			<!-- section -->
+			<div class="section">
+				<div class="section-header">
+					<a href="//xiazai.zol.com.cn/renew/all_1.html" rel="nofollow" target="_blank" class="more">更多&raquo;</a>
+					<h3>本类最新更新</h3>
+				</div>
+				<ul class="rank-list">
+                    <li><em class="n1">1</em><a class="title" target="_blank" title="网易云音乐电脑版 3.1.39" href="//xiazai.zol.com.cn/detail/43/428256.shtml">网易云音乐电脑版 3.1.39</a></li><li><em class="n1">2</em><a class="title" target="_blank" title="极客播放器Mac版 2.0.0.2" href="//xiazai.zol.com.cn/detail/72/710988.shtml">极客播放器Mac版 2.0.0.2</a></li><li><em class="n1">3</em><a class="title" target="_blank" title="芒果TV 8.0.8.0" href="//xiazai.zol.com.cn/detail/43/427260.shtml">芒果TV 8.0.8.0</a></li><li><em>4</em><a class="title" target="_blank" title="腾讯视频 电脑版官方最新 11.181" href="//xiazai.zol.com.cn/detail/12/114929.shtml">腾讯视频 电脑版官方最新 11.181</a></li><li><em>5</em><a class="title" target="_blank" title="AdVoice促销广告录音制作 7.3.3" href="//xiazai.zol.com.cn/detail/44/439309.shtml">AdVoice促销广告录音制作 7.3.3</a></li><li><em>6</em><a class="title" target="_blank" title="定时播音大师 7.1.3" href="//xiazai.zol.com.cn/detail/44/439913.shtml">定时播音大师 7.1.3</a></li><li><em>7</em><a class="title" target="_blank" title="时方文字转语音播音王 5.1.3" href="//xiazai.zol.com.cn/detail/48/476851.shtml">时方文字转语音播音王 5.1.3</a></li><li><em>8</em><a class="title" target="_blank" title="文字转语音助手 7.5.3" href="//xiazai.zol.com.cn/detail/44/435751.shtml">文字转语音助手 7.5.3</a></li><li><em>9</em><a class="title" target="_blank" title="TimingLaba(mp3定时播放器) 10.2" href="//xiazai.zol.com.cn/detail/42/417256.shtml">TimingLaba(mp3定时播放器) 10.2</a></li><li><em>10</em><a class="title" target="_blank" title="时方校园定时广播系统 10.3" href="//xiazai.zol.com.cn/detail/43/423506.shtml">时方校园定时广播系统 10.3</a></li>				</ul>
+			</div>
+            			<!-- //section --> 
+			
+			<!-- section -->
+            			<div class="section">
+				<div class="section-header">
+                                        <a href="//xiazai.zol.com.cn/download_order/cat_64.html" target="_blank" class="more">更多&raquo;</a>
+					<h3>多媒体排行</h3>
+				</div>
+				<ul class="rank-list">
+                    <li><em class="n1">1</em><a class="title" target="_blank" title="PotPlayer 1.7.22769" href="//xiazai.zol.com.cn/detail/36/353662.shtml">PotPlayer 1.7.22769</a></li><li><em class="n1">2</em><a class="title" target="_blank" title="VLC Media Player 3.0.23" href="//xiazai.zol.com.cn/detail/35/341813.shtml">VLC Media Player 3.0.23</a></li><li><em class="n1">3</em><a class="title" target="_blank" title="暴风影音播放器 官方最新版 5.92.0824.1111" href="//xiazai.zol.com.cn/detail/11/109667.shtml">暴风影音播放器 官方最新版 5.92.0824.1111</a></li><li><em>4</em><a class="title" target="_blank" title="WinHex 21.8" href="//xiazai.zol.com.cn/detail/4/31336.shtml">WinHex 21.8</a></li><li><em>5</em><a class="title" target="_blank" title="快播 5.0官方版下载" href="//xiazai.zol.com.cn/detail/33/328754.shtml">快播 5.0官方版下载</a></li><li><em>6</em><a class="title" target="_blank" title="格式工厂Format Factory 官方下载5.22.0" href="//xiazai.zol.com.cn/detail/33/325408.shtml">格式工厂Format Factory 官方下载5.22.0</a></li><li><em>7</em><a class="title" target="_blank" title="CAJViewer 10.0.0" href="//xiazai.zol.com.cn/detail/38/379564.shtml">CAJViewer 10.0.0</a></li><li><em>8</em><a class="title" target="_blank" title="Realtek高清音频管理器(Realtek HD audio)" href="//xiazai.zol.com.cn/detail/48/478723.shtml">Realtek高清音频管理器(Realtek HD audio)</a></li><li><em>9</em><a class="title" target="_blank" title="KMPlayer中文版 2023.2.9.11" href="//xiazai.zol.com.cn/detail/13/122319.shtml">KMPlayer中文版 2023.2.9.11</a></li><li><em>10</em><a class="title" target="_blank" title="Adobe Acrobat 9.0 Pro" href="//xiazai.zol.com.cn/detail/43/426731.shtml">Adobe Acrobat 9.0 Pro</a></li>				</ul>
+			</div>
+            			<!-- //section --> 
+			
+			<!-- section -->
+			<div class="section">
+				<div class="section-header"> 
+					<a href="//soft.zol.com.cn/school/" target="_blank" class="more">更多&raquo;</a>
+					<h3>热门教程</h3>
+				</div> 
+				<ul class="rank-list">
+                    <li><em class="n1">1</em><a target="_blank" href="//soft.zol.com.cn/photoshop/" class="title" title="Photoshop视频教程">Photoshop视频教程</a></li>
+                    <li><em class="n1">2</em><a target="_blank" href="//soft.zol.com.cn/cad/" class="title" title="CAD视频教程">CAD视频教程</a></li>
+                    <li><em class="n1">3</em><a target="_blank" href="//soft.zol.com.cn/excel/" class="title" title="EXCEL视频教程">EXCEL视频教程</a></li>
+                    <li><em>4</em><a target="_blank" href="//soft.zol.com.cn/word/" class="title" title="WORD视频教程">WORD视频教程</a></li>
+                    <li><em>5</em><a target="_blank" href="//soft.zol.com.cn/coreldraw/" class="title" title="CorelDRAW视频教程">CorelDRAW视频教程</a></li>
+                    <li><em>6</em><a target="_blank" href="//soft.zol.com.cn/flash/" class="title" title="FLASH视频教程">FLASH视频教程</a></li>
+                    <li><em>7</em><a target="_blank" href="//soft.zol.com.cn/dreamweaver/" class="title" title="Dreamweaver视频教程">Dreamweaver视频教程</a></li>
+                    <li><em>8</em><a target="_blank" href="//soft.zol.com.cn/3dmax/" class="title" title="3Dmax视频教程">3Dmax视频教程</a></li>
+                    <li><em>9</em><a target="_blank" href="//soft.zol.com.cn/100/1009392.html" class="title" title="用3DMAX制作精美LOGO">用3DMAX制作精美LOGO</a></li>
+                    <li><em>10</em><a target="_blank" href="//soft.zol.com.cn/171/1719601.html" class="title" title="Photoshop移花接木教程 恶搞人面合成">Photoshop移花接木教程 恶搞人面合成</a></li>
+				</ul>
+			</div>
+			<!-- //section -->  
+		</div>
+		<!-- //recommend-area --> 
+		
+		<!-- filter -->
+		<div class="section filter"> 
+            <a target="_blank" href="//xiazai.zol.com.cn/a.shtml">A</a><a target="_blank" href="//xiazai.zol.com.cn/b.shtml">B</a><a target="_blank" href="//xiazai.zol.com.cn/c.shtml">C</a><a target="_blank" href="//xiazai.zol.com.cn/d.shtml">D</a><a target="_blank" href="//xiazai.zol.com.cn/e.shtml">E</a><a target="_blank" href="//xiazai.zol.com.cn/f.shtml">F</a><a target="_blank" href="//xiazai.zol.com.cn/g.shtml">G</a><a target="_blank" href="//xiazai.zol.com.cn/h.shtml">H</a><a target="_blank" href="//xiazai.zol.com.cn/i.shtml">I</a><a target="_blank" href="//xiazai.zol.com.cn/j.shtml">J</a><a target="_blank" href="//xiazai.zol.com.cn/k.shtml">K</a><a target="_blank" href="//xiazai.zol.com.cn/l.shtml">L</a><a target="_blank" href="//xiazai.zol.com.cn/m.shtml">M</a><a target="_blank" href="//xiazai.zol.com.cn/n.shtml">N</a><a target="_blank" href="//xiazai.zol.com.cn/o.shtml">O</a><a target="_blank" href="//xiazai.zol.com.cn/p.shtml">P</a><a target="_blank" href="//xiazai.zol.com.cn/q.shtml">Q</a><a target="_blank" href="//xiazai.zol.com.cn/r.shtml">R</a><a target="_blank" href="//xiazai.zol.com.cn/s.shtml">S</a><a target="_blank" href="//xiazai.zol.com.cn/t.shtml">T</a><a target="_blank" href="//xiazai.zol.com.cn/u.shtml">U</a><a target="_blank" href="//xiazai.zol.com.cn/v.shtml">V</a><a target="_blank" href="//xiazai.zol.com.cn/w.shtml">W</a><a target="_blank" href="//xiazai.zol.com.cn/x.shtml">X</a><a target="_blank" href="//xiazai.zol.com.cn/y.shtml">Y</a><a target="_blank" href="//xiazai.zol.com.cn/z.shtml">Z</a><a target="_blank" href="//xiazai.zol.com.cn/1.shtml">0-9</a>		</div>
+		<!-- //filter -->
+	</div>
+	<!-- //main -->
+	<!-- //wrapper --> 
+
+</div>
+ 	<!-- wrapper -->
+<div class="wrapper section quick-navigation"> 
+	<div class="section-header">
+		<div class="links cooperation"><span>商务合作 | 刘先生 email: <font>liu.jian@zol.com.cn</font> | 张先生 email：<font>zhang.shaoyong@zol.com.cn</font></span></div> 
+		<h3>内容导航</h3>
+	</div>
+	<ul class="links clearfix"> 
+        <li><span>应用导航：</span><div class="link-items"><a target="_blank" href="//xiazai.zol.com.cn/office_soft_index/office_page_1.html">办公应用</a>|<a target="_blank" href="//xiazai.zol.com.cn/wlyx_soft_index/wlyx_page_1.html">网络游戏</a>|<a target="_blank" href="//xiazai.zol.com.cn/djgame_soft_index/djgame_page_1.html">单机游戏</a>|<a target="_blank" href="//xiazai.zol.com.cn/compress_soft_index/compress_page_1.html">压缩解压</a>|<a target="_blank" href="//xiazai.zol.com.cn/imageprocess_soft_index/imageprocess_page_1.html">图像处理</a>|<a target="_blank" href="//xiazai.zol.com.cn/upload_soft_index/upload_page_1.html">下载工具</a>|<a target="_blank" href="//xiazai.zol.com.cn/antivirus_soft_index/antivirus_page_1.html">杀毒软件</a>|<a target="_blank" href="//xiazai.zol.com.cn/mediaplay_soft_index/mediaplay_page_1.html">视频播放</a>|<a target="_blank" href="//xiazai.zol.com.cn/backuptools_soft_index/backuptools_page_1.html">备份还原</a>|<a target="_blank" href="//xiazai.zol.com.cn/recovery_soft_index/recovery_page_1.html">数据恢复</a>|<a target="_blank" href="//xiazai.zol.com.cn/wnqudong_soft_index/wnqudong_page_1.html">万能驱动</a></div></li>
+<li><span>资讯导航：</span><div class="link-items"><a target="_blank" href="//soft.zol.com.cn/more/2_1261.shtml">新闻资讯</a>|<a target="_blank" href="//soft.zol.com.cn/more/2_1257.shtml">软件新闻</a>|<a target="_blank" href="//soft.zol.com.cn/more/2_1155.shtml">技巧应用</a>|<a target="_blank" href="//xiazai.zol.com.cn/cy.html">装机必备</a>|<a target="_blank" href="//xiazai.zol.com.cn/download_order/soft_order.html">热门软件</a>|<a target="_blank" href="//xiazai.zol.com.cn/heji/21580/">office软件</a>|<a target="_blank" href="//xiazai.zol.com.cn/heji/15720/">Adobe软件</a>|<a target="_blank" href="//xiazai.zol.com.cn/detail/33/327560.shtml">谷歌浏览器</a>|<a target="_blank" href="//xiazai.zol.com.cn/detail/12/115442.shtml">WPS</a>|<a target="_blank" href="//xiazai.zol.com.cn/detail/33/329363.shtml">驱动精灵</a>|<a target="_blank" href="//xiazai.zol.com.cn/detail/44/430273.shtml">STEAM</a></div></li>            <li><span>推荐合集：</span> <div class="link-items">
+                       <a target="_blank" href="/heji/10790/">Adobe Photoshop</a>
+              
+                |                        <a target="_blank" href="/heji/3430/">RAR解压软件</a>
+              
+                |                        <a target="_blank" href="/heji/11190/">植物大战僵尸</a>
+              
+                |                        <a target="_blank" href="/heji/9270/">AutoCAD</a>
+              
+                |                        <a target="_blank" href="/heji/15520/">口袋妖怪</a>
+              
+                |                        <a target="_blank" href="/heji/8650/">贵金属行情交易软件</a>
+              
+                |                        <a target="_blank" href="/heji/5870/">Nero刻录软件</a>
+              
+                |                        <a target="_blank" href="/heji/9230/">安卓模拟器</a>
+              
+                                 </div> </li>
+        </ul>
+</div>
+<!-- //wrapper -->
+<script type="text/javascript" src="//icon.zol-img.com.cn/public/js/web_footc.js"></script>
+<script type="text/javascript" src="//icon.zol-img.com.cn/public/js/web_foot.js"></script>
+
+<script type="text/javascript" src="//s.zol-img.com.cn/d/Xiazai/Xiazai_Category.js?v=13514"></script>
+<script src="https://icon.zol-img.com.cn/xiazai/js/compare.js"></script>
+<script type="text/javascript">
+document.onkeydown=function(b){
+	     b=(b)?b:window.event;
+	     var pageIndex = 226;  
+	     var pageNum = 653;  
+	     var cateName = $("#cateInfo").attr("cateName");
+	     var order = $("#cateInfo").attr("order");
+	     if(""==pageIndex)return;                        
+	     if(b.keyCode=="37"){
+	         if(pageIndex > 1){
+	            if (pageIndex == 2){
+	                 window.location.href='/download_cate_'+cateName+'/'+cateName+'_'+order+'_1.html';
+	            }
+	           if (pageIndex > 2){
+	                 window.location.href='/download_cate_'+cateName+'/'+cateName+'_'+order+'_'+(pageIndex-1)+'.html';
+	           }
+	         }
+	     }else if(b.keyCode=="39"){
+	         if(parseInt(pageIndex) < parseInt(pageNum)){
+	              window.location.href='/download_cate_'+cateName+'/'+cateName+'_'+order+'_'+(pageIndex+1)+'.html';
+	         }
+	     }
+	 } 
+</script>
+<script type="text/javascript">
+    $(document).survey({pageType : 'xiazaiCateList'});
+    var speType = 'CateList';
+</script>
+
+<script src="https://icon.zol-img.com.cn/src/open-components/down-detail-mol/z.component.down-list-search.1.0.0.js"></script>
+
+
+
+<!-- Baidu Button BEGIN -->
+                         <script type="text/javascript" id="bdshare_js" data="type=slide&amp;img=5&amp;pos=right" ></script><script>window._bd_share_config={"common":{"wbUid": "","bdSnsKey":{"douban":"038da04052b48ba40aa8e0c0f81da2ec","qzone":"99d207b90670adceaaa416b63528d92c","tsina":"4028615622","tqq":"99d207b90670adceaaa416b63528d92c"},"bdText":"免费多媒体(音视频|多媒体播放器)了解更多请关注中关村在线软件下载平台（分享自 @ZOL软件应用平台）","bdMini":"2","bdMiniList":false,"bdPic":"","bdStyle":"0","bdSize":"16"},"slide":{"type":"slide","bdImg":"5","bdPos":"right","bdTop":"100"}};with(document)0[(getElementsByTagName("head")[0]||body).appendChild(createElement("script")).src="//icon.zol-img.com.cn/public/bdshare/static/api/js/share.js?v=89343201.js?cdnversion="+~(-new Date()/36e5)];</script></body>
+</html>
