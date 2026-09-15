@@ -28,7 +28,7 @@ def pack(words):
 
 
 def check(qemu, output, count=1, *, upper=False, nseg=False, masked=False,
-          timer=False, icount=None):
+          timer=False, icount=None, minimal=False):
     name = f"count-{count}-upper-{upper}-nseg-{nseg}-masked-{masked}-timer-{timer}-icount-{icount}"
     logical = 0xA600 if upper else 0x2600
     # 22:A600 falls in the diagnostic boot mode's read-only program mapping;
@@ -86,6 +86,8 @@ def check(qemu, output, count=1, *, upper=False, nseg=False, masked=False,
         result["owned_pid"] = emulator.process.pid
         try:
             print(f"checking {name}; owned PID={emulator.process.pid}", flush=True)
+            if minimal:
+                emulator.qmp.execute('qom-set', {'path':'/machine','property':'control-observers-minimal','value':True})
             emulator.qmp.execute("cont")
             deadline = time.monotonic() + 8
             while time.monotonic() < deadline:
@@ -129,17 +131,18 @@ def main():
     parser.add_argument("--qemu", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--first-only", action="store_true")
+    parser.add_argument('--minimal', action='store_true')
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     identity = {"qemu": str(args.qemu), "sha256": hashlib.sha256(args.qemu.read_bytes()).hexdigest()}
     (args.output / "identity.json").write_text(json.dumps(identity, indent=2) + "\n", encoding="utf-8")
-    results = [check(args.qemu, args.output)]
+    results = [check(args.qemu, args.output, minimal=args.minimal)]
     if not args.first_only:
         for count in (2, 3, 4):
-            results.append(check(args.qemu, args.output, count))
+            results.append(check(args.qemu, args.output, count, minimal=args.minimal))
         for options in ({"upper": True}, {"nseg": True}, {"masked": True}, {"icount": 5},
                         {"timer": True}, {"timer": True, "icount": 5}):
-            results.append(check(args.qemu, args.output, **options))
+            results.append(check(args.qemu, args.output, minimal=args.minimal, **options))
     assert hashlib.sha256(args.qemu.read_bytes()).hexdigest() == identity["sha256"], "build changed"
     (args.output / "report.json").write_text(json.dumps({"passed": True, "identity": identity, "cases": results}, indent=2) + "\n", encoding="utf-8")
     return 0

@@ -7,6 +7,11 @@ param(
     [string]$MaskRom,
     [string]$SocRom,
     [switch]$SocRomSkeleton,
+    [uint32]$RomMp3HleBase = 0,
+    [uint32]$RomMp3ArenaImage = 0,
+    [switch]$InstructionClock,
+    [switch]$Realtime,
+    [switch]$FullControlObservers,
     [string]$UsbLoader,
     [string]$BurnCode,
     [string]$DriverCode,
@@ -27,12 +32,20 @@ param(
     [ValidateRange(0, 1)]
     [int]$ExternalPower = 0,
     [int]$Port = 8765,
+    [string]$ListenAddress = '127.0.0.1',
     [string]$RunLogDir,
     [string]$ShutdownToken,
     [switch]$NoBrowser
 )
 
 $ErrorActionPreference = 'Stop'
+# wslpath emits UTF-8. A hidden Windows PowerShell process may otherwise
+# decode the Chinese factory-firmware directory using the legacy code page.
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = $OutputEncoding
+if ($Realtime -and (-not $InstructionClock -or (-not $Device -and $IcountShift -ne 0))) {
+    throw 'Realtime requires InstructionClock and IcountShift 0 (or a device bound to shift 0).'
+}
 $distro = 'Ubuntu2'
 $scriptWindows = Join-Path $PSScriptRoot 'web\np560_web.py'
 if (-not $Firmware) {
@@ -114,7 +127,7 @@ if ($LASTEXITCODE -ne 0 -or -not $wslScript) {
     throw 'Unable to translate paths into WSL.'
 }
 
-$pythonArguments = @($wslScript, '--port', [string]$Port)
+$pythonArguments = @($wslScript, '--host', $ListenAddress, '--port', [string]$Port)
 if (-not $Device -or $PSBoundParameters.ContainsKey('Qemu')) {
     $qemuWindows = (Resolve-Path -LiteralPath $Qemu).Path -replace '\\', '/'
     $wslQemu = (& wsl.exe -d $distro -- wslpath -a -- $qemuWindows).Trim()
@@ -151,6 +164,15 @@ if ($LogUnimp) {
 }
 if ($IcountShift -ge 0) {
     $pythonArguments += @('--icount-shift', [string]$IcountShift)
+}
+if ($InstructionClock) { $pythonArguments += '--instruction-clock' }
+if ($Realtime) { $pythonArguments += '--realtime' }
+if ($FullControlObservers) { $pythonArguments += '--full-control-observers' }
+if ($RomMp3HleBase) {
+    $pythonArguments += @('--rom-mp3-hle-base', [string]$RomMp3HleBase)
+}
+if ($RomMp3ArenaImage) {
+    $pythonArguments += @('--rom-mp3-arena-image', [string]$RomMp3ArenaImage)
 }
 if ($ShutdownToken) {
     $pythonArguments += @('--shutdown-token', $ShutdownToken)

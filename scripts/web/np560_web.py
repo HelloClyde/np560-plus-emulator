@@ -276,10 +276,13 @@ class Emulator:
                  soc_rom_skeleton: bool = False,
                  log_unimp: bool = False,
                  icount_shift: int | str | None = None,
+                 icount_align: bool = False,
                  nand_save_on_exit: Path | None = None,
                  start_paused: bool = False,
                  journal: RunJournal | None = None,
                  nand_journal: Path | None = None):
+        if icount_align and icount_shift != 0:
+            raise ValueError("real-time pacing requires fixed icount shift 0")
         if nand_image is not None and nand_checkpoint is not None:
             raise ValueError("nand_image and nand_checkpoint are mutually exclusive")
         if rom_mp3_hle_base and (rom_hle or hle_ui or not soc_rom_skeleton or soc_rom is None):
@@ -355,7 +358,7 @@ class Emulator:
             command.append("-S")
         if icount_shift is not None:
             command.extend((
-                "-icount", f"shift={icount_shift},align=off,sleep=on",
+                "-icount", f"shift={icount_shift},align={'on' if icount_align else 'off'},sleep=on",
             ))
         if log_unimp:
             command.extend(("-d", "unimp"))
@@ -1153,6 +1156,8 @@ def parse_args(argv=None) -> argparse.Namespace:
         help=("advance virtual time by 2^N ns per DMCU instruction instead "
               "of tying the 64 Hz timer to slow host execution"),
     )
+    parser.add_argument('--realtime', action='store_true',
+                        help='pace a sufficiently fast instruction-clock CPU to host time; requires --instruction-clock --icount-shift 0')
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument(
@@ -1333,10 +1338,13 @@ def run_server(args: argparse.Namespace) -> int:
 
 def start_emulator(args: argparse.Namespace, journal: RunJournal) -> Emulator:
     instruction_clock = getattr(args, "instruction_clock", False)
+    realtime = getattr(args, 'realtime', False)
     minimal_observers = not (getattr(args, "full_control_observers", False) or
                             args.rom_hle or args.hle_ui)
     if instruction_clock and args.icount_shift != 0:
         raise ValueError("--instruction-clock requires --icount-shift 0")
+    if realtime and not instruction_clock:
+        raise ValueError('--realtime requires --instruction-clock')
     emulator = Emulator(
         qemu=args.qemu, firmware=args.firmware,
         mask_rom=args.mask_rom, soc_rom=args.soc_rom,
@@ -1355,6 +1363,7 @@ def start_emulator(args: argparse.Namespace, journal: RunJournal) -> Emulator:
         soc_rom_skeleton=args.soc_rom_skeleton,
         log_unimp=args.log_unimp,
         icount_shift=args.icount_shift,
+        icount_align=realtime,
         nand_save_on_exit=args.nand_save_on_exit,
         start_paused=bool(
             instruction_clock or minimal_observers or args.debug_program_load or args.initial_key_matrix_low or

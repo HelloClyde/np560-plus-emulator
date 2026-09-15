@@ -16,6 +16,7 @@ from array import array
 import base64
 import hashlib
 import json
+import re
 from pathlib import Path
 import struct
 import subprocess
@@ -348,10 +349,22 @@ def main():
                    help="optional exact gray5 startup-card reference; dismiss once using physical Enter")
     p.add_argument("--key-release",choices=("auto","candidate","host-pulse"),default="auto",
                    help="physical-key release policy; explicit candidate enables same-input clock comparisons")
+    p.add_argument('--key-pulse-ms', type=int, choices=range(20,501), default=150,
+                   help='fixed physical hold duration for host-pulse; never wait for a guest candidate')
     p.add_argument("--observe-dtu-refill",action="store_true",
                    help="opt-in read-only completion/IRQ/refill timestamps, no hardware changes")
     p.add_argument("--minimal-control-observers",action="store_true",
                    help="experimental reduced historical observers; strict faults and key ACK retained")
+    p.add_argument('--speed-window-seconds', type=int, choices=range(0,61), default=0,
+                   help='unpaused desktop/player speed windows with LCD polling; no debugger')
+    p.add_argument('--profile-player', action='store_true',
+                   help='after speed windows, collect 20 read-only CPU stack samples; not timing evidence')
+    p.add_argument('--speed-audio-poll', action='store_true',
+                   help='also fetch the complete DAC packet every 50 ms in the player speed window')
+    p.add_argument('--profile-samples', type=int, choices=range(1,101), default=20,
+                   help='bounded number of debugger samples, outside timing windows')
+    p.add_argument('--realtime', action='store_true',
+                   help='enable QEMU host pacing; requires the instruction clock')
     p.add_argument("--observe-dtu-config",action="store_true",
                    help="read the bounded ED configuration trace; no breakpoints or guest writes")
     p.add_argument("--record-device-audio",action="store_true",
@@ -382,6 +395,12 @@ def main():
     p.add_argument("--observe-audio-files",action="store_true",
                    help="read sparse original file/callback boundaries without a host debugger")
     args=p.parse_args()
+    if args.realtime and not args.instruction_clock:
+        p.error('--realtime requires --instruction-clock')
+    if args.speed_window_seconds and (not args.instruction_clock or any((
+            args.observe_state_writes, args.observe_end_writes, args.observe_input_writes,
+            args.observe_file_scan_writes, args.observe_exit_heap_writes))):
+        p.error('speed windows require instruction clock and no debugger observers')
     if args.instruction_clock and args.icount_shift != 0:
         p.error("--instruction-clock requires --icount-shift 0")
     if not 1 <= args.host_timeout_scale <= 20:
@@ -424,6 +443,7 @@ def main():
     report["rom_mp3_hle_base"]=args.rom_mp3_hle_base
     report["icount_shift"]=args.icount_shift
     report["instruction_clock"]=args.instruction_clock
+    report['realtime_pacing']=args.realtime
     report["host_timeout_scale"]=args.host_timeout_scale
     # Fixed instruction time can run much slower than host time. A 150 ms
     # HOST pulse then disappears before one original scanner iteration.
@@ -432,9 +452,9 @@ def main():
     # Do not use a single-scan device pulse or inject the logical event.
     candidate_release=(args.key_release=="candidate" or
         (args.key_release=="auto" and args.icount_shift is not None))
-    key_pulse_duration=0 if candidate_release else .15
+    key_pulse_duration=0 if candidate_release else args.key_pulse_ms / 1000
     report["key_press_policy"]=("physical level until original candidate, then release"
-        if key_pulse_duration==0 else "physical level for 0.15 host seconds")
+        if key_pulse_duration==0 else f"physical level for {key_pulse_duration} host seconds")
     startup_card=None
     if args.startup_card_reference is not None:
         startup_card=args.startup_card_reference.read_bytes()
@@ -566,6 +586,63 @@ def main():
                 arm_file_scan(scan_frame,label)
             return state
         finally: emulator.qmp.execute("cont")
+    def speed_window(label):
+        if not args.speed_window_seconds:
+            return
+        emulator.qmp.execute('stop')
+        def clock_ns():
+            clock=emulator.qmp.execute('qom-get', {'path':'/machine','property':'instruction-clock-state'})
+            assert 'FAULT:0' in clock, clock
+            return int(re.search(r'\bNS:(\d+)', clock)[1])
+        start_ns=clock_ns()
+        audio_before=emulator.audio() if label == 'player' else None
+        if audio_before:
+            assert audio_before['enabled'] and audio_before['request_clock']['running'], 'speed window is not active playback'
+        started=time.monotonic()
+        emulator.qmp.execute('cont')
+        polls=0
+        audio_polls=0
+        next_lcd=started
+        poll_audio=args.speed_audio_poll and label == 'player'
+        while time.monotonic()-started < args.speed_window_seconds:
+            if time.monotonic() >= next_lcd:
+                emulator.snapshot('lcd', 0, 0, diagnostics=False)
+                polls+=1
+                next_lcd=time.monotonic()+.2
+            if poll_audio:
+                emulator.audio()
+                audio_polls+=1
+            time.sleep(.05 if poll_audio else .2)
+        emulator.qmp.execute('stop')
+        elapsed=time.monotonic()-started
+        end_ns=clock_ns()
+        cpu=emulator.qmp.execute('qom-get', {'path':'/machine','property':'cpu-state'})
+        assert all(f'{field}=none' in cpu for field in ('ROM_MISSING','UNSUPPORTED','INVALID_CONTROL'))
+        result=dict(label=label, host_seconds=elapsed, guest_seconds=(end_ns-start_ns)/1e9,
+                    realtime_ratio=(end_ns-start_ns)/1e9/elapsed, lcd_polls=polls,
+                    audio_polls=audio_polls)
+        report.setdefault('speed_windows', []).append(result)
+        if audio_before:
+            audio_after=emulator.audio()
+            before, after = audio_before['request_clock'], audio_after['request_clock']
+            assert audio_after['enabled'] and after['running'], 'playback ended during the speed window'
+            assert before['hz'] == after['hz'] and before['pll'] == after['pll']
+            ticks=after['ticks']-before['ticks']
+            expected_ticks=result['guest_seconds']*after['hz']
+            result['audio_request_ticks']=ticks
+            result['audio_request_hz']=after['hz']
+            result['audio_request_duty_ratio']=ticks/expected_ticks
+            result['audio_control_events']=audio_after['control_event_next']-audio_before['control_event_next']
+            # The pinned short tone loops through the original stop/open/
+            # reconfigure path, as observed before this optimization. Do not
+            # mislabel it as continuous audio, or accept an idle-ended test.
+            result['audio_continuous']=abs(ticks-expected_ticks) < 2+after['hz']*.01
+            assert .90 < result['audio_request_duty_ratio'] < 1.01, result
+            assert result['audio_continuous'] or result['audio_control_events'] > 0, result
+            result['audio_playback_window']=True
+        print('unpaused speed: '+json.dumps(result), flush=True)
+        emulator.qmp.execute('cont')
+
     def arm_file_scan(frame,label):
         nonlocal watch
         # Called by capture while the owned guest is still QMP-stopped.
@@ -580,6 +657,7 @@ def main():
             rom_mp3_hle_base=args.rom_mp3_hle_base,
             rom_mp3_arena_image=args.rom_mp3_arena_image,
             icount_shift=args.icount_shift,
+            icount_align=args.realtime,
             nand_checkpoint=args.nand_checkpoint,soc_rom_skeleton=True,
             boot_mode="firmware-vma03",start_paused=True,journal=journal)
         if args.instruction_clock:
@@ -626,6 +704,7 @@ def main():
             time.sleep(1)
         assert stable>=3,"desktop did not complete"
         capture("00-desktop")
+        speed_window('desktop')
         route=[("start",55,0xb0),("entertainment",53,0x86),("mp3",53,0x86),
                ("open-file",60,0xe2),("parent",53,0x86)]
         route += [(f"down-{i+1}",37,0x83) for i in range(28)]
@@ -697,6 +776,16 @@ def main():
                 time.sleep(5);state=capture(f"05-codec-{i+1}")
             assert "ROM_MISSING=none" in state["registers"],state["registers"].splitlines()[0]
             assert report.get("native_owner_and_pcm_observed"),"no initialized native owner and PCM observed within window"
+            speed_window('player')
+            if args.profile_player:
+                report['player_profile']=f'{args.profile_samples} debugger samples AFTER timing windows; not timing evidence'
+                for sample in range(args.profile_samples):
+                    trace=subprocess.run(['gdb','-q','-nx','-batch','-p',str(emulator.process.pid),
+                        '-ex','set pagination off','-ex','thread apply all bt 8','-ex','detach'],
+                        stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=15)
+                    (args.output/f'player-profile-{sample:02}.txt').write_text(trace.stdout)
+                    assert trace.returncode==0,trace.stdout
+                    time.sleep(.25)
             if args.observe_play_controls:
                 if args.observe_state_writes:
                     import build_np560_mp3_session as session

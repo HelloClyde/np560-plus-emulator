@@ -20,7 +20,7 @@ from web.np560_web import Emulator
 
 
 def check(qemu, output, name, entry, body, patch, internal=False,
-          byte=False, in_place=False, *, icount=None, instruction_clock=False):
+          byte=False, in_place=False, *, icount=None, instruction_clock=False, minimal=False):
     words = [0x6800, 2, 0x68FF, 0x6000, 0x6810, 6]
     replacement = 0xBE34 if byte else 0xBEEF
     if internal:
@@ -64,6 +64,8 @@ def check(qemu, output, name, entry, body, patch, internal=False,
         result["owned_pid"] = emulator.process.pid
         print(f"checking {name}; owned PID={emulator.process.pid}", flush=True)
         try:
+            if minimal:
+                emulator.qmp.execute('qom-set', {'path':'/machine','property':'control-observers-minimal','value':True})
             if instruction_clock:
                 emulator.qmp.execute("qom-set", {"path":"/machine", "property":"instruction-clock", "value":True})
             emulator.qmp.execute("cont")
@@ -205,14 +207,17 @@ def main():
     parser.add_argument("--original-prg", type=Path)
     parser.add_argument("--instruction-clock", action="store_true",
                         help="test only partial instruction clock with fixed shift=0")
+    parser.add_argument('--minimal', action='store_true')
     args = parser.parse_args()
     if args.instruction_clock and args.original_prg:
         parser.error("instruction-clock currently covers executable-write cases only")
+    if args.minimal and args.original_prg:
+        parser.error('minimal currently covers executable-write cases only')
     if args.case == "original-relocated-irq" and not args.original_prg:
         parser.error("original-relocated-irq requires --original-prg")
     args.output.mkdir(parents=True, exist_ok=False)
     identity = hashlib.sha256(args.qemu.read_bytes()).hexdigest()
-    report = {"passed": False, "qemu_sha256": identity, "cases": []}
+    report = {"passed": False, "qemu_sha256": identity, "minimal": args.minimal, "cases": []}
     try:
         for name, parameters in CASES.items():
             if args.case and args.case != name:
@@ -220,7 +225,7 @@ def main():
             for icount in ((0,) if args.instruction_clock else (None, 5)):
                 report["cases"].append(check(args.qemu, args.output, f"{name}-icount{icount}",
                                               *parameters, icount=icount,
-                                              instruction_clock=args.instruction_clock))
+                                              instruction_clock=args.instruction_clock, minimal=args.minimal))
         if args.original_prg and args.case in (None, "original-relocated-irq"):
             for icount in (None, 5):
                 report["cases"].append(check_original_relocated_irq(

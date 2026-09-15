@@ -53,12 +53,16 @@
           <button type="button" data-key="ArrowRight" class="right">▶</button>
           <button type="button" data-key="ArrowDown" class="down">▼</button>
         </div>
-        <div id="keyboard" class="keyboard" aria-label="仿真键盘"></div>
+        <button type="button" data-key="Escape" class="mobile-back">返回 / 退出</button>
+        <details class="keyboard-panel">
+          <summary>完整键盘（字母、数字及更多功能键）</summary>
+          <div id="keyboard" class="keyboard" aria-label="仿真键盘"></div>
+        </details>
         <p class="unmapped-note">只启用已由 V3.80 事件表确认的实体键；照片中其余侧键仍标记为未映射，不会向 guest 发送事件。</p>
       </div>
     </section>
 
-    <details class="debug-panel" open>
+    <details class="debug-panel">
       <summary>LCD 与调试</summary>
       <div class="debug-grid">
         <form id="frame-settings" class="settings">

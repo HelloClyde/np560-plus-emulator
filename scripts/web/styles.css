@@ -22,6 +22,11 @@ body {
   font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
 }
 button, input, select { font: inherit; }
+button { touch-action: manipulation; }
+[data-key] { touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+.device > *, .debug-grid > *, .input-deck { min-width: 0; }
+.keyboard-panel summary { cursor: pointer; padding: .75rem 0; font-size: .85rem; }
+.mobile-back { min-height: 44px; }
 button {
   border: 1px solid var(--line);
   border-radius: .55rem;
@@ -121,5 +126,32 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
   .device { padding: .75rem; border-radius: 1rem; }
   .settings { grid-template-columns: 1fr; }
   .settings .scan-buttons, .settings p { grid-column: 1; }
-  .keyboard { grid-template-columns: repeat(8, 1fr); }
+  .keyboard { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+  .keyboard button { min-height: 48px; font-size: .9rem; }
+  .screen-bezel { padding: .65rem; }
+  .screen-header { flex-wrap: wrap; font-size: .65rem; }
+  #frame-address { display: none; }
+  .softkeys { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .softkeys button { min-height: 48px; }
+  .softkeys [data-key="StartMenu"] { grid-column: 1 / -1; }
+  .navigation { grid-template-rows: repeat(3, 48px); width: min(18rem, 100%); }
+  .audio-controls { flex-wrap: wrap; }
+  #audio-status, #status { overflow-wrap: anywhere; }
+  .topbar { gap: .65rem; }
+  .input-deck-heading p, .unmapped-note { display: none; }
+  .topbar h1 { font-size: 1.15rem; }
+  .input-deck { gap: .6rem; }
+}
+@media (pointer: coarse) {
+  button { min-height: 44px; }
+  .navigation { grid-template-rows: repeat(3, 48px); }
+}
+@media (orientation: landscape) and (min-width: 600px) and (max-height: 600px) {
+  .app-shell { padding: .5rem; }
+  .device { grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); padding: .75rem; gap: .75rem; }
+  .topbar h1, .eyebrow, .input-deck-heading p, .unmapped-note { display: none; }
+  .topbar { gap: .5rem; margin-bottom: .5rem; }
+  .audio-controls { width: auto; }
+  .screen-header { flex-wrap: wrap; }
+  #frame-address { display: none; }
 }

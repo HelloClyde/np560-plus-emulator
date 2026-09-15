@@ -54,7 +54,7 @@ def fixture(kind, tail):
     return raw, count, expected_r6
 
 
-def check(qemu, output, kind, tail, shift):
+def check(qemu, output, kind, tail, shift, minimal=False):
     name = f"{kind}-tail{tail}-shift{shift}"
     firmware = output / (name + ".prg")
     raw, expected, expected_r6 = fixture(kind, tail)
@@ -66,6 +66,8 @@ def check(qemu, output, kind, tail, shift):
     try:
         emu = Emulator(qemu=qemu, firmware=firmware, start_paused=True,
                        icount_shift=shift, journal=journal)
+        if minimal:
+            emu.qmp.execute('qom-set', {'path':'/machine', 'property':'control-observers-minimal', 'value':True})
         before = emu.qmp.execute("query-replay")["icount"]
         emu.qmp.execute("cont")
         deadline = time.monotonic() + 10
@@ -108,14 +110,15 @@ def main():
     p.add_argument("--qemu", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--shift", type=int, choices=range(11), default=5)
+    p.add_argument('--minimal', action='store_true')
     args = p.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     identity = hashlib.sha256(args.qemu.read_bytes()).hexdigest()
-    cases = [check(args.qemu, args.output, kind, tail, args.shift)
+    cases = [check(args.qemu, args.output, kind, tail, args.shift, args.minimal)
              for kind in ("straight", "repeat", "repeat-block", "crit", "ignds", "ds")
              for tail in (0, 12)]
     assert hashlib.sha256(args.qemu.read_bytes()).hexdigest() == identity
-    report = dict(qemu_sha256=identity, nand_used=False, host_guest_memory_writes=0,
+    report = dict(qemu_sha256=identity, minimal=args.minimal, nand_used=False, host_guest_memory_writes=0,
                   scope="instruction accounting; not hardware cycle accuracy",
                   cases=cases, passed=all(c["passed"] for c in cases))
     (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")

@@ -45,7 +45,7 @@ TARGETS = {
 }
 
 
-def check(qemu, output, name, icount):
+def check(qemu, output, name, icount, minimal=False):
     words = [0x6800, 2, 0x6801, 0, 0x68FF, 0x6000, 0x68FB, 0x6100,
              0x68F0, 0x1234, 0x68F1, 1, 0x68F2, 0x2400]
     if name.startswith("cirq-"):
@@ -66,7 +66,7 @@ def check(qemu, output, name, icount):
     case = f"{name}-icount{icount}"
     result = run(qemu, output, case, words,
                  {0: 0x1234, 1: 1, 2: 0x2400, 11: 0x6100, 15: 0x6000},
-                 icount=icount, fault=f"20:{address:04x} WORD={target[0]:04x}",
+                 icount=icount, minimal=minimal, fault=f"20:{address:04x} WORD={target[0]:04x}",
                  metadata={"boundary": "IREP dispatch remains unimplemented",
                            "reason": reason, "target_words": target})
     state = (output / f"{case}.cpu.txt").read_text(encoding="utf-8")
@@ -80,6 +80,7 @@ def main():
     parser.add_argument("--qemu", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--case", choices=[*TARGETS, "cirq-rep", "cirq-repb"])
+    parser.add_argument('--minimal', action='store_true')
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     (args.output / "identity.json").write_text(json.dumps({
@@ -87,7 +88,7 @@ def main():
         "scope": "illegal REP boundary, not EXR/IREP hardware completion",
     }, indent=2) + "\n", encoding="utf-8")
     cases = [args.case] if args.case else [*TARGETS, "cirq-rep", "cirq-repb"]
-    results = [check(args.qemu, args.output, name, icount)
+    results = [check(args.qemu, args.output, name, icount, args.minimal)
                for name in cases for icount in (None, 5)]
     (args.output / "report.json").write_text(json.dumps({
         "passed": all(r["passed"] for r in results), "results": results,

@@ -1,7 +1,12 @@
 [CmdletBinding()]
-param()
+param(
+    [ValidateSet('keep', '2', '3')]
+    [string]$Optimization = 'keep'
+)
 
 $ErrorActionPreference = 'Stop'
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = $OutputEncoding
 $distro = 'Ubuntu2'
 $buildDir = '/mnt/e/qemu-dmcu-build'
 $sourceWindows = (Join-Path (Split-Path $PSScriptRoot -Parent) 'qemu-dmcu') `
@@ -39,8 +44,11 @@ $quotedOptions = $options -join ' '
 $buildPath = '/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 $configure = "if [ ! -f build.ninja ]; then " +
     "env PATH=$buildPath '$sourceDir/configure' $quotedOptions; fi"
+$optimize = if ($Optimization -eq 'keep') { 'true' } else {
+    "./pyvenv/bin/meson configure -Doptimization=$Optimization ."
+}
 $command = "mkdir -p '$buildDir' && cd '$buildDir' && " +
-    "$configure && ninja -j4 qemu-system-dmcu"
+    "$configure && $optimize && ninja -j4 qemu-system-dmcu"
 
 & wsl.exe -d $distro -- bash -lc $command
 if ($LASTEXITCODE -ne 0) {

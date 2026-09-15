@@ -90,18 +90,20 @@ def fields(text):
             for k,v in re.findall(r"\b([A-Z_]+):([0-9a-f]+)\b", text)}
 
 
-def run(qemu, output, name):
+def run(qemu, output, name, minimal=False):
     p, final_pc = program(name)
     raw = struct.pack(f"<{len(p.words)}H", *p.words)
     firmware = output/(name + ".prg")
     firmware.write_bytes(raw)
     journal = RunJournal(output/"runs", case=name)
-    result = dict(name=name, passed=False, run_directory=str(journal.directory))
+    result = dict(name=name, passed=False, minimal=minimal, run_directory=str(journal.directory))
     emu = None
     try:
         emu = Emulator(qemu=qemu, firmware=firmware, start_paused=True,
                        icount_shift=0, journal=journal)
         emu.qmp.execute("qom-set", {"path":"/machine", "property":"instruction-clock", "value":True})
+        if minimal:
+            emu.qmp.execute('qom-set', {'path':'/machine', 'property':'control-observers-minimal', 'value':True})
         emu.qmp.execute("cont")
         for attempt in range(300):
             clock = emu.qmp.execute("qom-get", {"path":"/machine", "property":"instruction-clock-state"})
@@ -190,9 +192,10 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument("--qemu",type=Path,required=True)
     p.add_argument("--output",type=Path,required=True)
+    p.add_argument('--minimal', action='store_true')
     args=p.parse_args(); args.output.mkdir(parents=True,exist_ok=False)
     identity=hashlib.sha256(args.qemu.read_bytes()).hexdigest()
-    cases=[run(args.qemu,args.output,name) for name in (
+    cases=[run(args.qemu,args.output,name,args.minimal) for name in (
         "changes","timer-fast","timer-slow","independent-tb","power-unsupported","rate-unsupported")]
     cases += [reject(args.qemu,args.output,shift) for shift in (None,5,"auto")]
     assert hashlib.sha256(args.qemu.read_bytes()).hexdigest()==identity

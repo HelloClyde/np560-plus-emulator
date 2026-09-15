@@ -106,6 +106,7 @@ def main():
     parser.add_argument('--qemu', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--first-only', action='store_true')
+    parser.add_argument('--minimal', action='store_true')
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     identity = hashlib.sha256(args.qemu.read_bytes()).hexdigest()
@@ -113,7 +114,7 @@ def main():
     results = []
     for name, words, expected, fault in cases():
         results.append(run(args.qemu, args.output, name, words,
-                           {15: 0x6000, **expected}, fault=fault))
+                           {15: 0x6000, **expected}, fault=fault, minimal=args.minimal))
         if args.first_only:
             break
     assert hashlib.sha256(args.qemu.read_bytes()).hexdigest() == identity

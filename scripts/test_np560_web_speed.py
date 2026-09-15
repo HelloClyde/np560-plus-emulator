@@ -6,6 +6,20 @@ from web import np560_web as web
 
 
 class WebSpeedTests(unittest.TestCase):
+    def test_realtime_rejects_unclocked_execution(self):
+        args = SimpleNamespace(instruction_clock=False, realtime=True,
+                               full_control_observers=False, rom_hle=False,
+                               hle_ui=False)
+        with self.assertRaisesRegex(ValueError, 'instruction-clock'):
+            web.start_emulator(args, None)
+
+    def test_realtime_rejects_adaptive_or_scaled_icount(self):
+        from pathlib import Path
+        for shift in (None, 'auto', 1):
+            with self.assertRaisesRegex(ValueError, 'fixed icount shift 0'):
+                web.Emulator(qemu=Path('unused'), firmware=Path('unused'),
+                             icount_shift=shift, icount_align=True)
+
     def test_light_snapshot_retains_frame_and_skips_cpu_dump(self):
         emu = web.Emulator.__new__(web.Emulator)
         emu.process = Mock()
@@ -40,6 +54,14 @@ class WebSpeedTests(unittest.TestCase):
                 ('qom-set', {'path':'/machine','property':'control-observers-minimal','value':True}))
             self.assertEqual(emu.qmp.execute.call_args_list[-1].args, ('cont',))
             self.assertEqual(len(emu.qmp.execute.call_args_list), 2)
+            self.assertFalse(constructor.call_args.kwargs['icount_align'])
+        args.instruction_clock = True
+        args.icount_shift = 0
+        args.realtime = True
+        with patch.object(web, 'Emulator') as constructor:
+            web.start_emulator(args, None)
+            self.assertTrue(constructor.call_args.kwargs['icount_align'])
+            self.assertEqual(constructor.call_args.kwargs['icount_shift'], 0)
 
 
 if __name__ == '__main__':

@@ -36,7 +36,7 @@ def run(qemu, output, name, words, expected, *, rom=None, tail=None,
         boot_mode="firmware", expected_disassembly=None,
         expected_lcd=None, expected_annunciators=None, expected_lcd_state=None,
         timeout=10, poll_interval=0.01, capture_ranges=None, expected_code=None,
-        profile_pc=False, rom_mp3_hle_base=0):
+        profile_pc=False, rom_mp3_hle_base=0, minimal=False):
     final = (0x030000 if boot_mode == "firmware-vma03" else 0x200000) + len(words) * 2
     words = [*words, 0xD0FF]
     program = bytearray(pack(words))
@@ -45,7 +45,7 @@ def run(qemu, output, name, words, expected, *, rom=None, tail=None,
         assert offset >= len(program)
         program.extend(bytes(offset + len(data) - len(program)))
         program[offset:offset + len(data)] = data
-    result = {"name": name, "passed": False, "icount": icount,
+    result = {"name": name, "passed": False, "icount": icount, "minimal": minimal,
               "host_guest_memory_writes": 0, "nand_used": False,
               "metadata": metadata or {}, "expected": expected,
               "expected_fault": fault}
@@ -75,6 +75,8 @@ def run(qemu, output, name, words, expected, *, rom=None, tail=None,
                 asm_path = (output / f"{name}.asm.log").resolve()
                 assert not emulator.qmp.hmp(f"logfile {json.dumps(str(asm_path))}")
                 assert not emulator.qmp.hmp("log in_asm")
+            if minimal:
+                emulator.qmp.execute('qom-set', {'path':'/machine', 'property':'control-observers-minimal', 'value':True})
             emulator.qmp.execute("cont")
             started = time.monotonic()
             deadline = started + timeout
