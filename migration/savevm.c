@@ -3197,6 +3197,7 @@ void qmp_xen_save_devices_state(const char *filename, bool has_live, bool live,
     QIOChannelFile *ioc;
     int saved_vm_running;
     int ret;
+    int close_ret;
 
     if (!has_live) {
         /* live default to true so old version of Xen tool stack can have a
@@ -3217,7 +3218,9 @@ void qmp_xen_save_devices_state(const char *filename, bool has_live, bool live,
     f = qemu_file_new_output(QIO_CHANNEL(ioc));
     object_unref(OBJECT(ioc));
     ret = qemu_save_device_state(f);
-    if (ret < 0 || qemu_fclose(f) < 0) {
+    /* Close even when a device rejects saving; do not short-circuit it. */
+    close_ret = qemu_fclose(f);
+    if (ret < 0 || close_ret < 0) {
         error_setg(errp, QERR_IO_ERROR);
     } else {
         /* libxl calls the QMP command "stop" before calling
@@ -3258,6 +3261,13 @@ void qmp_xen_load_devices_state(const char *filename, Error **errp)
 
     ioc = qio_channel_file_new_path(filename, O_RDONLY | O_BINARY, 0, errp);
     if (!ioc) {
+        return;
+    }
+    /* Pair migration_incoming_state_destroy() below, including load_setup
+     * failures. Otherwise a rejected device state aborts in yank cleanup
+     * instead of returning the QMP error to the caller. */
+    if (!yank_register_instance(MIGRATION_YANK_INSTANCE, errp)) {
+        object_unref(OBJECT(ioc));
         return;
     }
     qio_channel_set_name(QIO_CHANNEL(ioc), "migration-xen-load-state");

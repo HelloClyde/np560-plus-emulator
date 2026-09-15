@@ -3,6 +3,7 @@
 #include "qemu/osdep.h"
 #include "qemu/datadir.h"
 #include "qapi/error.h"
+#include "qapi/visitor.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
@@ -12,7 +13,17 @@
 #include "exec/exec-all.h"
 #include "exec/tb-flush.h"
 #include "sysemu/reset.h"
+#include "sysemu/runstate.h"
+#include "sysemu/cpu-timers.h"
+#include "sysemu/replay.h"
+#include "migration/blocker.h"
+#include "migration/register.h"
+#include "migration/qemu-file.h"
 #include "cpu.h"
+#include "np560_timer.h"
+#include "np560_audio.h"
+#include "np560_nand_journal.h"
+#include "np560_mp3_hle.h"
 
 #define TYPE_NP560_MACHINE MACHINE_TYPE_NAME("np560")
 OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
@@ -50,22 +61,19 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_ECC_BASE             0x0000f20au
 #define NP560_ECC_SIZE             0x06u
 #define NP560_ADC_BASE             0x0000f2d0u
-#define NP560_ADC_SIZE             0x02u
-#define NP560_KEYBOARD_GPIO_BASE   0x0000f010u
-#define NP560_KEYBOARD_GPIO_SIZE   0x02u
+/* Adjacent ADC F2D0, CPU PLL F2D2 and audio PLL F2D4 share a window. */
+#define NP560_ADC_SIZE             0x06u
 #define NP560_KEYBOARD_TRACE       32u
 #define NP560_MATRIX_TRACE         16u
 #define NP560_SYSTEM_CONTROL_TRACE 16u
 #define NP560_SYSTEM_CONTROL_BASE  0x0000f100u
 #define NP560_SYSTEM_CONTROL_SIZE  0x02u
+#define NP560_LOW_SFR_BASE         0x0000f100u
+#define NP560_LOW_SFR_SIZE         0x100u
 #define NP560_KEY_MATRIX_BASE      0x0000f160u
 #define NP560_KEY_MATRIX_SIZE      0x06u
 #define NP560_KEYBOARD_BASE        0x0000f340u
 #define NP560_KEYBOARD_SIZE        0x08u
-#define NP560_TIMER_BASE           0x00000494u
-#define NP560_TIMER_SIZE           0x06u
-#define NP560_TIMER_COUNT          3u
-#define NP560_TIMER_FREQUENCY      64u
 #define NP560_NAND_PAGE_DATA       2048u
 #define NP560_NAND_PAGE_OOB        64u
 #define NP560_NAND_PAGE_TOTAL      (NP560_NAND_PAGE_DATA + NP560_NAND_PAGE_OOB)
@@ -85,15 +93,37 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_NAND_CAFE_PREFIX     32u
 
 /*
- * The application power-state path at 2D:2D98 copies 22 words from
- * 2F:550C to data address 00:1002 and immediately jumps there.  Only this
- * prefix is writable internal code RAM; execution after 00:102E falls
- * through into resident ROM.  Map the same RAMBlock on the code bus so normal
- * guest data writes install executable instructions and trigger QEMU's usual
- * self-modifying-code invalidation.
+ * Experimental link-time view of NP560.PRG.
+ *
+ * Treating file byte zero as 20:0000 makes the reset stub's first call leave
+ * the image and creates a uniform +0x1d-segment "source copy" for every
+ * target.  Mapping the same four MiB at 03:0000 instead makes the reset call
+ * local, resolves its 33:4F50 continuation directly, and gives the complete
+ * image the coherent linked range 03:0000..42:FFFF.  Keep this selectable
+ * until native boot proves the mapping dynamically; the legacy mapping stays
+ * available as boot-mode=firmware.
  */
-#define NP560_INTERNAL_CODE_PREFIX_BASE 0x00001002u
-#define NP560_INTERNAL_CODE_PREFIX_SIZE 0x0000002cu
+#define NP560_PROGRAM_VMA03_BASE   0x00030000u
+
+/*
+ * CN1916884A Fig. 2 places internal X RAM at 00:0000..00:7FFF;
+ * the program-addressing section explicitly permits executing it, but not
+ * the separate Y RAM beginning at 00:8000. Use the same RAMBlock for data
+ * and instructions across the full X window, not just known entry bodies.
+ * The factory power path executes its copy at 00:1002, and another factory
+ * IRQ body is copied to 00:1202 before the RAM vector is changed to it.
+ * A former 00:102D cutoff made that valid IRQ fetch unrelated ROM bytes.
+ * Legacy reconstructed-ROM payloads below 00:8000 must not hide X RAM.
+ */
+#define NP560_INTERNAL_X_CODE_BASE 0x00000000u
+#define NP560_INTERNAL_X_CODE_SIZE 0x00008000u
+
+/* CN1916884A Fig. 2 places internal program ROM above the complete low
+ * RAM/SFR segment. Data addressing can read this memory too (description
+ * paragraphs 59..71), not only instruction fetches. In the VMA03 board
+ * profile the loaded writable firmware starts at 03:0000, so only the
+ * resident interval below that boundary remains backed by this ROM. */
+#define NP560_INTERNAL_PROGRAM_BASE 0x00010000u
 
 /*
  * The exact application call at 21:C076 enters resident 05:2286 after the
@@ -132,9 +162,22 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_MENU_TEXT_DATA_30_BASE 0x00303900u
 #define NP560_MENU_TEXT_DATA_30_SOURCE 0x004d3900u
 #define NP560_MENU_TEXT_DATA_30_SIZE 0x00000156u
-#define NP560_PIM_RESOURCE_DATA_2F_BASE 0x002ff46au
-#define NP560_PIM_RESOURCE_DATA_2F_SOURCE 0x004cf46au
-#define NP560_PIM_RESOURCE_DATA_2F_SIZE 0x00000032u
+/* The reconstructed 12:5434 NPE layout builder is the exact source-2F
+ * function and therefore retains its linked data pointers at
+ * 30:58D0..30:5962.  Flat bank 30 contains executable instructions at those
+ * addresses, which made the later layout pass draw instruction words over
+ * the already-correct NPE menu.  The same-linked +0x1D bank has one complete
+ * constant island: 4D:585E..5861 is the terminal AJMP of the preceding
+ * function, 4D:5862 begins the word-serialized text, and 4D:5A6A starts the
+ * next LINK #2 function.  The tail also contains the 13 by 0x14 table rooted
+ * at data pointer 30:5966.  Expose precisely that 0x208-byte island on the
+ * data bus while leaving code fetches on flat bank 30. */
+#define NP560_APPLICATION_LAYOUT_TEXT_DATA_30_BASE 0x00305862u
+#define NP560_APPLICATION_LAYOUT_TEXT_DATA_30_SOURCE 0x004d5862u
+#define NP560_APPLICATION_LAYOUT_TEXT_DATA_30_SIZE 0x00000208u
+#define NP560_PIM_RESOURCE_DATA_2F_BASE 0x002ff37eu
+#define NP560_PIM_RESOURCE_DATA_2F_SOURCE 0x004cf37eu
+#define NP560_PIM_RESOURCE_DATA_2F_SIZE 0x0000011eu
 /*
  * The application validation worker at 2A:A746 passes data pointer 28:E368
  * to the exact resident file-open routine at 1F:1F1A.  The flat destination
@@ -155,7 +198,51 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
  */
 #define NP560_USERINFO_LITERAL_DATA_31_BASE 0x0031940eu
 #define NP560_USERINFO_LITERAL_DATA_31_SIZE 0x00000010u
-#define NP560_CATALOG_STRING_DATA_COUNT 9u
+#define NP560_INPUT_BIT_MASK_DATA_33_BASE 0x003339e6u
+#define NP560_INPUT_BIT_MASK_DATA_33_SOURCE 0x005039e6u
+#define NP560_INPUT_BIT_MASK_DATA_33_SIZE 0x00000040u
+#define NP560_CATALOG_STRING_DATA_COUNT 17u
+#define NP560_APPLICATION_FILE_DIALOG_TEXT_DATA_BASE 0x0027e000u
+#define NP560_APPLICATION_FILE_DIALOG_TEXT_DATA_SOURCE 0x0044e000u
+#define NP560_APPLICATION_FILE_DIALOG_TEXT_DATA_SIZE 0x0000007eu
+#define NP560_APPLICATION_PAGE_ARGUMENT_TEXT_DATA_BASE 0x0026527cu
+#define NP560_APPLICATION_PAGE_ARGUMENT_TEXT_DATA_SOURCE 0x0043527cu
+#define NP560_APPLICATION_PAGE_ARGUMENT_TEXT_DATA_SIZE 0x00000014u
+#define NP560_APPLICATION_PAGE_DIALOG_TEXT_DATA_BASE 0x0032e248u
+#define NP560_APPLICATION_PAGE_DIALOG_TEXT_DATA_SOURCE 0x004fe248u
+#define NP560_APPLICATION_PAGE_DIALOG_TEXT_DATA_SIZE 0x00000084u
+/* Operation six enters the unframed 2E:B5A0 input worker.  For state values
+ * one through eight, 2E:B8BE indexes eight near targets through data pointer
+ * 11:B8DA and dispatches with PUSH/RET.  Those exact sixteen table bytes are
+ * embedded beside the worker on the PRG code view at 2E:B8DA:
+ * B8EA,B9FC,BB54,BB54,BB54,BCA4,BCA4,BCA4.  Expose only that immutable
+ * same-linked island on the Harvard data bus.  Leaving 11:B8DA on writable
+ * RAM made F4 exit load 0B7C and enter the middle of unrelated 2E:0AF6. */
+#define NP560_APPLICATION_INPUT_DISPATCH_TABLE_DATA_BASE 0x0011b8dau
+#define NP560_APPLICATION_INPUT_DISPATCH_TABLE_DATA_SOURCE 0x002eb8dau
+#define NP560_APPLICATION_INPUT_DISPATCH_TABLE_DATA_SIZE 0x00000010u
+/* The post-NPE-launch list page at 32:A946..B670 passes linked constants
+ * 32:62B6, 32:62B8 and 32:62BE to the native string and text helpers.  Flat
+ * bank 32 is executable code at those addresses, so the page otherwise
+ * clears the valid RPG status screen and redraws only its border.  In the
+ * same-linked +0x1D bank, 4F:6138..613B is the terminal AJMP of the
+ * preceding function, 4F:613C begins a single record/string island (which
+ * includes the word-serialized "please enter user" prompt at 4F:62BE), and
+ * 4F:6358 starts the next LINK #1 function.  Expose exactly that 0x21C-byte
+ * island on the data bus while preserving flat bank 32 for code fetches. */
+#define NP560_APPLICATION_NPE_LIST_TEXT_DATA_32_BASE 0x0032613cu
+#define NP560_APPLICATION_NPE_LIST_TEXT_DATA_32_SOURCE 0x004f613cu
+#define NP560_APPLICATION_NPE_LIST_TEXT_DATA_32_SIZE 0x0000021cu
+/* Exact 18:4E62 copies both caller-supplied page strings from linked data
+ * pointers 31:F042 and 31:F0C8.  Flat bank 31 contains executable code at
+ * those addresses, which rendered instruction words as the first native NPE
+ * page's title and body.  Same-linked source 4E:F040..F15F is one bounded
+ * constant island: F040 starts the string block and 4E:F160 starts the next
+ * LINK #2 function.  Expose only that island on the data bus; instruction
+ * fetches at 31:F040 continue to observe the live application code. */
+#define NP560_APPLICATION_NPE_PAGE_TEXT_DATA_31_BASE 0x0031f040u
+#define NP560_APPLICATION_NPE_PAGE_TEXT_DATA_31_SOURCE 0x004ef040u
+#define NP560_APPLICATION_NPE_PAGE_TEXT_DATA_31_SIZE 0x00000120u
 #define NP560_NWF_FORMAT_DATA_2B_BASE 0x002bff80u
 #define NP560_NWF_FORMAT_DATA_2B_SOURCE 0x0048ff80u
 #define NP560_NWF_FORMAT_DATA_2B_SIZE 0x00000080u
@@ -182,6 +269,96 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
  * the complete reconstructed controller. */
 #define NP560_RESIDENT_ROOT_MENU_CONTROLLER_TABLE_BASE 0x001df3dau
 #define NP560_RESIDENT_ROOT_MENU_CONTROLLER_TABLE_SIZE 0x0000000cu
+/* The root desktop object publishes resident 0F:2094 as its event callback.
+ * That exact function dispatches 0x80..0x86 and 0x8E..0x95 through two
+ * inline near-target tables, loading the selected word through the Harvard
+ * data bus and executing RET.  Instruction fetch already sees the complete
+ * reconstructed function; expose only the two recursively proven table gaps
+ * on the data bus so the first matrix event does not read 0000 and return to
+ * 0F:0000. */
+#define NP560_RESIDENT_ROOT_EVENT_TABLE_80_BASE 0x000f2132u
+#define NP560_RESIDENT_ROOT_EVENT_TABLE_80_SIZE 0x0000000eu
+#define NP560_RESIDENT_ROOT_EVENT_TABLE_8E_BASE 0x000f2194u
+#define NP560_RESIDENT_ROOT_EVENT_TABLE_8E_SIZE 0x00000010u
+/* The exact resident Game World controller at 0F:7E18 uses RET as a
+ * computed dispatcher after reading fifteen near targets through the data
+ * bus.  Instruction fetch already sees these bytes in reconstructed SoC ROM;
+ * expose only the proven 0F:7E92..7EAF table on the Harvard data side. */
+#define NP560_RESIDENT_GAME_WORLD_CONTROLLER_TABLE_BASE 0x000f7e92u
+#define NP560_RESIDENT_GAME_WORLD_CONTROLLER_TABLE_SIZE 0x0000001eu
+/* The resident 0D:B1C0 event dispatcher uses RET as a ten-way computed
+ * branch after loading one 16-bit target from 0D:B420 through the data bus.
+ * Code fetch already sees the reconstructed source-2A body; expose only the
+ * exact immutable table bytes through the Harvard data view. */
+#define NP560_RESIDENT_GAME_WORLD_EVENT_DISPATCH_TABLE_BASE 0x000db420u
+#define NP560_RESIDENT_GAME_WORLD_EVENT_DISPATCH_TABLE_SIZE 0x00000014u
+/* The flat 30:0000 main-action worker reads its 0x80..0x90 near-target
+ * table through resident data segment 13, while the exact linked literal
+ * words live at 30:0A3E in the updater.  The reconstructed SoC ROM restores
+ * those 17 words at 13:0A3E; expose only that immutable data window so a
+ * missing table cannot recursively dispatch back to 30:0000. */
+#define NP560_RESIDENT_MAIN_ACTION_EVENT_TABLE_BASE 0x00130a3eu
+#define NP560_RESIDENT_MAIN_ACTION_EVENT_TABLE_SIZE 0x00000022u
+/* The exact resident input helper at 11:1752 dispatches events 0x80..0x8D
+ * through fourteen inline near targets at 11:18D4.  It reads the selected
+ * word through the data bus, pushes it, and executes RET at 11:18D2.  Code
+ * fetch already sees the relocated source-2E body; expose only this table on
+ * the Harvard data bus so event 0x86 reaches 11:2A1A instead of 11:0000. */
+#define NP560_RESIDENT_APPLICATION_INPUT_EVENT_TABLE_BASE 0x001118d4u
+#define NP560_RESIDENT_APPLICATION_INPUT_EVENT_TABLE_SIZE 0x0000001cu
+/* Resident 15:F0EE accepts event 0x86, selects one of six actions, and
+ * executes a computed RET after loading the target at 15:F362 through the
+ * data bus.  The reconstructed SoC ROM already carries the exact source-32
+ * words on its instruction view; expose precisely those twelve bytes on the
+ * Harvard data side as well. */
+#define NP560_RESIDENT_EVENT_E0_HANDLER_TABLE_BASE 0x0015f362u
+#define NP560_RESIDENT_EVENT_E0_HANDLER_TABLE_SIZE 0x0000000cu
+/* Resident 14:B768 classifies object kinds 0x51..0x58 through the inline
+ * eight-word table at 14:B932.  Kind 0x55 selects 14:BB28, the exact D016
+ * persistence continuation.  The table is already present in reconstructed
+ * SoC ROM code; mirror only these sixteen bytes onto the Harvard data bus. */
+#define NP560_RESIDENT_RESOURCE_DISPATCH_KIND_TABLE_BASE 0x0014b932u
+#define NP560_RESIDENT_RESOURCE_DISPATCH_KIND_TABLE_SIZE 0x00000010u
+/* The same dispatcher indexes events 0x80..0x86 without first subtracting
+ * 0x80: its encoded pointer is 14:B716, so the seven words actually read are
+ * 14:B816..B823.  Exact source-31 bytes map 0x86 to 14:B868, which then uses
+ * the kind table above. */
+#define NP560_RESIDENT_RESOURCE_DISPATCH_EVENT_TABLE_BASE 0x0014b816u
+#define NP560_RESIDENT_RESOURCE_DISPATCH_EVENT_TABLE_SIZE 0x0000000eu
+/* Resident 1B:A454 is the sound-effects switch editor. Events 0x80..0x90
+ * are dispatched through its seventeen-word inline table at 1B:A6BC using
+ * a data-bus load plus computed RET. The exact words already live in the
+ * reconstructed SoC ROM instruction view; expose only this immutable table
+ * on the Harvard data side. */
+#define NP560_RESIDENT_SOUND_EFFECT_SWITCH_EVENT_TABLE_BASE 0x001ba6bcu
+#define NP560_RESIDENT_SOUND_EFFECT_SWITCH_EVENT_TABLE_SIZE 0x00000022u
+/* The exact resident operation at 1B:23B8 selects one of nineteen near
+ * continuations by loading an inline word at 1B:299C through the data bus and
+ * executing RET at 1B:299A.  Keep instruction fetch on reconstructed SoC ROM
+ * while exposing only the vendor source-38 table as immutable Harvard data. */
+#define NP560_RESIDENT_OPERATION_DISPATCH_TABLE_BASE 0x001b299cu
+#define NP560_RESIDENT_OPERATION_DISPATCH_TABLE_SIZE 0x00000026u
+/* The exact application operation-7 controller at 2B:0000 dispatches its
+ * six states by reading the inline source-48 near-PC table through data
+ * segment 0E, pushing the selected word, and executing RET at 2B:089E.
+ * Reconstructed SoC ROM stores those vendor words at 0E:08A0; expose only
+ * that immutable range on the Harvard data bus. */
+/* The exact resident page renderer at 18:57A4 implements a five-way mode
+ * switch by reading one near target from inline table 18:57A6 through the
+ * data bus, pushing it, and executing RET.  Instruction fetch already sees
+ * the complete reconstructed body; expose only these ten ROM bytes on the
+ * Harvard data bus so mode zero reaches 18:57B0 instead of 18:0000. */
+#define NP560_RESIDENT_APPLICATION_PAGE_MODE_TABLE_BASE 0x001857a6u
+#define NP560_RESIDENT_APPLICATION_PAGE_MODE_TABLE_SIZE 0x0000000au
+/* Exact resident 1A:DEAA selects one of four mode continuations by reading
+ * this inline table through the data bus and executing a computed RET.  Code
+ * fetch already sees the reconstructed source-37 body.  Its six selected
+ * paths contain another five-way inline table apiece; all seven tables need
+ * the same narrow Harvard data view or a zero target returns to 1A:0000. */
+#define NP560_RESIDENT_APPLICATION_COMPARE_MODE_TABLE_BASE 0x001ae038u
+#define NP560_RESIDENT_APPLICATION_COMPARE_MODE_TABLE_SIZE 0x00000008u
+#define NP560_RESIDENT_APPLICATION_COMPARE_INNER_TABLE_COUNT 6u
+#define NP560_RESIDENT_APPLICATION_COMPARE_INNER_TABLE_SIZE 0x0000000au
 /* Source 38:CE3C reads the factory resource-enable flag and 50-byte path
  * through far data address 10:D03E before invoking the native file scanner.
  * The reconstructed SoC-ROM image carries the evidence-driven constant at
@@ -215,14 +392,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_MENU_POSITION_DATA_33_BASE 0x00331368u
 #define NP560_MENU_POSITION_DATA_33_SOURCE 0x00501368u
 #define NP560_MENU_POSITION_DATA_33_SIZE 0x00000060u
-/* The exact 41:162C foreground callback follows a four-bit parent index
- * through the sixteen packed words at data address 33:07E4.  Flat bank 33
- * is the adjacent 33:07B0 arithmetic code and creates the non-terminating
- * 1->7->6->15->7 cycle.  Same-linked source 50:07E4 contains the constant
- * state table; index one is zero and terminates the initial walk. */
+/* The exact 41:162C foreground callback follows the eight-bit parent field
+ * through 26 packed words at data address 33:07E4.  Entry six points to
+ * parent 0x19, so the complete table must include entries 16..25; mapping
+ * only the first sixteen words falls through into adjacent 33:0804 code and
+ * creates a non-terminating 1->7->6->15->7 cycle.  Same-linked source
+ * 50:07E4 contains the signature-bounded table through entry 25 at 50:0816;
+ * the unrelated 0x0010 value at 50:0818 begins the following data island. */
 #define NP560_MODAL_STATE_TABLE_DATA_33_BASE 0x003307e4u
 #define NP560_MODAL_STATE_TABLE_DATA_33_SOURCE 0x005007e4u
-#define NP560_MODAL_STATE_TABLE_DATA_33_SIZE 0x00000020u
+#define NP560_MODAL_STATE_TABLE_DATA_33_SIZE 0x00000034u
 /* 4A:9DFC constructs the foreground UI from 25 exact 0x42-byte records at
  * data address 1C:974E.  The same-linked updater image stores those records
  * at 39:974E; record 25 at 39:9DC0 is entirely zero and fixes the upper
@@ -279,6 +458,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_MENU_REGISTRY_LOOKUP_OVERLAY_SIZE 0x00000124u
 #define NP560_MENU_UNALIGNED_U16_OVERLAY_BASE 0x0032af98u
 #define NP560_MENU_UNALIGNED_U16_OVERLAY_SIZE 0x00000056u
+#define NP560_MENU_UNALIGNED_STORAGE_RESET_ALIAS_SIZE 0x000000acu
 #define NP560_MENU_TEXT_INPUT_OVERLAY_BASE 0x002f8e8eu
 #define NP560_MENU_TEXT_INPUT_OVERLAY_SIZE 0x00000138u
 #define NP560_MENU_UI_ADAPTER_OVERLAY_BASE 0x002f8fc6u
@@ -291,6 +471,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_MENU_RENDER_OVERLAY_SIZE 0x000002bau
 #define NP560_MENU_RESOURCE_FORMAT_OVERLAY_BASE 0x0023da24u
 #define NP560_MENU_RESOURCE_FORMAT_OVERLAY_SIZE 0x00000482u
+#define NP560_MENU_RESOURCE_MODAL_FIELD_PAIR_OVERLAY_BASE 0x0023da24u
+#define NP560_MENU_RESOURCE_MODAL_FIELD_PAIR_OVERLAY_SIZE 0x00000902u
 #define NP560_MENU_RESOURCE_BIND_OVERLAY_BASE 0x00317d02u
 #define NP560_MENU_RESOURCE_BIND_OVERLAY_SIZE 0x000000b2u
 #define NP560_MENU_RESOURCE_BIND_WRAPPER_OVERLAY_BASE 0x00334ae4u
@@ -299,6 +481,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_MENU_RESULT_ATTACH_OVERLAY_SIZE 0x000000beu
 #define NP560_MENU_RESULT_LIST_OVERLAY_BASE 0x002aae0au
 #define NP560_MENU_RESULT_LIST_OVERLAY_SIZE 0x0000025cu
+#define NP560_MENU_RESULT_RANGE_OVERLAY_BASE 0x002ab066u
+#define NP560_MENU_RESULT_RANGE_OVERLAY_SIZE 0x0000025au
 #define NP560_MENU_RESULT_PROCESS_OVERLAY_BASE 0x0025b202u
 #define NP560_MENU_RESULT_PROCESS_OVERLAY_SIZE 0x000003d4u
 #define NP560_MENU_PAGE_POPULATE_OVERLAY_BASE 0x00203edeu
@@ -348,12 +532,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_MENU_HW_BIT1_SET_OVERLAY_BASE 0x00336bbau
 #define NP560_MENU_HW_BIT1_SET_OVERLAY_SIZE 0x00000008u
 #define NP560_MENU_HW_BIT1_SET_OVERLAY_SOURCE 0x00506bbau
+#define NP560_MENU_HW_BITS_SET_OVERLAY_SIZE 0x00000010u
+#define NP560_APPLICATION_FOREGROUND_READY_RELOCATED_OVERLAY_BASE 0x005f6be2u
+#define NP560_APPLICATION_FOREGROUND_READY_RELOCATED_OVERLAY_SIZE 0x00000008u
+#define NP560_APPLICATION_FOREGROUND_READY_RELOCATED_OVERLAY_SOURCE 0x00506be2u
 #define NP560_MENU_HW_BIT2_CLEAR_OVERLAY_BASE 0x00336c2au
 #define NP560_MENU_HW_BIT2_CLEAR_OVERLAY_SIZE 0x00000008u
 #define NP560_MENU_HW_BIT2_CLEAR_OVERLAY_SOURCE 0x00506c2au
 #define NP560_MENU_HW_BIT1_CLEAR_OVERLAY_BASE 0x00336c32u
 #define NP560_MENU_HW_BIT1_CLEAR_OVERLAY_SIZE 0x00000008u
 #define NP560_MENU_HW_BIT1_CLEAR_OVERLAY_SOURCE 0x00506c32u
+#define NP560_MENU_HW_BITS_CLEAR_OVERLAY_SIZE 0x00000010u
 #define NP560_UI_STATE_OVERLAY_BASE 0x00203390u
 #define NP560_UI_STATE_OVERLAY_SIZE 0x000005acu
 #define NP560_UI_PREPARE_OVERLAY_BASE 0x003365d4u
@@ -369,14 +558,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_MENU_STATE_CLEAR_OVERLAY_SIZE 0x00000016u
 #define NP560_MENU_HANDLE_RELEASE_OVERLAY_BASE 0x0033468cu
 #define NP560_MENU_HANDLE_RELEASE_OVERLAY_SIZE 0x00000016u
+#define NP560_UI_PROPERTY_SET_OVERLAY_BASE 0x00334d14u
+#define NP560_UI_PROPERTY_SET_OVERLAY_SIZE 0x00000016u
+#define NP560_UI_PROPERTY_KEY_ITEM_SET_ALIAS_SIZE 0x0000002cu
 #define NP560_MENU_CONTEXT_RELEASE_OVERLAY_BASE 0x00334d2au
 #define NP560_MENU_CONTEXT_RELEASE_OVERLAY_SIZE 0x00000016u
 #define NP560_MENU_GLOBAL_RESET_OVERLAY_BASE 0x00334ddau
 #define NP560_MENU_GLOBAL_RESET_OVERLAY_SIZE 0x00000016u
 #define NP560_MENU_EVENT_STATE_OVERLAY_BASE 0x00330edcu
 #define NP560_MENU_EVENT_STATE_OVERLAY_SIZE 0x00000032u
-#define NP560_MENU_UI_PREPARE_CORE_OVERLAY_BASE 0x002fd266u
-#define NP560_MENU_UI_PREPARE_CORE_OVERLAY_SIZE 0x00000128u
 #define NP560_MENU_BUFFER_SETUP_OVERLAY_BASE 0x00305f7eu
 #define NP560_MENU_BUFFER_SETUP_OVERLAY_SIZE 0x00000104u
 #define NP560_MENU_LAYOUT_BUILD_OVERLAY_BASE 0x0026e3d8u
@@ -504,6 +694,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_MEMORY_MODE_OVERLAY_SOURCE 0x004eb014u
 #define NP560_GLOBAL_RESET_OVERLAY_BASE 0x003338d6u
 #define NP560_GLOBAL_RESET_OVERLAY_SIZE 0x0022u
+/* Six adjacent 0x22-byte guest-published helpers occupy this entire range:
+ * global reset, key completion, hardware clear, path A, path B, and event
+ * enable.  Their individual aliases had identical destination-RAM backing. */
+#define NP560_GLOBAL_KEY_EVENT_WINDOW_BASE 0x003338d6u
+#define NP560_GLOBAL_KEY_EVENT_WINDOW_SIZE 0x00ccu
 #define NP560_STARTUP_TABLE_OVERLAY_BASE 0x00324218u
 #define NP560_STARTUP_TABLE_OVERLAY_SIZE 0x0078u
 #define NP560_STARTUP_POINTER_OVERLAY_BASE 0x0032cc9cu
@@ -526,6 +721,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_POINTER_FLAG_OVERLAY_SIZE 0x000eu
 #define NP560_POINTER_NORMALIZE_OVERLAY_BASE 0x00334492u
 #define NP560_POINTER_NORMALIZE_OVERLAY_SIZE 0x001cu
+#define NP560_APPLICATION_FOREGROUND_STATE4E_WRAPPER_OVERLAY_BASE 0x003344aeu
+#define NP560_APPLICATION_FOREGROUND_STATE4E_WRAPPER_OVERLAY_SIZE 0x001cu
+#define NP560_APPLICATION_FOREGROUND_STATE4E_ROM_OVERLAY_BASE 0x000d2f30u
+#define NP560_APPLICATION_FOREGROUND_STATE4E_ROM_OVERLAY_SIZE 0x002e6cu
 #define NP560_POINTER_RESOLVE_OVERLAY_BASE 0x0031f282u
 #define NP560_POINTER_RESOLVE_OVERLAY_SIZE 0x0090u
 #define NP560_APPLICATION_DRAW_CONTEXT_OVERLAY_BASE 0x0021fd80u
@@ -548,9 +747,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_LCD_RESOURCE_TRANSFER_OVERLAY_BASE 0x0029ac4eu
 #define NP560_LCD_RESOURCE_TRANSFER_OVERLAY_SIZE 0x029cu
 #define NP560_LCD_RESOURCE_TRANSFER_OVERLAY_SOURCE 0x0046ac4eu
-#define NP560_APPLICATION_RESOURCE_PAGE_READ_OVERLAY_BASE 0x002d261cu
+#define NP560_APPLICATION_RESOURCE_PAGE_READ_OVERLAY_BASE 0x005f261cu
 #define NP560_APPLICATION_RESOURCE_PAGE_READ_OVERLAY_SIZE 0x01cau
-#define NP560_APPLICATION_RESOURCE_PAGE_READ_OVERLAY_SOURCE 0x004a261cu
 #define NP560_LCD_TIMING_OVERLAY_BASE 0x0030d350u
 #define NP560_LCD_TIMING_OVERLAY_SIZE 0x00e0u
 #define NP560_APPLICATION_STATE_OVERLAY_BASE 0x00308c1cu
@@ -616,6 +814,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_APPLICATION_POWER_STATE_OVERLAY_SIZE 0x0036u
 #define NP560_APPLICATION_PAGE_SETUP_OVERLAY_BASE 0x002913dcu
 #define NP560_APPLICATION_PAGE_SETUP_OVERLAY_SIZE 0x02d4u
+#define NP560_APPLICATION_PAGE_SETUP_CONTEXT_ALIAS_SIZE 0x05a8u
 #define NP560_APPLICATION_TEXT_LOOP_OVERLAY_BASE 0x00281f08u
 #define NP560_APPLICATION_TEXT_LOOP_OVERLAY_SIZE 0x0316u
 #define NP560_APPLICATION_RESOURCE_LOOP_OVERLAY_BASE 0x0025cc94u
@@ -625,7 +824,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_APPLICATION_STORAGE_CONTEXT_OVERLAY_SOURCE 0x00425460u
 #define NP560_APPLICATION_STORAGE_REGISTRY_OVERLAY_BASE 0x00255858u
 #define NP560_APPLICATION_STORAGE_REGISTRY_OVERLAY_SIZE 0x03f6u
-#define NP560_APPLICATION_STORAGE_REGISTRY_OVERLAY_SOURCE 0x00425858u
 #define NP560_STORAGE_BAD_BLOCK_STATUS_OVERLAY_BASE 0x0024236au
 #define NP560_STORAGE_BAD_BLOCK_STATUS_OVERLAY_SIZE 0x0464u
 #define NP560_STORAGE_BAD_BLOCK_STATUS_OVERLAY_SOURCE 0x0041236au
@@ -647,12 +845,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_STORAGE_PRIMARY_READER_OVERLAY_BASE 0x00326f12u
 #define NP560_STORAGE_PRIMARY_READER_OVERLAY_SOURCE 0x004f6f12u
 #define NP560_STORAGE_PRIMARY_READER_OVERLAY_SIZE 0x006au
+#define NP560_STORAGE_DRIVER_READERS_OVERLAY_SIZE 0x00d4u
 #define NP560_STORAGE_TRANSFER_WORKER_OVERLAY_BASE 0x002ebf9au
 #define NP560_STORAGE_TRANSFER_WORKER_OVERLAY_SOURCE 0x004bbf9au
 #define NP560_STORAGE_TRANSFER_WORKER_OVERLAY_SIZE 0x016au
 #define NP560_STORAGE_PRIMARY_TRANSFER_OVERLAY_BASE 0x002ec104u
 #define NP560_STORAGE_PRIMARY_TRANSFER_OVERLAY_SOURCE 0x004bc104u
 #define NP560_STORAGE_PRIMARY_TRANSFER_OVERLAY_SIZE 0x016au
+#define NP560_STORAGE_TRANSFER_WORKERS_OVERLAY_SIZE 0x02d4u
 #define NP560_STORAGE_PRIMARY_SECTOR_READ_OVERLAY_BASE 0x002c2ebau
 #define NP560_STORAGE_PRIMARY_SECTOR_READ_OVERLAY_SOURCE 0x00492ebau
 #define NP560_STORAGE_PRIMARY_SECTOR_READ_OVERLAY_SIZE 0x0202u
@@ -662,6 +862,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_STORAGE_BLOCK_TRANSFER_OVERLAY_BASE 0x002905b0u
 #define NP560_STORAGE_BLOCK_TRANSFER_OVERLAY_SOURCE 0x004605b0u
 #define NP560_STORAGE_BLOCK_TRANSFER_OVERLAY_SIZE 0x02d6u
+#define NP560_STORAGE_CAPACITY_TRANSFER_OVERLAY_SIZE 0x05aeu
 #define NP560_STORAGE_RECORD_CALLBACK_OVERLAY_BASE 0x0033091cu
 #define NP560_STORAGE_RECORD_CALLBACK_OVERLAY_SOURCE 0x0050091cu
 #define NP560_STORAGE_RECORD_CALLBACK_OVERLAY_SIZE 0x0034u
@@ -689,14 +890,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_STORAGE_RECORD_DISPATCH_OVERLAY_BASE 0x0032082eu
 #define NP560_STORAGE_RECORD_DISPATCH_OVERLAY_SIZE 0x008au
 #define NP560_STORAGE_RECORD_DISPATCH_OVERLAY_SOURCE 0x004f082eu
+#define NP560_STORAGE_RECORD_KEY_RESET_OVERLAY_SIZE 0x0114u
 #define NP560_TIMER_IDLE_SET_BIT2_OVERLAY_BASE 0x005f6bb2u
 #define NP560_TIMER_IDLE_SET_BIT2_OVERLAY_SIZE 0x0008u
 #define NP560_TIMER_IDLE_SET_BIT1_OVERLAY_BASE 0x005f6bbau
 #define NP560_TIMER_IDLE_SET_BIT1_OVERLAY_SIZE 0x0008u
+#define NP560_TIMER_IDLE_SET_BITS_OVERLAY_SIZE 0x0010u
 #define NP560_TIMER_IDLE_CLEAR_BIT2_OVERLAY_BASE 0x005f6c2au
 #define NP560_TIMER_IDLE_CLEAR_BIT2_OVERLAY_SIZE 0x0008u
 #define NP560_TIMER_IDLE_CLEAR_BIT1_OVERLAY_BASE 0x005f6c32u
 #define NP560_TIMER_IDLE_CLEAR_BIT1_OVERLAY_SIZE 0x0008u
+#define NP560_TIMER_IDLE_CLEAR_BITS_OVERLAY_SIZE 0x0010u
 #define NP560_STORAGE_RECORD_ACCEPT_OVERLAY_BASE 0x005f6bf2u
 #define NP560_STORAGE_RECORD_ACCEPT_OVERLAY_SIZE 0x0008u
 #define NP560_APPLICATION_RESULT_RECORD_PARSE_OVERLAY_BASE 0x002081e0u
@@ -739,6 +943,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_KEY_EVENT_TABLES_SIZE 0x0180u
 #define NP560_APPLICATION_STORAGE_BLOCK_OVERLAY_BASE 0x00270000u
 #define NP560_APPLICATION_STORAGE_BLOCK_OVERLAY_SIZE 0x0362u
+#define NP560_APPLICATION_STORAGE_BLOCK_PAGE_ALIAS_SIZE 0x06c4u
 #define NP560_APPLICATION_STORAGE_SCAN_OVERLAY_BASE 0x0027287cu
 #define NP560_APPLICATION_STORAGE_SCAN_OVERLAY_SIZE 0x035au
 #define NP560_APPLICATION_STORAGE_VERIFY_OVERLAY_BASE 0x002b4c0au
@@ -811,6 +1016,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_APPLICATION_TEXT_DISPATCH_OVERLAY_SIZE 0x0038u
 #define NP560_APPLICATION_TEXT_DISPATCH_F0_OVERLAY_BASE 0x003300a8u
 #define NP560_APPLICATION_TEXT_DISPATCH_F0_OVERLAY_SIZE 0x0038u
+/* These two independently published helpers are exactly adjacent and use
+ * the same coherent destination-RAM backing.  One combined alias preserves
+ * the identical writable union while saving one FlatView range on each
+ * Harvard bus. */
+#define NP560_APPLICATION_TEXT_DISPATCH_PAIR_OVERLAY_BASE 0x00330070u
+#define NP560_APPLICATION_TEXT_DISPATCH_PAIR_OVERLAY_SIZE 0x0070u
 #define NP560_APPLICATION_INDEX_ACTION_OVERLAY_BASE 0x00300c24u
 #define NP560_APPLICATION_INDEX_ACTION_OVERLAY_SIZE 0x0118u
 #define NP560_APPLICATION_PAGE_INDEX_OVERLAY_BASE 0x003014e4u
@@ -819,6 +1030,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_APPLICATION_PAGE_FETCH_OVERLAY_SIZE 0x0116u
 #define NP560_APPLICATION_RECT_DRAW_OVERLAY_BASE 0x00301a54u
 #define NP560_APPLICATION_RECT_DRAW_OVERLAY_SIZE 0x0116u
+#define NP560_APPLICATION_PAGE_RASTER_OVERLAY_BASE 0x00241f02u
+#define NP560_APPLICATION_PAGE_RASTER_OVERLAY_SIZE 0x0468u
 #define NP560_APPLICATION_IMAGE_WINDOW_OVERLAY_BASE 0x00260000u
 #define NP560_APPLICATION_IMAGE_WINDOW_OVERLAY_SIZE 0x0772u
 /* The exact event callback at source 41:162C calls 2D:9DFC with five
@@ -842,6 +1055,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
  * ROM-01 installer can copy the exact vendor bytes into place. */
 #define NP560_MODAL_CALLBACK_OVERLAY_BASE 0x002b6ce6u
 #define NP560_MODAL_CALLBACK_OVERLAY_SIZE 0x022au
+/* Original 2F:B6AA calls 23:70E0 after the final ROM-01 installer copies the
+ * exact 40:70E0..7583 action body.  Keep this guest-owned destination coherent
+ * on the data and code buses; it is not an immutable source-pinned overlay. */
+#define NP560_APPLICATION_OPERATION_ACTION_OVERLAY_BASE 0x002370e0u
+#define NP560_APPLICATION_OPERATION_ACTION_OVERLAY_SIZE 0x04a4u
 #define NP560_MODAL_IMAGE_RENDER_OVERLAY_BASE 0x00277e84u
 #define NP560_MODAL_IMAGE_RENDER_OVERLAY_SIZE 0x0344u
 #define NP560_MODAL_LAYOUT_OVERLAY_BASE 0x00317772u
@@ -892,6 +1110,97 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_MODAL_WORKER_OVERLAY_SIZE 0x0090u
 #define NP560_MODAL_WORKER_CORE_OVERLAY_BASE 0x0029db0au
 #define NP560_MODAL_WORKER_CORE_OVERLAY_SIZE 0x0292u
+/* Resident operation 1B:23B8 reaches 29:9746 only after the ROM-01 loader
+ * has copied the complete source-46 LINK body into place.  Unlike the
+ * immutable resource-buffer code islands surrounding it, this function must
+ * use one coherent writable data/code backing: source-pinning it would hide
+ * the guest loader store and mis-model the executable application overlay. */
+#define NP560_APPLICATION_OPERATION_CONTEXT_BUILD_OVERLAY_BASE 0x00299746u
+#define NP560_APPLICATION_OPERATION_CONTEXT_BUILD_OVERLAY_SIZE 0x02a4u
+/* The recovered application's operation browser installs these exact linked
+ * bodies before the resident controllers call them.  The operation-one
+ * action address is live flat startup code before 09:E000 publishes source
+ * 46:CE22, so it must use coherent writable data/code RAM.  The following
+ * UI_INIT body is published by the same installer.  Keep the two contiguous
+ * bodies in one coherent alias: besides matching the real writable program
+ * window, this avoids spending another pair of QEMU physical-map sections. */
+#define NP560_APPLICATION_OPERATION_ONE_ACTION_OVERLAY_BASE 0x0029ce22u
+#define NP560_APPLICATION_OPERATION_ONE_ACTION_OVERLAY_SIZE 0x0298u
+#define NP560_APPLICATION_OPERATION_UI_INIT_OVERLAY_BASE 0x0029d0bau
+#define NP560_APPLICATION_OPERATION_UI_INIT_OVERLAY_SOURCE 0x0046d0bau
+#define NP560_APPLICATION_OPERATION_UI_INIT_OVERLAY_SIZE 0x0296u
+#define NP560_APPLICATION_OPERATION_ACTION_UI_OVERLAY_SIZE 0x052eu
+#define NP560_APPLICATION_OPERATION_ACTION_CODE_PAGE_BASE 0x0029c800u
+#define NP560_APPLICATION_OPERATION_ACTION_CODE_PAGE_SIZE 0x0800u
+#define NP560_APPLICATION_OPERATION_ACTION_CODE_PAGE_OFFSET 0x0622u
+#define NP560_APPLICATION_OPERATION_ACTION_CODE_PAGE_PUBLISHED_SIZE 0x01deu
+#define NP560_APPLICATION_OPERATION_ACTION_UI_TAIL_BASE 0x0029d000u
+#define NP560_APPLICATION_OPERATION_ACTION_UI_TAIL_OFFSET 0x01deu
+#define NP560_APPLICATION_OPERATION_ACTION_UI_TAIL_SIZE 0x0350u
+#define NP560_APPLICATION_OPERATION_MODE_ROUTER_OVERLAY_BASE 0x002fb644u
+#define NP560_APPLICATION_OPERATION_MODE_ROUTER_OVERLAY_SIZE 0x0130u
+#define NP560_APPLICATION_OPERATION_NUMBER_DISPATCH_OVERLAY_BASE 0x002df47cu
+#define NP560_APPLICATION_OPERATION_NUMBER_DISPATCH_OVERLAY_SIZE 0x0196u
+/* Exact 29:9746 calls 27:CBE4 twice.  The flat destination is a numeric data
+ * table, whereas source 44:CBE4 is the bounded LINK #5 function through
+ * 44:CF0E RETS.  Keep its instruction bus pinned to immutable PRG while the
+ * guest ROM copy remains visible through the writable data view. */
+#define NP560_APPLICATION_OPERATION_CONTEXT_CHILD_OVERLAY_BASE 0x0027cbe4u
+#define NP560_APPLICATION_OPERATION_CONTEXT_CHILD_OVERLAY_SOURCE 0x0044cbe4u
+#define NP560_APPLICATION_OPERATION_CONTEXT_CHILD_OVERLAY_SIZE 0x032cu
+/* Wildcard matching calls logical 31:5246 to normalize both operands.  Flat
+ * 31:5246 is an unrelated unframed tail that returns directly to 29:98C2;
+ * source 4E:5246 is the complete LINK #0 normalizer through 4E:52FE RETS.
+ * Its two source-50 leaves classify A-Z and convert one uppercase byte to
+ * lowercase.  All three destinations are also live flat startup code before
+ * ROM-01 runs, so their instruction views must stay coherent with writable
+ * overlay RAM: the resident loader, not an always-on source pin, switches
+ * them to the exact PRG bodies at the proven late boundary. */
+#define NP560_APPLICATION_OPERATION_CONTEXT_CASEFOLD_OVERLAY_BASE 0x00315246u
+#define NP560_APPLICATION_OPERATION_CONTEXT_CASEFOLD_OVERLAY_SOURCE 0x004e5246u
+#define NP560_APPLICATION_OPERATION_CONTEXT_CASEFOLD_OVERLAY_SIZE 0x00bau
+#define NP560_APPLICATION_OPERATION_CONTEXT_UPPER_PREDICATE_OVERLAY_BASE 0x0033430au
+#define NP560_APPLICATION_OPERATION_CONTEXT_UPPER_PREDICATE_OVERLAY_SOURCE 0x0050430au
+#define NP560_APPLICATION_OPERATION_CONTEXT_UPPER_PREDICATE_OVERLAY_SIZE 0x001cu
+#define NP560_APPLICATION_OPERATION_CONTEXT_TOLOWER_OVERLAY_BASE 0x003345a2u
+#define NP560_APPLICATION_OPERATION_CONTEXT_TOLOWER_OVERLAY_SOURCE 0x005045a2u
+#define NP560_APPLICATION_OPERATION_CONTEXT_TOLOWER_OVERLAY_SIZE 0x001au
+/* The late ROM-01 guest loader rewrites only the operation-1 adapter's SCALL
+ * at 33:3DB8 so it can install the case-folding closure on demand.  Keep this
+ * four-byte code/data view coherent; source-pinning it would hide that real
+ * guest write and call the browser before the overlay switch. */
+/* Exact source 50:6C0A is a four-word LINK #0 boolean predicate.  The flat
+ * 33:6C0A target is an unrelated long-function middle which corrupts the
+ * caller's return frame. */
+#define NP560_APPLICATION_OPERATION_CONTEXT_PREDICATE_OVERLAY_BASE 0x00336c0au
+#define NP560_APPLICATION_OPERATION_CONTEXT_PREDICATE_OVERLAY_SOURCE 0x00506c0au
+#define NP560_APPLICATION_OPERATION_CONTEXT_PREDICATE_OVERLAY_SIZE 0x0008u
+/* Exact 1C:D462 calls 2E:393A.  Flat target bytes borrow the resident
+ * layout's frame and return straight to 2C:87FC; source 4B:393A is the
+ * complete LINK #6 helper through 4B:3AC0 RETS. */
+#define NP560_APPLICATION_FILE_BROWSER_LAYOUT_RANGE_OVERLAY_BASE 0x002e393au
+#define NP560_APPLICATION_FILE_BROWSER_LAYOUT_RANGE_OVERLAY_SOURCE 0x004b393au
+#define NP560_APPLICATION_FILE_BROWSER_LAYOUT_RANGE_OVERLAY_SIZE 0x0188u
+/* Exact 1C:D562 calls flat 31:4200 without LINK and the shared 31:4474 tail
+ * consumes the caller's outer frame.  The late resident builder installs the
+ * complete 4E:4200..4E:42BF body into this ROM01 slot.  Keep its data and
+ * instruction views coherent so those guest writes are what the CPU fetches;
+ * do not source-pin or synthesize the helper here. */
+#define NP560_APPLICATION_FILE_BROWSER_LAYOUT_HELPER_OVERLAY_BASE 0x00314200u
+#define NP560_APPLICATION_FILE_BROWSER_LAYOUT_HELPER_OVERLAY_SIZE 0x00c0u
+/* The sole child reached from the installed 31:4200 helper enters flat
+ * 32:E5E4 at an FP-relative middle.  Its complete 4F:E5E4..4F:E625 body is
+ * copied by the same late resident builder.  As above, expose coherent data
+ * and instruction views only; guest writes provide the executable content. */
+#define NP560_APPLICATION_FILE_BROWSER_LAYOUT_CHILD_OVERLAY_BASE 0x0032e5e4u
+#define NP560_APPLICATION_FILE_BROWSER_LAYOUT_CHILD_OVERLAY_SIZE 0x0042u
+/* Exact operation action 23:70E0 calls logical 30:2966.  The final ROM-01
+ * guest installer writes the complete source-4D LINK #5 predicate here from
+ * immutable literal words.  Keep the destination's data and instruction
+ * views on one writable RAM backing so those guest stores become executable;
+ * QEMU does not redirect or implement the call. */
+#define NP560_APPLICATION_OPERATION_ACTION_MODE_PREDICATE_OVERLAY_BASE 0x00302966u
+#define NP560_APPLICATION_OPERATION_ACTION_MODE_PREDICATE_OVERLAY_SIZE 0x0112u
 #define NP560_MODAL_BUFFER_PREPARE_OVERLAY_BASE 0x002f3cdeu
 #define NP560_MODAL_BUFFER_PREPARE_OVERLAY_SIZE 0x014au
 #define NP560_MODAL_FIELD_DECODE_OVERLAY_BASE 0x0032be86u
@@ -904,6 +1213,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_MODAL_STATUS_READ_OVERLAY_SIZE 0x000eu
 #define NP560_APPLICATION_STATE_COMMIT_OVERLAY_BASE 0x003365fcu
 #define NP560_APPLICATION_STATE_COMMIT_OVERLAY_SIZE 0x000au
+#define NP560_APPLICATION_OPERATION_UI_PREPARE_OVERLAY_BASE 0x00336610u
+#define NP560_APPLICATION_OPERATION_UI_PREPARE_OVERLAY_SIZE 0x000au
+#define NP560_APPLICATION_OPERATION_UI_PREPARE_OVERLAY_SOURCE 0x00506610u
 #define NP560_APPLICATION_IMAGE_DISPATCH_OVERLAY_BASE 0x0027a8b6u
 #define NP560_APPLICATION_IMAGE_DISPATCH_OVERLAY_SIZE 0x0336u
 #define NP560_APPLICATION_EVENT_POLL_OVERLAY_BASE 0x002efc6au
@@ -932,6 +1244,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_UINT32_DIVIDE_WRAPPER_OVERLAY_BASE 0x003324eau
 #define NP560_UINT32_DIVIDE_WRAPPER_OVERLAY_SIZE 0x0028u
 #define NP560_UINT32_DIVIDE_WRAPPER_OVERLAY_SOURCE 0x005024eau
+#define NP560_INTEGER_DIVIDE_WRAPPERS_OVERLAY_SIZE 0x0050u
 #define NP560_UINT32_DIVIDE_OVERLAY_BASE 0x00316a14u
 #define NP560_UINT32_DIVIDE_OVERLAY_SIZE 0x00b6u
 #define NP560_UINT32_DIVIDE_OVERLAY_SOURCE 0x004e6a14u
@@ -941,6 +1254,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_UINT32_NORMALIZE_OVERLAY_BASE 0x00332f3eu
 #define NP560_UINT32_NORMALIZE_OVERLAY_SIZE 0x0024u
 #define NP560_UINT32_NORMALIZE_OVERLAY_SOURCE 0x00502f3eu
+#define NP560_UINT32_NORMALIZATION_OVERLAY_SIZE 0x0048u
 #define NP560_APPLICATION_INIT_TASK_OVERLAY_BASE 0x002b939au
 #define NP560_APPLICATION_INIT_TASK_OVERLAY_SIZE 0x0222u
 #define NP560_APPLICATION_VALIDATION_CHECKSUM_OVERLAY_BASE 0x00325accu
@@ -954,6 +1268,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_APPLICATION_EVENT_POSTPROCESS_OVERLAY_SIZE 0x0050u
 #define NP560_APPLICATION_VALIDATION_CRC16_OVERLAY_BASE 0x0031f162u
 #define NP560_APPLICATION_VALIDATION_CRC16_OVERLAY_SIZE 0x0090u
+#define NP560_APPLICATION_VALIDATION_MODAL_ALIAS_SIZE 0x0120u
 #define NP560_APPLICATION_CONTEXT_LAUNCH_OVERLAY_BASE 0x0023a38cu
 #define NP560_APPLICATION_CONTEXT_LAUNCH_OVERLAY_SIZE 0x0494u
 #define NP560_APPLICATION_RECORD_PREPARE_OVERLAY_BASE 0x00298202u
@@ -961,6 +1276,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_APPLICATION_ADDRESS_RESOLVE_OVERLAY_BASE 0x0030c8c0u
 #define NP560_APPLICATION_ADDRESS_RESOLVE_OVERLAY_SOURCE 0x004dc8c0u
 #define NP560_APPLICATION_ADDRESS_RESOLVE_OVERLAY_SIZE 0x00deu
+#define NP560_APPLICATION_ADDRESS_FILE_WRAPPER_OVERLAY_SIZE 0x01c4u
 #define NP560_APPLICATION_RECORD_DISPATCH_OVERLAY_BASE 0x0033048au
 #define NP560_APPLICATION_RECORD_DISPATCH_OVERLAY_SIZE 0x0036u
 #define NP560_FAR_STRING_LENGTH_OVERLAY_BASE 0x0031aed0u
@@ -994,8 +1310,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_APPLICATION_POST_REGISTRY_BINDINGS_OVERLAY_SIZE 0x0032u
 #define NP560_APPLICATION_POST_REGISTRY_BIND_TARGET_OVERLAY_BASE 0x00333bc6u
 #define NP560_APPLICATION_POST_REGISTRY_BIND_TARGET_OVERLAY_SIZE 0x0020u
-#define NP560_RESIDENT_FIXED_LAUNCH_WRAPPER_OVERLAY_BASE 0x00333ca6u
-#define NP560_RESIDENT_FIXED_LAUNCH_WRAPPER_OVERLAY_SIZE 0x0040u
 #define NP560_APPLICATION_POST_REGISTRY_HOOK_OVERLAY_BASE 0x00336f30u
 #define NP560_APPLICATION_POST_REGISTRY_HOOK_OVERLAY_SIZE 0x0006u
 #define NP560_APPLICATION_MAIN_PREPARE_OVERLAY_BASE 0x003365c0u
@@ -1004,6 +1318,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_APPLICATION_MAIN_BIT_CLEAR_OVERLAY_SIZE 0x000eu
 #define NP560_APPLICATION_MAIN_STATE_INIT_OVERLAY_BASE 0x0032c86eu
 #define NP560_APPLICATION_MAIN_STATE_INIT_OVERLAY_SIZE 0x004eu
+#define NP560_APPLICATION_START_CONTEXT_INIT_OVERLAY_BASE 0x0030e662u
+#define NP560_APPLICATION_START_CONTEXT_INIT_OVERLAY_SIZE 0x00dcu
+#define NP560_APPLICATION_START_CALLBACK_OVERLAY_BASE 0x0032f15cu
+#define NP560_APPLICATION_START_CALLBACK_OVERLAY_SIZE 0x003eu
+#define NP560_APPLICATION_START_RECORD_HANDLER_OVERLAY_BASE 0x002b593eu
+#define NP560_APPLICATION_START_RECORD_HANDLER_OVERLAY_SIZE 0x0232u
+#define NP560_APPLICATION_START_STATE_MASK_OVERLAY_BASE 0x00316518u
+#define NP560_APPLICATION_START_STATE_MASK_OVERLAY_SIZE 0x00b8u
+#define NP560_APPLICATION_START_RELEASE_OVERLAY_BASE 0x002c79b8u
+#define NP560_APPLICATION_START_RELEASE_OVERLAY_SIZE 0x01f0u
 #define NP560_APPLICATION_MAIN_STATE_BUILD_OVERLAY_BASE 0x002edb9cu
 #define NP560_APPLICATION_MAIN_STATE_BUILD_OVERLAY_SIZE 0x0160u
 #define NP560_APPLICATION_MAIN_STATE_CALLBACK_OVERLAY_BASE 0x002ca03au
@@ -1029,6 +1353,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_APPLICATION_MAIN_SERVICE_INIT_OVERLAY_BASE 0x00302630u
 #define NP560_APPLICATION_MAIN_SERVICE_INIT_OVERLAY_SIZE 0x0112u
 #define NP560_APPLICATION_MAIN_STORAGE_FLAG_OVERLAY_BASE 0x0033197au
+#define NP560_APPLICATION_MAIN_STORAGE_FLAG_OVERLAY_SOURCE 0x0050197au
 #define NP560_APPLICATION_MAIN_STORAGE_FLAG_OVERLAY_SIZE 0x002eu
 #define NP560_APPLICATION_MAIN_MODE_DISPATCH_OVERLAY_BASE 0x002db54cu
 #define NP560_APPLICATION_MAIN_MODE_DISPATCH_OVERLAY_SIZE 0x01a6u
@@ -1053,12 +1378,19 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_APPLICATION_MAIN_INPUT_STATE_OVERLAY_BASE 0x0031df8cu
 #define NP560_APPLICATION_MAIN_INPUT_STATE_OVERLAY_SIZE 0x0096u
 #define NP560_APPLICATION_MAIN_INPUT_STATE_OVERLAY_SOURCE 0x004edf8cu
+#define NP560_APPLICATION_INPUT_OBJECT_RESOLVE_OVERLAY_SIZE 0x012cu
 #define NP560_APPLICATION_MAIN_STATUS_SCAN_OVERLAY_BASE 0x002f5024u
 #define NP560_APPLICATION_MAIN_STATUS_SCAN_OVERLAY_SIZE 0x0148u
 #define NP560_APPLICATION_MAIN_STATUS_SCAN_OVERLAY_SOURCE 0x004c5024u
 #define NP560_APPLICATION_MAIN_STATE_TICK_OVERLAY_BASE 0x00301eaau
 #define NP560_APPLICATION_MAIN_STATE_TICK_OVERLAY_SIZE 0x0114u
 #define NP560_APPLICATION_MAIN_STATE_TICK_OVERLAY_SOURCE 0x004d1eaau
+/* Game World object construction calls 30:9794 with five words.  ROM-01's
+ * final guest installer replaces the incompatible flat compositor fragment
+ * with the exact 4D:9794 body, so this bounded destination is writable,
+ * coherent executable code RAM rather than immutable program NOR. */
+#define NP560_APPLICATION_MAIN_FAR_BYTE_SEARCH_OVERLAY_BASE 0x00309794u
+#define NP560_APPLICATION_MAIN_FAR_BYTE_SEARCH_OVERLAY_SIZE 0x00f2u
 #define NP560_APPLICATION_MAIN_STATE_CLEAR_OVERLAY_BASE 0x00334ef8u
 #define NP560_APPLICATION_MAIN_STATE_CLEAR_OVERLAY_SIZE 0x0016u
 #define NP560_APPLICATION_MAIN_STATE_CLEAR_OVERLAY_SOURCE 0x00504ef8u
@@ -1070,13 +1402,66 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_APPLICATION_MAIN_STATE_SYNC_OVERLAY_SOURCE 0x004f2930u
 #define NP560_APPLICATION_MAIN_ACTION_OVERLAY_BASE 0x0032342eu
 #define NP560_APPLICATION_MAIN_ACTION_OVERLAY_SIZE 0x007eu
+#define NP560_APPLICATION_MAIN_ACTION_BUFFER_PREPARE_OVERLAY_BASE 0x002411beu
+#define NP560_APPLICATION_MAIN_ACTION_BUFFER_PREPARE_OVERLAY_SIZE 0x0184u
+#define NP560_APPLICATION_MAIN_ACTION_BUFFER_PREPARE_OVERLAY_SOURCE 0x004111beu
 #define NP560_APPLICATION_MAIN_ACTION_QUERY_OVERLAY_BASE 0x00334ab4u
 #define NP560_APPLICATION_MAIN_ACTION_QUERY_OVERLAY_SIZE 0x0018u
 #define NP560_APPLICATION_MAIN_ACTION_RENDER_OVERLAY_BASE 0x0021cef4u
 #define NP560_APPLICATION_MAIN_ACTION_RENDER_OVERLAY_SIZE 0x0536u
+/* 3E:D3FE calls the exact linked helper at 4B:2B6E.  The guest application
+ * installer copies that complete 0x18a-byte body to 2E:2B6E before the
+ * renderer executes it, so this destination is loader-owned writable
+ * executable RAM rather than immutable flat PRG/NOR. */
+#define NP560_APPLICATION_MAIN_ACTION_RENDER_HELPER_OVERLAY_BASE 0x002e2b6eu
+#define NP560_APPLICATION_MAIN_ACTION_RENDER_HELPER_OVERLAY_SIZE 0x018au
+/* The resident ROM first publishes the complete Game World controller from
+ * source 2C:7E18 at its real 0F:7E18 target.  The original 2C:8744 source
+ * subrange is therefore available for this exact guest-installed layout body
+ * and must remain coherent between data writes and instruction fetches. */
+#define NP560_APPLICATION_MAIN_RENDER_LAYOUT_OVERLAY_BASE 0x002c8744u
+#define NP560_APPLICATION_MAIN_RENDER_LAYOUT_OVERLAY_SIZE 0x01eeu
+/* 21:D410 makes the renderer's final native commit through this exact body,
+ * copied by the guest installer from 4D:6082. */
+#define NP560_APPLICATION_MAIN_RENDER_FINALIZE_OVERLAY_BASE 0x00306082u
+#define NP560_APPLICATION_MAIN_RENDER_FINALIZE_OVERLAY_SIZE 0x0104u
 #define NP560_APPLICATION_MAIN_ACTION_RENDER_CLEAR_OVERLAY_BASE 0x0032b922u
 #define NP560_APPLICATION_MAIN_ACTION_RENDER_CLEAR_OVERLAY_SIZE 0x0052u
-#define NP560_APPLICATION_MAIN_ACTION_RENDER_LINE_OVERLAY_BASE 0x0032cf38u
+#define NP560_APPLICATION_RENDER_CLEAR_TRANSITION_CHILD_ALIAS_SIZE 0x00a4u
+#define NP560_APPLICATION_NPE_LOADER_CONTEXT_INIT_OVERLAY_BASE 0x0032ceeeu
+#define NP560_APPLICATION_NPE_LOADER_CONTEXT_INIT_OVERLAY_SIZE 0x004au
+#define NP560_APPLICATION_NPE_STATE_DISPATCH_OVERLAY_BASE 0x005f0000u
+#define NP560_APPLICATION_NPE_STATE_DISPATCH_OVERLAY_SIZE 0x0248u
+#define NP560_APPLICATION_NPE_STREAM_CLASSIFY_OVERLAY_BASE 0x005f4e3eu
+#define NP560_APPLICATION_NPE_STREAM_CLASSIFY_OVERLAY_SIZE 0x0234u
+#define NP560_APPLICATION_NPE_LOADER_BITMAP_DECODE_OVERLAY_BASE 0x005f716cu
+#define NP560_APPLICATION_NPE_LOADER_BITMAP_DECODE_OVERLAY_SIZE 0x0346u
+#define NP560_APPLICATION_NPE_BITMAP_CONTEXT_OVERLAY_BASE 0x005f8202u
+#define NP560_APPLICATION_NPE_BITMAP_CONTEXT_OVERLAY_SIZE 0x02aau
+#define NP560_APPLICATION_NPE_NODE_TRANSFER_OVERLAY_BASE 0x005fc5ecu
+#define NP560_APPLICATION_NPE_NODE_TRANSFER_OVERLAY_SIZE 0x0850u
+/* The final ROM-01 guest installer supplies the exact +0x1D updater-bank
+ * bodies for the three application functions reached after 1F:D224.  Flat
+ * 24:ACBA is erased storage, and flat 31:71D2/2B:0DA2 are instruction
+ * extension words.  These are writable coherent code/data windows only;
+ * QEMU neither source-pins them nor manufactures their return values. */
+#define NP560_APPLICATION_NPE_LOADER_PREPARE_OVERLAY_BASE 0x0024acbau
+#define NP560_APPLICATION_NPE_LOADER_PREPARE_OVERLAY_SIZE 0x0432u
+#define NP560_APPLICATION_NPE_LOADER_MODE_OVERLAY_BASE 0x003171d2u
+#define NP560_APPLICATION_NPE_LOADER_MODE_OVERLAY_SIZE 0x00b4u
+#define NP560_APPLICATION_NPE_OPERATION7_OVERLAY_BASE 0x002b0da2u
+#define NP560_APPLICATION_NPE_OPERATION7_OVERLAY_SIZE 0x0242u
+/* 2B:0DA2 consumes the original operation-7 title/menu data from numeric
+ * 2F:AA00 only after the Game World browser has retired.  Before that point
+ * the same numeric range is part of the live flat 2F:A0B6 code body.  Keep a
+ * writable data-only Harvard window: reset seeds it with flat PRG bytes, the
+ * guest lifecycle wrapper replaces it with exact 4C:AA00 data, and the code
+ * bus deliberately remains on the immutable flat instruction image. */
+#define NP560_APPLICATION_NPE_OPERATION7_MENU_DATA_BASE 0x002faa00u
+#define NP560_APPLICATION_NPE_OPERATION7_MENU_DATA_SIZE 0x0054u
+#define NP560_APPLICATION_NPE_OPERATION7_DECODE_OVERLAY_BASE 0x0026a92cu
+#define NP560_APPLICATION_NPE_OPERATION7_DECODE_OVERLAY_SIZE 0x037au
+#define NP560_APPLICATION_MAIN_ACTION_RENDER_LINE_OVERLAY_BASE 0x005fcf38u
 #define NP560_APPLICATION_MAIN_ACTION_RENDER_LINE_OVERLAY_SIZE 0x0046u
 #define NP560_APPLICATION_MAIN_ACTION_RENDER_PACK_OVERLAY_BASE 0x0032f4f2u
 #define NP560_APPLICATION_MAIN_ACTION_RENDER_PACK_OVERLAY_SIZE 0x003cu
@@ -1205,6 +1590,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
  * PC in collision-free bank 5F and its evidenced callers are retargeted. */
 #define NP560_APPLICATION_RESULT_MODE_PAIR_OVERLAY_BASE 0x005f1bbau
 #define NP560_APPLICATION_RESULT_MODE_PAIR_OVERLAY_SIZE 0x002cu
+/* Resident 1B:7A20 calls two complete application helpers whose linked
+ * 33:380A and 30:6A9C targets overlap live flat functions.  The final guest
+ * ROM-01 installer publishes their exact source words in collision-free bank
+ * 5F.  Keep both instruction and data views on the writable guest backing. */
+#define NP560_APPLICATION_OPERATION_RECORD_ACCESSOR_OVERLAY_BASE 0x005f380au
+#define NP560_APPLICATION_OPERATION_RECORD_ACCESSOR_OVERLAY_SIZE 0x0022u
+#define NP560_APPLICATION_OPERATION_FRAME_DRAW_OVERLAY_BASE 0x005f6a9cu
+#define NP560_APPLICATION_OPERATION_FRAME_DRAW_OVERLAY_SIZE 0x0102u
 /* The wide-result normalizer calls a naked source-50 accumulate leaf whose
  * linked 33:1A5A address is live flat code.  The reconstructed loader places
  * that exact 44-byte leaf in collision-free bank 5F, so both the data bus
@@ -1291,6 +1684,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
  * 32:D964; expose that destination as writable executable SoC code RAM. */
 #define NP560_APPLICATION_ROOT_MENU_MODE_QUERY_OVERLAY_BASE 0x0032d964u
 #define NP560_APPLICATION_ROOT_MENU_MODE_QUERY_OVERLAY_SIZE 0x0046u
+/* All root-controller paths pass the nonzero mode-query result to 31:5300.
+ * Flat 31:5300 is an unframed raster-algorithm continuation; the resident
+ * guest installer copies the complete 4E:5300 object selector through its
+ * balanced 4E:53B8 RETS.  Expose that destination as writable executable
+ * overlay RAM so the installed selector can return the 51:4A46 root node. */
+#define NP560_APPLICATION_ROOT_OBJECT_SELECT_OVERLAY_BASE 0x00315300u
+#define NP560_APPLICATION_ROOT_OBJECT_SELECT_OVERLAY_SIZE 0x00bau
 #define NP560_APPLICATION_FOREGROUND_STATE_DISPATCH_OVERLAY_BASE 0x0022381eu
 #define NP560_APPLICATION_FOREGROUND_STATE_DISPATCH_OVERLAY_SIZE 0x0510u
 #define NP560_APPLICATION_FOREGROUND_STATE50_OVERLAY_BASE 0x0032bfc6u
@@ -1339,6 +1739,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_APPLICATION_TIMER_COMMIT_OVERLAY_SOURCE 0x004e3212u
 #define NP560_APPLICATION_EVENT_FETCH_OVERLAY_BASE 0x00334eccu
 #define NP560_APPLICATION_EVENT_FETCH_OVERLAY_SIZE 0x0016u
+/* EVENT_FETCH and POST_REGISTRY_STATE are adjacent 22-byte publisher
+ * destinations.  One coherent program window represents both without an
+ * otherwise redundant pair of Harvard aliases. */
+#define NP560_APPLICATION_EVENT_REGISTRY_OVERLAY_SIZE 0x002cu
 #define NP560_APPLICATION_EVENT_DECODE_OVERLAY_BASE 0x002e8742u
 #define NP560_APPLICATION_EVENT_DECODE_OVERLAY_SIZE 0x0178u
 #define NP560_APPLICATION_LOADING_TASK_OVERLAY_BASE 0x0020be12u
@@ -1372,6 +1776,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_APPLICATION_POST_MODAL_REFRESH_OVERLAY_SIZE 0x00deu
 #define NP560_APPLICATION_FAR_QUERY_WRAPPER_OVERLAY_BASE 0x003340a8u
 #define NP560_APPLICATION_FAR_QUERY_WRAPPER_OVERLAY_SIZE 0x001eu
+#define NP560_APPLICATION_FLAG_REPORT_OVERLAY_BASE 0x0031e1e4u
+#define NP560_APPLICATION_FLAG_REPORT_OVERLAY_SIZE 0x0096u
 #define NP560_APPLICATION_REGISTER_QUAD_CONVERT_OVERLAY_BASE 0x0031e27au
 #define NP560_APPLICATION_REGISTER_QUAD_CONVERT_OVERLAY_SIZE 0x0094u
 #define NP560_APPLICATION_SIGNED_VALUE_CONVERT_OVERLAY_BASE 0x0032169cu
@@ -1463,6 +1869,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_APPLICATION_INIT_32_519E_OVERLAY_BASE 0x0032519eu
 #define NP560_APPLICATION_INIT_32_519E_OVERLAY_SIZE 0x0072u
 #define NP560_APPLICATION_INIT_32_519E_OVERLAY_SOURCE 0x004f519eu
+#define NP560_APPLICATION_RESOURCE_DRIVER_INIT_OVERLAY_SIZE 0x00e4u
 #define NP560_APPLICATION_INIT_32_F3C6_OVERLAY_BASE 0x0032f3c6u
 #define NP560_APPLICATION_INIT_32_F3C6_OVERLAY_SIZE 0x003cu
 #define NP560_APPLICATION_INIT_32_F3C6_OVERLAY_SOURCE 0x004ff3c6u
@@ -1472,6 +1879,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_APPLICATION_INIT_31_CC84_OVERLAY_BASE 0x0031cc84u
 #define NP560_APPLICATION_INIT_31_CC84_OVERLAY_SIZE 0x009au
 #define NP560_APPLICATION_INIT_31_CC84_OVERLAY_SOURCE 0x004ecc84u
+#define NP560_STORAGE_PACKED_INIT_OVERLAY_SIZE 0x0136u
 #define NP560_APPLICATION_INIT_32_C514_OVERLAY_BASE 0x0032c514u
 #define NP560_APPLICATION_INIT_32_C514_OVERLAY_SIZE 0x004eu
 #define NP560_APPLICATION_INIT_32_C514_OVERLAY_SOURCE 0x004fc514u
@@ -1515,6 +1923,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_APPLICATION_FILE_OBJECT_OPEN_OVERLAY_BASE 0x0031339au
 #define NP560_APPLICATION_FILE_OBJECT_OPEN_OVERLAY_SIZE 0x00c4u
 #define NP560_APPLICATION_FILE_OBJECT_OPEN_OVERLAY_SOURCE 0x004e339au
+#define NP560_APPLICATION_STATE_DESCRIPTOR_OVERLAY_BASE 0x0031345eu
+#define NP560_APPLICATION_STATE_DESCRIPTOR_OVERLAY_SIZE 0x00c4u
+#define NP560_APPLICATION_STATE_DESCRIPTOR_OVERLAY_SOURCE 0x004e345eu
 #define NP560_APPLICATION_FILE_OBJECT_RESOLVE_OVERLAY_BASE 0x0031e022u
 #define NP560_APPLICATION_FILE_OBJECT_RESOLVE_OVERLAY_SIZE 0x0096u
 #define NP560_APPLICATION_FILE_OBJECT_RESOLVE_OVERLAY_SOURCE 0x004ee022u
@@ -1539,6 +1950,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_APPLICATION_FILE_CREATE_VALIDATE_OVERLAY_BASE 0x0032e560u
 #define NP560_APPLICATION_FILE_CREATE_VALIDATE_OVERLAY_SIZE 0x0042u
 #define NP560_APPLICATION_FILE_CREATE_VALIDATE_OVERLAY_SOURCE 0x004fe560u
+#define NP560_APPLICATION_FILE_CREATE_VALIDATE_PAIR_ALIAS_SIZE 0x0084u
 #define NP560_APPLICATION_STORAGE_CONTEXT_RESOLVE_OVERLAY_BASE 0x002916b0u
 #define NP560_APPLICATION_STORAGE_CONTEXT_RESOLVE_OVERLAY_SIZE 0x02d4u
 #define NP560_APPLICATION_STORAGE_CONTEXT_RESOLVE_OVERLAY_SOURCE 0x004616b0u
@@ -1560,6 +1972,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_APPLICATION_FILE_RECORD_LEAF_507C_OVERLAY_SIZE 0x0014u
 #define NP560_APPLICATION_FILE_RECORD_LEAF_66EC_OVERLAY_BASE 0x003366ecu
 #define NP560_APPLICATION_FILE_RECORD_LEAF_66EC_OVERLAY_SIZE 0x000au
+#define NP560_APPLICATION_ROOT_OBJECT_FIELD_OVERLAY_BASE 0x0033280au
+#define NP560_APPLICATION_ROOT_OBJECT_FIELD_OVERLAY_SIZE 0x0028u
 #define NP560_APPLICATION_FILE_RECORD_LEAF_673C_OVERLAY_BASE 0x0033673cu
 #define NP560_APPLICATION_FILE_RECORD_LEAF_673C_OVERLAY_SIZE 0x000au
 #define NP560_APPLICATION_RESOURCE_RECORD_PARSE_OVERLAY_BASE 0x0028d7e2u
@@ -1586,6 +2000,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_REVERSE_FAR_MEMMOVE_OVERLAY_SIZE 0x00a0u
 #define NP560_APPLICATION_GLYPH_DRAW_OVERLAY_BASE 0x0028fd38u
 #define NP560_APPLICATION_GLYPH_DRAW_OVERLAY_SIZE 0x02c8u
+#define NP560_APPLICATION_WRAPPED_TEXT_DRAW_OVERLAY_BASE 0x002f0000u
+#define NP560_APPLICATION_WRAPPED_TEXT_DRAW_OVERLAY_SIZE 0x0158u
 #define NP560_CHARACTER_DRAW_OVERLAY_BASE 0x00327c0eu
 #define NP560_CHARACTER_DRAW_OVERLAY_SIZE 0x0066u
 #define NP560_FAR_STRING_CONCAT_OVERLAY_BASE 0x00328204u
@@ -1628,8 +2044,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_APPLICATION_RESOURCE_OPEN_OVERLAY_SIZE 0x0046u
 #define NP560_APPLICATION_DRAW_CONTEXT_FACTORY_OVERLAY_BASE 0x0032da7cu
 #define NP560_APPLICATION_DRAW_CONTEXT_FACTORY_OVERLAY_SIZE 0x0046u
-#define NP560_APPLICATION_RESOURCE_OPEN_WRAPPER_OVERLAY_BASE 0x0032b63cu
+#define NP560_APPLICATION_RESOURCE_OPEN_WRAPPER_OVERLAY_BASE 0x005fb63cu
 #define NP560_APPLICATION_RESOURCE_OPEN_WRAPPER_OVERLAY_SIZE 0x0054u
+#define NP560_APPLICATION_RESOURCE_OPEN_WRAPPER_OVERLAY_SOURCE 0x004fb63cu
 #define NP560_APPLICATION_RESOURCE_COORDINATE_OVERLAY_BASE 0x002eab96u
 #define NP560_APPLICATION_RESOURCE_COORDINATE_OVERLAY_SIZE 0x0170u
 #define NP560_INT32_DIVIDE_WRAPPER_OVERLAY_BASE 0x00332512u
@@ -1644,6 +2061,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_WIDE_COMPARE_OVERLAY_BASE 0x00328716u
 #define NP560_WIDE_COMPARE_OVERLAY_SIZE 0x0062u
 #define NP560_WIDE_COMPARE_OVERLAY_SOURCE 0x004f8716u
+#define NP560_WIDE_FROM_INT_COMPARE_OVERLAY_SIZE 0x00c4u
 #define NP560_WIDE_OPERATION_DISPATCH_OVERLAY_BASE 0x0032d218u
 #define NP560_WIDE_OPERATION_DISPATCH_OVERLAY_SOURCE 0x004fd218u
 #define NP560_WIDE_OPERATION_DISPATCH_OVERLAY_SIZE 0x0048u
@@ -1710,6 +2128,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_WIDE_RIGHT_NONZERO_OVERLAY_BASE 0x003311a0u
 #define NP560_WIDE_RIGHT_NONZERO_OVERLAY_SIZE 0x0018u
 #define NP560_WIDE_RIGHT_NONZERO_OVERLAY_SOURCE 0x005011a0u
+#define NP560_WIDE_NONZERO_OVERLAY_SIZE 0x0030u
 #define NP560_APPLICATION_PAIR_STORE_OVERLAY_BASE 0x003281d4u
 #define NP560_APPLICATION_PAIR_STORE_OVERLAY_SIZE 0x0030u
 #define NP560_RESOURCE_STORAGE_ENTRY_OVERLAY_BASE 0x0033524cu
@@ -1733,6 +2152,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_RESOURCE_STORAGE_WRITE_OVERLAY_BASE 0x00284ceau
 #define NP560_RESOURCE_STORAGE_WRITE_OVERLAY_SIZE 0x0306u
 #define NP560_RESOURCE_STORAGE_WRITE_OVERLAY_SOURCE 0x00454ceau
+#define NP560_RESOURCE_STORAGE_WRITE_MENU_ALIAS_SIZE 0x060cu
 #define NP560_RESOURCE_STORAGE_BLOCK_WRITE_OVERLAY_BASE 0x0025970cu
 #define NP560_RESOURCE_STORAGE_BLOCK_WRITE_OVERLAY_SIZE 0x03e2u
 #define NP560_RESOURCE_STORAGE_BLOCK_WRITE_OVERLAY_SOURCE 0x0042970cu
@@ -1769,11 +2189,209 @@ OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
 #define NP560_RESOURCE_STORAGE_STATUS_OVERLAY_BASE 0x0031b33cu
 #define NP560_RESOURCE_STORAGE_STATUS_OVERLAY_SIZE 0x00a0u
 #define NP560_RESOURCE_STORAGE_STATUS_OVERLAY_SOURCE 0x004eb33cu
-#define NP560_LATE_OVERLAY_COUNT 569
+/* Resident 14:BB28 persists one-byte resource settings through the exact
+ * linked writer chain 32:EBAE -> 33:0D7E -> 28:0F92.  The upgrade image's
+ * flat destinations are unrelated fragments; the guest late installer
+ * publishes the complete +0x1D bodies.  Give each bounded destination the
+ * same source-pinned executable treatment as the surrounding resource/storage
+ * graph while retaining the ordinary data-bus alias for guest publication. */
+#define NP560_RESOURCE_PERSIST_WRAPPER_OVERLAY_BASE 0x0032ebaeu
+#define NP560_RESOURCE_PERSIST_WRAPPER_OVERLAY_SIZE 0x0040u
+#define NP560_RESOURCE_PERSIST_WRAPPER_OVERLAY_SOURCE 0x004febaeu
+#define NP560_RESOURCE_PERSIST_BRIDGE_OVERLAY_BASE 0x00330d7eu
+#define NP560_RESOURCE_PERSIST_BRIDGE_OVERLAY_SIZE 0x0032u
+#define NP560_RESOURCE_PERSIST_PAGE_WRITE_OVERLAY_BASE 0x00280f92u
+#define NP560_RESOURCE_PERSIST_PAGE_WRITE_OVERLAY_SIZE 0x0312u
+#define NP560_RESOURCE_PERSIST_PAGE_WRITE_OVERLAY_SOURCE 0x00450f92u
+#define NP560_GAME_WORLD_HELPER_2D0B00_OVERLAY_BASE 0x002d0b00u
+#define NP560_GAME_WORLD_HELPER_2D0B00_OVERLAY_SIZE 0x01d4u
+#define NP560_GAME_WORLD_HELPER_2D0B00_OVERLAY_SOURCE 0x004a0b00u
+#define NP560_GAME_WORLD_HELPER_2A8F26_OVERLAY_BASE 0x002a8f26u
+#define NP560_GAME_WORLD_HELPER_2A8F26_OVERLAY_SIZE 0x0268u
+#define NP560_GAME_WORLD_HELPER_2A8F26_OVERLAY_SOURCE 0x00478f26u
+#define NP560_GAME_WORLD_HELPER_331E22_OVERLAY_BASE 0x00331e22u
+#define NP560_GAME_WORLD_HELPER_331E22_OVERLAY_SIZE 0x002cu
+#define NP560_GAME_WORLD_HELPER_331E22_OVERLAY_SOURCE 0x00501e22u
+#define NP560_GAME_WORLD_HELPER_3009F2_OVERLAY_BASE 0x003009f2u
+#define NP560_GAME_WORLD_HELPER_3009F2_OVERLAY_SIZE 0x011au
+#define NP560_GAME_WORLD_HELPER_3009F2_OVERLAY_SOURCE 0x004d09f2u
+#define NP560_GAME_WORLD_HELPER_30BC4C_OVERLAY_BASE 0x0030bc4cu
+#define NP560_GAME_WORLD_HELPER_30BC4C_OVERLAY_SIZE 0x00e6u
+#define NP560_GAME_WORLD_HELPER_30BC4C_OVERLAY_SOURCE 0x004dbc4cu
+#define NP560_GAME_WORLD_HELPER_2C682E_OVERLAY_BASE 0x002c682eu
+#define NP560_GAME_WORLD_HELPER_2C682E_OVERLAY_SIZE 0x01f6u
+#define NP560_GAME_WORLD_HELPER_2C682E_OVERLAY_SOURCE 0x0049682eu
+#define NP560_GAME_WORLD_HELPER_20CE3A_OVERLAY_BASE 0x0020ce3au
+#define NP560_GAME_WORLD_HELPER_20CE3A_OVERLAY_SIZE 0x0562u
+#define NP560_GAME_WORLD_HELPER_20CE3A_OVERLAY_SOURCE 0x003dce3au
+#define NP560_GAME_WORLD_HELPER_30E81A_OVERLAY_BASE 0x0030e81au
+#define NP560_GAME_WORLD_HELPER_30E81A_OVERLAY_SIZE 0x00dcu
+#define NP560_GAME_WORLD_HELPER_30E81A_OVERLAY_SOURCE 0x004de81au
+#define NP560_GAME_WORLD_HELPER_2D6070_OVERLAY_BASE 0x002d6070u
+#define NP560_GAME_WORLD_HELPER_2D6070_OVERLAY_SIZE 0x01beu
+#define NP560_GAME_WORLD_HELPER_2D6070_OVERLAY_SOURCE 0x004a6070u
+#define NP560_GAME_WORLD_HELPER_2E6822_OVERLAY_BASE 0x002e6822u
+#define NP560_GAME_WORLD_HELPER_2E6822_OVERLAY_SIZE 0x017eu
+#define NP560_GAME_WORLD_HELPER_2E6822_OVERLAY_SOURCE 0x004b6822u
+#define NP560_GAME_WORLD_HELPER_32DCAC_OVERLAY_BASE 0x0032dcacu
+#define NP560_GAME_WORLD_HELPER_32DCAC_OVERLAY_SIZE 0x0046u
+#define NP560_GAME_WORLD_HELPER_32DCAC_OVERLAY_SOURCE 0x004fdcacu
+#define NP560_GAME_WORLD_DEP_2D622E_OVERLAY_BASE 0x002d622eu
+#define NP560_GAME_WORLD_DEP_2D622E_OVERLAY_SIZE 0x01beu
+#define NP560_GAME_WORLD_DEP_30A0FC_OVERLAY_BASE 0x0030a0fcu
+#define NP560_GAME_WORLD_DEP_30A0FC_OVERLAY_SIZE 0x00eeu
+#define NP560_GAME_WORLD_DEP_287408_OVERLAY_BASE 0x00287408u
+#define NP560_GAME_WORLD_DEP_287408_OVERLAY_SIZE 0x02feu
+#define NP560_GAME_WORLD_DEP_30EE12_OVERLAY_BASE 0x0030ee12u
+#define NP560_GAME_WORLD_DEP_30EE12_OVERLAY_SIZE 0x00dau
+#define NP560_GAME_WORLD_DEP_3150D0_OVERLAY_BASE 0x003150d0u
+#define NP560_GAME_WORLD_DEP_3150D0_OVERLAY_SIZE 0x00bcu
+#define NP560_GAME_WORLD_DEP_323E52_OVERLAY_BASE 0x00323e52u
+#define NP560_GAME_WORLD_DEP_323E52_OVERLAY_SIZE 0x007au
+#define NP560_GAME_WORLD_DEP_282844_OVERLAY_BASE 0x00282844u
+#define NP560_GAME_WORLD_DEP_282844_OVERLAY_SIZE 0x0312u
+#define NP560_GAME_WORLD_DEP_32E06C_OVERLAY_BASE 0x0032e06cu
+#define NP560_GAME_WORLD_DEP_32E06C_OVERLAY_SIZE 0x0044u
+#define NP560_GAME_WORLD_DEP_2BDB86_OVERLAY_BASE 0x002bdb86u
+#define NP560_GAME_WORLD_DEP_2BDB86_OVERLAY_SIZE 0x0218u
+#define NP560_GAME_WORLD_DEP_2BDB86_OVERLAY_SOURCE 0x0048db86u
+#define NP560_FILE_BROWSER_CONFIRM_FIELD_OVERLAY_BASE 0x0033384eu
+#define NP560_FILE_BROWSER_CONFIRM_FIELD_OVERLAY_SIZE 0x0022u
+#define NP560_FILE_BROWSER_CONFIRM_FIELD_OVERLAY_SOURCE 0x0050384eu
+#define NP560_FILE_BROWSER_PATH_RANGE_OVERLAY_BASE 0x0025f992u
+#define NP560_FILE_BROWSER_PATH_RANGE_OVERLAY_SIZE 0x03bau
+#define NP560_FILE_BROWSER_PATH_RANGE_OVERLAY_SOURCE 0x0042f992u
+#define NP560_APPLICATION_MAIN_ITEM_CALLBACK_OVERLAY_BASE 0x0022147au
+#define NP560_APPLICATION_MAIN_ITEM_CALLBACK_OVERLAY_SIZE 0x051au
+#define NP560_APPLICATION_MAIN_ITEM_CALLBACK_RANGE_OVERLAY_BASE 0x002e0192u
+#define NP560_APPLICATION_MAIN_ITEM_CALLBACK_RANGE_OVERLAY_SIZE 0x0192u
+#define NP560_APPLICATION_MAIN_ITEM_CALLBACK_FINALIZE_OVERLAY_BASE 0x0032f0e0u
+#define NP560_APPLICATION_MAIN_ITEM_CALLBACK_FINALIZE_OVERLAY_SIZE 0x003eu
+/*
+ * v754 dynamic tracing proved that exact 08:43A6 copies 0x26 bytes from
+ * 4F:4956 to data 32:4956 before the NPE header comparisons.  The generic
+ * program-NOR data alias currently shadows broad RAM at this address, so the
+ * observed stores are discarded.  Expose only this bounded data-bus window
+ * as writable external RAM; the Harvard code view must remain flat PRG.
+ */
+#define NP560_APPLICATION_NPE_FORMAT_LITERAL_DATA_BASE 0x00324956u
+#define NP560_APPLICATION_NPE_FORMAT_LITERAL_DATA_SIZE 0x0026u
+#define NP560_APPLICATION_NPE_LOADER_SLOT_WRITE_LINKED_OVERLAY_BASE 0x0032f38au
+#define NP560_APPLICATION_NPE_LOADER_SLOT_WRITE_OVERLAY_BASE 0x005ff38au
+#define NP560_APPLICATION_NPE_LOADER_SLOT_WRITE_OVERLAY_SIZE 0x003cu
+#define NP560_APPLICATION_NPE_RUNTIME_HELPER_OVERLAY_BASE 0x00263e5eu
+#define NP560_APPLICATION_NPE_RUNTIME_HELPER_OVERLAY_SIZE 0x03a0u
+#define NP560_APPLICATION_NPE_TABLE_MODE_INIT_OVERLAY_BASE 0x00253082u
+#define NP560_APPLICATION_NPE_TABLE_MODE_INIT_OVERLAY_SIZE 0x0400u
+#define NP560_APPLICATION_OPERATION_TABLE_REFRESH_OVERLAY_BASE 0x002fe15au
+#define NP560_APPLICATION_OPERATION_TABLE_REFRESH_OVERLAY_SIZE 0x0126u
+#define NP560_APPLICATION_OPERATION_NEW_JOURNEY_FRAME_INIT_OVERLAY_BASE 0x002f6ab8u
+#define NP560_APPLICATION_OPERATION_NEW_JOURNEY_FRAME_INIT_OVERLAY_SIZE 0x0142u
+#define NP560_APPLICATION_OPERATION_FRAME_CLEAR_OVERLAY_BASE 0x00295c22u
+#define NP560_APPLICATION_OPERATION_FRAME_CLEAR_OVERLAY_SIZE 0x02bcu
+#define NP560_APPLICATION_OPERATION_FRAME_CLEAR_DRAW_HELPER_OVERLAY_BASE 0x00307b8cu
+#define NP560_APPLICATION_OPERATION_FRAME_CLEAR_DRAW_HELPER_OVERLAY_SIZE 0x00fcu
+#define NP560_APPLICATION_NPE_OBJECT_UPDATE_OVERLAY_BASE 0x002dc276u
+#define NP560_APPLICATION_NPE_OBJECT_UPDATE_OVERLAY_SIZE 0x01a4u
+#define NP560_APPLICATION_NPE_TRANSFORM_HELPER_OVERLAY_BASE 0x003303b2u
+#define NP560_APPLICATION_NPE_TRANSFORM_HELPER_OVERLAY_SIZE 0x0036u
+/* Operation 7's ``new journey`` callback copies this exact seven-function
+ * closure from the linked +0x1d PRG banks immediately before it is called.
+ * These bounded destinations are therefore loader-owned writable executable
+ * RAM, not immutable flat NOR at the same numeric addresses.  Two bodies in
+ * banks 27 and 29 deliberately remain coherent with guest writes: their
+ * installed call words are retargeted away from the collided 2B dispatcher,
+ * so the generic resource-buffer source pinning must not cover them. */
+#define NP560_APPLICATION_OPERATION_NEW_JOURNEY_INIT_OVERLAY_BASE 0x00258392u
+#define NP560_APPLICATION_OPERATION_NEW_JOURNEY_INIT_OVERLAY_SIZE 0x03e8u
+#define NP560_APPLICATION_OPERATION_NEW_JOURNEY_RANGE_OVERLAY_BASE 0x00236c3cu
+#define NP560_APPLICATION_OPERATION_NEW_JOURNEY_RANGE_OVERLAY_SIZE 0x04a4u
+#define NP560_APPLICATION_OPERATION_NEW_JOURNEY_RANDOMIZE_OVERLAY_BASE 0x0027e84cu
+#define NP560_APPLICATION_OPERATION_NEW_JOURNEY_RANDOMIZE_OVERLAY_SIZE 0x0324u
+#define NP560_APPLICATION_OPERATION_NEW_JOURNEY_COMPARE_OVERLAY_BASE 0x002e79fau
+#define NP560_APPLICATION_OPERATION_NEW_JOURNEY_COMPARE_OVERLAY_SIZE 0x017cu
+#define NP560_APPLICATION_OPERATION_NEW_JOURNEY_DRAW_OVERLAY_BASE 0x0029bbf2u
+#define NP560_APPLICATION_OPERATION_NEW_JOURNEY_DRAW_OVERLAY_SIZE 0x029au
+#define NP560_APPLICATION_OPERATION_NEW_JOURNEY_DRAW_ITEM_OVERLAY_BASE 0x002d908eu
+#define NP560_APPLICATION_OPERATION_NEW_JOURNEY_DRAW_ITEM_OVERLAY_SIZE 0x01b0u
+#define NP560_APPLICATION_OPERATION_TRANSITION_CALLBACK_OVERLAY_BASE 0x0031a3f4u
+#define NP560_APPLICATION_OPERATION_TRANSITION_CALLBACK_OVERLAY_SIZE 0x00a4u
+#define NP560_APPLICATION_OPERATION_TRANSITION_SERVICE_OVERLAY_BASE 0x00325f86u
+#define NP560_APPLICATION_OPERATION_TRANSITION_SERVICE_OVERLAY_SIZE 0x006eu
+#define NP560_APPLICATION_OPERATION_TRANSITION_SERVICE_CODE_BASE 0x00325800u
+#define NP560_APPLICATION_OPERATION_TRANSITION_SERVICE_CODE_SIZE 0x0800u
+#define NP560_APPLICATION_OPERATION_TRANSITION_SERVICE_CHILD_OVERLAY_BASE 0x0032b974u
+#define NP560_APPLICATION_OPERATION_TRANSITION_SERVICE_CHILD_OVERLAY_SIZE 0x0052u
+#define NP560_APPLICATION_OPERATION_TRANSITION_SERVICE_LEAF_OVERLAY_BASE 0x00250000u
+#define NP560_APPLICATION_OPERATION_TRANSITION_SERVICE_LEAF_OVERLAY_SIZE 0x0412u
+/* Keep the data-bus write aperture bounded to the exact installed function,
+ * but back its whole 2-KiB instruction-dispatch page with the same seeded RAM.
+ * Bytes after the function retain their flat PRG seed and remain protected by
+ * the data-bus NOR alias, so this removes a QEMU subpage split without
+ * widening the guest-visible writable range. */
+#define NP560_APPLICATION_OPERATION_TRANSITION_SERVICE_LEAF_CODE_SIZE 0x0800u
+#define NP560_APPLICATION_OPERATION_GRID_REPOSITION_OVERLAY_BASE 0x00224c58u
+#define NP560_APPLICATION_OPERATION_GRID_REPOSITION_OVERLAY_SIZE 0x0506u
+#define NP560_APPLICATION_OPERATION_GRID_REPOSITION_CODE_BASE 0x00224800u
+#define NP560_APPLICATION_OPERATION_GRID_REPOSITION_CODE_SIZE 0x1000u
+/* The relocated input controller calls linked 22:D700 for movement and
+ * viewport scrolling.  The operation-7 guest publisher replaces the flat
+ * collided continuation with exact source 3F:D700..DBDF, so keep its bounded
+ * data writes coherent with instruction fetches. */
+#define NP560_APPLICATION_OPERATION_SCROLL_RENDERER_OVERLAY_BASE 0x0022d700u
+#define NP560_APPLICATION_OPERATION_SCROLL_RENDERER_OVERLAY_SIZE 0x04e0u
+#define NP560_APPLICATION_OPERATION_SCROLL_RENDERER_CODE_BASE 0x0022d000u
+#define NP560_APPLICATION_OPERATION_SCROLL_RENDERER_CODE_SIZE 0x1000u
+#define NP560_APPLICATION_NPE_STATE_RANGE_OVERLAY_BASE 0x005f0248u
+#define NP560_APPLICATION_NPE_STATE_RANGE_OVERLAY_SIZE 0x0248u
+#define NP560_APPLICATION_NPE_STATE_RANGE_OVERLAY_SOURCE 0x00480248u
+#define NP560_APPLICATION_NPE_DIRECTION_PUBLICATION_OVERLAY_BASE 0x00326062u
+#define NP560_APPLICATION_NPE_DIRECTION_PUBLICATION_OVERLAY_SIZE 0x006eu
+/* The operation-7 publisher writes exact source 4F:6062 here at runtime.
+ * Keep that destination coherent, but seed it from the flat destination PRG
+ * bytes (code_source=0 below), not from source 4F.  Seeding source 4F during
+ * cold boot overwrote live browser code before the publisher ran.  The ROM03
+ * veneer still uses the independently relocated exact body at 1A:7B00. */
+#define NP560_LATE_OVERLAY_COUNT 625
 
 G_STATIC_ASSERT(NP560_MENU_TEXT_DATA_30_BASE +
                 NP560_MENU_TEXT_DATA_30_SIZE ==
                 NP560_APPLICATION_LIST_ITEM_SET_OVERLAY_BASE);
+G_STATIC_ASSERT(NP560_APPLICATION_OPERATION_ONE_ACTION_OVERLAY_BASE +
+                NP560_APPLICATION_OPERATION_ONE_ACTION_OVERLAY_SIZE ==
+                NP560_APPLICATION_OPERATION_UI_INIT_OVERLAY_BASE);
+G_STATIC_ASSERT(NP560_APPLICATION_OPERATION_ACTION_UI_OVERLAY_SIZE ==
+                NP560_APPLICATION_OPERATION_ONE_ACTION_OVERLAY_SIZE +
+                NP560_APPLICATION_OPERATION_UI_INIT_OVERLAY_SIZE);
+G_STATIC_ASSERT(NP560_APPLICATION_OPERATION_ACTION_CODE_PAGE_BASE +
+                NP560_APPLICATION_OPERATION_ACTION_CODE_PAGE_OFFSET ==
+                NP560_APPLICATION_OPERATION_ONE_ACTION_OVERLAY_BASE);
+G_STATIC_ASSERT(NP560_APPLICATION_OPERATION_ONE_ACTION_OVERLAY_BASE +
+                NP560_APPLICATION_OPERATION_ACTION_CODE_PAGE_PUBLISHED_SIZE ==
+                NP560_APPLICATION_OPERATION_ACTION_UI_TAIL_BASE);
+G_STATIC_ASSERT(NP560_APPLICATION_OPERATION_ACTION_UI_TAIL_OFFSET ==
+                NP560_APPLICATION_OPERATION_ACTION_CODE_PAGE_PUBLISHED_SIZE);
+G_STATIC_ASSERT(NP560_APPLICATION_OPERATION_ACTION_UI_TAIL_OFFSET +
+                NP560_APPLICATION_OPERATION_ACTION_UI_TAIL_SIZE ==
+                NP560_APPLICATION_OPERATION_ACTION_UI_OVERLAY_SIZE);
+G_STATIC_ASSERT(NP560_APPLICATION_EVENT_FETCH_OVERLAY_BASE +
+                NP560_APPLICATION_EVENT_FETCH_OVERLAY_SIZE ==
+                NP560_APPLICATION_POST_REGISTRY_STATE_OVERLAY_BASE);
+G_STATIC_ASSERT(NP560_APPLICATION_EVENT_REGISTRY_OVERLAY_SIZE ==
+                NP560_APPLICATION_EVENT_FETCH_OVERLAY_SIZE +
+                NP560_APPLICATION_POST_REGISTRY_STATE_OVERLAY_SIZE);
+G_STATIC_ASSERT(NP560_TIMER_IDLE_SET_BIT2_OVERLAY_BASE +
+                NP560_TIMER_IDLE_SET_BIT2_OVERLAY_SIZE ==
+                NP560_TIMER_IDLE_SET_BIT1_OVERLAY_BASE);
+G_STATIC_ASSERT(NP560_TIMER_IDLE_SET_BITS_OVERLAY_SIZE ==
+                NP560_TIMER_IDLE_SET_BIT2_OVERLAY_SIZE +
+                NP560_TIMER_IDLE_SET_BIT1_OVERLAY_SIZE);
+G_STATIC_ASSERT(NP560_TIMER_IDLE_CLEAR_BIT2_OVERLAY_BASE +
+                NP560_TIMER_IDLE_CLEAR_BIT2_OVERLAY_SIZE ==
+                NP560_TIMER_IDLE_CLEAR_BIT1_OVERLAY_BASE);
+G_STATIC_ASSERT(NP560_TIMER_IDLE_CLEAR_BITS_OVERLAY_SIZE ==
+                NP560_TIMER_IDLE_CLEAR_BIT2_OVERLAY_SIZE +
+                NP560_TIMER_IDLE_CLEAR_BIT1_OVERLAY_SIZE);
 #define NP560_UINT32_MULTIPLY_OVERLAY_BASE 0x003307b0u
 #define NP560_UINT32_MULTIPLY_OVERLAY_SIZE 0x0034u
 #define NP560_UINT32_MULTIPLY_OVERLAY_SOURCE 0x005007b0u
@@ -1832,11 +2450,13 @@ enum {
     NP560_NAND_ERROR_PAGE = 2,
     NP560_NAND_ERROR_RANGE = 3,
     NP560_NAND_ERROR_DMA = 4,
+    NP560_NAND_ERROR_BACKING = 5,
 };
 
 typedef struct NP560NANDState {
     uint8_t *data;
     uint8_t *oob;
+    NP560NANDJournal *journal;
     uint16_t command;
     uint16_t status;
     uint16_t page_hi;
@@ -1967,10 +2587,13 @@ typedef struct NP560ADCState {
 
 typedef struct NP560ST7529State {
     uint8_t gram[NP560_ST7529_RAM_LINES][NP560_ST7529_RAM_WIDTH];
+    uint8_t completed_frame[DMCU_LCD_WIDTH * DMCU_LCD_HEIGHT];
     uint8_t command;
-    uint8_t parameters[4];
+    uint8_t parameters[16];
     uint8_t parameter_index;
     uint8_t parameter_count;
+    uint8_t gray_pwm[2][16];
+    bool gray_pwm_programmed[2]; /* Reset palette values are not specified. */
     uint8_t column_start;
     uint8_t column_end;
     uint8_t line_start;
@@ -1978,6 +2601,9 @@ typedef struct NP560ST7529State {
     uint8_t column;
     uint8_t line;
     uint8_t pixel;
+    uint16_t write_latch; /* Incomplete 2B3P/3B3P bus group. */
+    uint8_t read_pixel;
+    uint8_t read_latch; /* DDRAM bus holder: first MPU read is dummy. */
     uint8_t scan[3];
     uint8_t com_scan;
     uint8_t display_lines;
@@ -1992,9 +2618,11 @@ typedef struct NP560ST7529State {
     bool sleeping;
     bool ram_write;
     bool ram_read;
+    bool read_modify_write;
     uint64_t command_writes;
     uint64_t data_writes;
     uint64_t completed_frames;
+    bool completed_frame_valid;
     uint64_t frame_sequence[NP560_ST7529_FRAME_TRACE];
     uint64_t frame_data_writes[NP560_ST7529_FRAME_TRACE];
     uint32_t frame_pc[NP560_ST7529_FRAME_TRACE];
@@ -2015,19 +2643,10 @@ typedef struct NP560ST7529State {
 
 typedef struct NP560KeyboardState {
     uint16_t last_event;
-    uint16_t last_gpio_state;
     uint64_t events_read;
     uint64_t latch_reads;
     uint64_t latch_events;
     uint32_t latch_last_pc;
-    uint64_t gpio_reads;
-    uint64_t gpio_writes;
-    uint16_t gpio_last_write;
-    uint32_t gpio_last_write_pc;
-    uint32_t trace_index;
-    uint32_t trace_pc[NP560_KEYBOARD_TRACE];
-    uint16_t trace_value[NP560_KEYBOARD_TRACE];
-    uint16_t system_control;
     uint32_t system_control_trace_index;
     uint32_t system_control_trace_pc[NP560_SYSTEM_CONTROL_TRACE];
     uint32_t system_control_trace_next_pc[NP560_SYSTEM_CONTROL_TRACE];
@@ -2046,15 +2665,11 @@ typedef struct NP560KeyboardState {
     uint32_t matrix_trace_index;
     uint16_t matrix_trace_value[NP560_MATRIX_TRACE];
     uint32_t matrix_trace_pc[NP560_MATRIX_TRACE];
+    /* Diagnostic one-shot physical switch.  Index 64 means idle.  Unlike
+     * the Web-held matrix levels, this switch releases itself after the
+     * exact scanner has sampled its selected row once. */
+    uint32_t matrix_pulse_index;
 } NP560KeyboardState;
-
-typedef struct NP560TimerState {
-    uint16_t initial[NP560_TIMER_COUNT];
-    int64_t deadline_ns[NP560_TIMER_COUNT];
-    uint64_t irq_ticks;
-    uint64_t irq_requests;
-    bool irq_enabled;
-} NP560TimerState;
 
 typedef struct NP560ProgramOverlay {
     uint32_t base;
@@ -2096,10 +2711,50 @@ typedef struct NP560FixedDataAlias {
     const char *name;
 } NP560FixedDataAlias;
 
+/* Each selected path below 1A:DEAA performs a second computed RET through a
+ * five-word inline table.  The reconstructed source-37 continuation keeps
+ * those words in SoC ROM, while ordinary data reads would otherwise observe
+ * the zero-filled external-RAM view at the same logical addresses. */
+static const NP560FixedDataAlias
+np560_resident_application_compare_inner_tables[
+    NP560_RESIDENT_APPLICATION_COMPARE_INNER_TABLE_COUNT
+] = {
+    { 0x001ae112u, 0x001ae112u,
+      NP560_RESIDENT_APPLICATION_COMPARE_INNER_TABLE_SIZE,
+      "np560.data-resident-application-compare-inner-table-0-alias" },
+    { 0x001ae30cu, 0x001ae30cu,
+      NP560_RESIDENT_APPLICATION_COMPARE_INNER_TABLE_SIZE,
+      "np560.data-resident-application-compare-inner-table-1-alias" },
+    { 0x001ae506u, 0x001ae506u,
+      NP560_RESIDENT_APPLICATION_COMPARE_INNER_TABLE_SIZE,
+      "np560.data-resident-application-compare-inner-table-2-alias" },
+    { 0x001ae562u, 0x001ae562u,
+      NP560_RESIDENT_APPLICATION_COMPARE_INNER_TABLE_SIZE,
+      "np560.data-resident-application-compare-inner-table-3-alias" },
+    { 0x001ae5beu, 0x001ae5beu,
+      NP560_RESIDENT_APPLICATION_COMPARE_INNER_TABLE_SIZE,
+      "np560.data-resident-application-compare-inner-table-4-alias" },
+    { 0x001ae620u, 0x001ae620u,
+      NP560_RESIDENT_APPLICATION_COMPARE_INNER_TABLE_SIZE,
+      "np560.data-resident-application-compare-inner-table-5-alias" },
+};
+
 /* Fixed Harvard data views backed by exact linked PRG bytes.  Most entries
  * are catalogue strings; the result-object dispatcher also reads its jump
  * table through the data bus even though the surrounding range is code. */
 static const NP560FixedDataAlias np560_catalog_string_data[] = {
+    { NP560_APPLICATION_LAYOUT_TEXT_DATA_30_BASE,
+      NP560_APPLICATION_LAYOUT_TEXT_DATA_30_SOURCE,
+      NP560_APPLICATION_LAYOUT_TEXT_DATA_30_SIZE,
+      "np560.data-application-layout-text-30-alias" },
+    { NP560_APPLICATION_NPE_LIST_TEXT_DATA_32_BASE,
+      NP560_APPLICATION_NPE_LIST_TEXT_DATA_32_SOURCE,
+      NP560_APPLICATION_NPE_LIST_TEXT_DATA_32_SIZE,
+      "np560.data-application-npe-list-text-32-alias" },
+    { NP560_APPLICATION_NPE_PAGE_TEXT_DATA_31_BASE,
+      NP560_APPLICATION_NPE_PAGE_TEXT_DATA_31_SOURCE,
+      NP560_APPLICATION_NPE_PAGE_TEXT_DATA_31_SIZE,
+      "np560.data-application-npe-page-text-31-alias" },
     { 0x00335e38u, 0x00505e38u, 0x00000060u,
       "np560.data-catalog-strings-0-alias" },
     { 0x00336138u, 0x00506138u, 0x000003cau,
@@ -2130,12 +2785,265 @@ static const NP560FixedDataAlias np560_catalog_string_data[] = {
       NP560_APPLICATION_RESULT_OBJECT_INIT_JUMP_TABLE_DATA_OVERLAY_SOURCE,
       NP560_APPLICATION_RESULT_OBJECT_INIT_JUMP_TABLE_DATA_OVERLAY_SIZE,
       "np560.data-application-result-object-init-jump-table-alias" },
+    /* 2E:B8D8 uses RET as a computed local branch after reading this table
+     * from logical data segment 11.  Its bytes live in the same PRG image as
+     * the worker, not in the reconstructed resident SoC ROM. */
+    { NP560_APPLICATION_INPUT_DISPATCH_TABLE_DATA_BASE,
+      NP560_APPLICATION_INPUT_DISPATCH_TABLE_DATA_SOURCE,
+      NP560_APPLICATION_INPUT_DISPATCH_TABLE_DATA_SIZE,
+      "np560.data-application-input-dispatch-table-alias" },
+    /* The file-browser dialog passes title 27:E066 directly and copies the
+     * format at 27:E02E into its page message buffer.  Flat bank 27 contains
+     * executable instructions at both addresses; same-linked source
+     * 44:E000..E07D is the exact bounded string island from the search prompt
+     * through the NUL-terminated "0:\\multi-subject exam" path.  The next
+     * byte, 27:E07E, is already owned by the recovered resident-operation
+     * string-pool overlay.  Redirect only this prefix on the data bus. */
+    { NP560_APPLICATION_FILE_DIALOG_TEXT_DATA_BASE,
+      NP560_APPLICATION_FILE_DIALOG_TEXT_DATA_SOURCE,
+      NP560_APPLICATION_FILE_DIALOG_TEXT_DATA_SIZE,
+      "np560.data-application-file-dialog-text-alias" },
+    /* Exact 1A:DEAA passes 26:527C and 26:528A to the page renderer as two
+     * far strings.  The flat target bank is unrelated code/data and lacks a
+     * terminator; its +0x1D linked source has both bounded NUL-terminated
+     * strings in exactly 0x14 bytes.  Without this Harvard data view the
+     * native 32:945C string copy runs for 0xD6 bytes and overwrites the
+     * renderer's return frame.  Keep instruction fetch on the flat bank. */
+    { NP560_APPLICATION_PAGE_ARGUMENT_TEXT_DATA_BASE,
+      NP560_APPLICATION_PAGE_ARGUMENT_TEXT_DATA_SOURCE,
+      NP560_APPLICATION_PAGE_ARGUMENT_TEXT_DATA_SIZE,
+      "np560.data-application-page-argument-text-alias" },
+    /* Exact 18:4E62 page renderer passes linked constants 32:E248 and
+     * 32:E260 to the native text renderer.  Flat bank 32 contains executable
+     * instructions there; same-linked source 4F:E248..E2CB is the bounded
+     * constant island from "Message size overflow!" through the NCell error,
+     * and 4F:E2CC starts the next function.  Keep code fetches on flat 32 and
+     * expose only those 0x84 source-proven bytes on the Harvard data view. */
+    { NP560_APPLICATION_PAGE_DIALOG_TEXT_DATA_BASE,
+      NP560_APPLICATION_PAGE_DIALOG_TEXT_DATA_SOURCE,
+      NP560_APPLICATION_PAGE_DIALOG_TEXT_DATA_SIZE,
+      "np560.data-application-page-dialog-text-alias" },
+    /* Exact key-completion worker 28:F4A4 calls 31:5014/31:4D24 with a
+     * bit identifier.  Those helpers index two contiguous 16-word AND/OR
+     * tables at data 33:39E6..3A25.  Flat bank 33 is executable code here;
+     * same-linked source 50 contains the exact FFFE..7FFF and 0001..8000
+     * masks.  Without this Harvard view, status key 0x8C sets annunciator
+     * bit 268 but cannot clear it on release. */
+    { NP560_INPUT_BIT_MASK_DATA_33_BASE,
+      NP560_INPUT_BIT_MASK_DATA_33_SOURCE,
+      NP560_INPUT_BIT_MASK_DATA_33_SIZE,
+      "np560.data-input-bit-mask-table-alias" },
 };
 
 G_STATIC_ASSERT(G_N_ELEMENTS(np560_catalog_string_data) ==
                 NP560_CATALOG_STRING_DATA_COUNT);
 
+/* Do not register duplicate aliases for 22:FD9E, 28:12A8, 2D:2D40, 2F:D266,
+ * 2F:FA32, 31:4974, 31:5014, 31:5300, 31:D9AA, 33:3CA6, 33:3DB8, 33:468C,
+ * 33:4D2A, or 33:5D76.  Lifecycle-named or dedicated entries cover those
+ * exact ranges with the same destination-RAM backing.  Keeping both views is
+ * semantically redundant and needlessly consumes QEMU physical-section
+ * indices on both Harvard address spaces. */
 static const NP560ProgramOverlay np560_late_overlays[] = {
+    {
+        NP560_APPLICATION_MAIN_FAR_BYTE_SEARCH_OVERLAY_BASE,
+        NP560_APPLICATION_MAIN_FAR_BYTE_SEARCH_OVERLAY_SIZE,
+        "np560.data-application-main-far-byte-search-overlay-alias",
+        "np560.code-application-main-far-byte-search-overlay-alias",
+        0,
+    },
+    {
+        /* Exact 43:3E5E NPE helper is copied here by the operation-7 guest
+         * wrapper.  The coherent RAM starts with flat resource bytes so the
+         * earlier application lifecycle is unchanged. */
+        NP560_APPLICATION_NPE_RUNTIME_HELPER_OVERLAY_BASE,
+        NP560_APPLICATION_NPE_RUNTIME_HELPER_OVERLAY_SIZE,
+        "np560.data-application-npe-runtime-helper-overlay-alias",
+        "np560.code-application-npe-runtime-helper-overlay-alias",
+        0,
+    },
+    {
+        /* Preserve flat 32:6062 until the operation-7 guest publisher writes
+         * the direction helper, then expose those guest writes to instruction
+         * fetches.  This differs from the removed cold source-4F alias. */
+        NP560_APPLICATION_NPE_DIRECTION_PUBLICATION_OVERLAY_BASE,
+        NP560_APPLICATION_NPE_DIRECTION_PUBLICATION_OVERLAY_SIZE,
+        "np560.data-application-npe-direction-publication-overlay-alias",
+        "np560.code-application-npe-direction-publication-overlay-alias",
+        0,
+    },
+    {
+        /* Resident 0C:BDBE copies the complete 42:3082 table-mode initializer
+         * to linked 25:3082 before calling it.  Keep the Harvard instruction
+         * view coherent with those guest writes; prior to installation the
+         * power-on seed still exposes the original flat PRG bytes. */
+        NP560_APPLICATION_NPE_TABLE_MODE_INIT_OVERLAY_BASE,
+        NP560_APPLICATION_NPE_TABLE_MODE_INIT_OVERLAY_SIZE,
+        "np560.data-application-npe-table-mode-init-overlay-alias",
+        "np560.code-application-npe-table-mode-init-overlay-alias",
+        0,
+    },
+    {
+        /* The operation-7 wrapper replaces the flat function's local branch
+         * at 2F:E15A with the exact closed 4C:E15A table-refresh body.  Keep
+         * the window coherent and seed it from flat PRG so callers before
+         * that lifecycle boundary continue to observe the original image. */
+        NP560_APPLICATION_OPERATION_TABLE_REFRESH_OVERLAY_BASE,
+        NP560_APPLICATION_OPERATION_TABLE_REFRESH_OVERLAY_SIZE,
+        "np560.data-application-operation-table-refresh-overlay-alias",
+        "np560.code-application-operation-table-refresh-overlay-alias",
+        0,
+    },
+    {
+        /* The same guest wrapper copies the exact closed 4C:6AB8 frame
+         * initializer over the unrelated flat 2F:6AB8 continuation.  The
+         * destination is writable executable program RAM: seed it with the
+         * flat PRG bytes so the pre-operation-7 lifecycle is unchanged, then
+         * keep data-bus writes coherent with instruction fetches. */
+        NP560_APPLICATION_OPERATION_NEW_JOURNEY_FRAME_INIT_OVERLAY_BASE,
+        NP560_APPLICATION_OPERATION_NEW_JOURNEY_FRAME_INIT_OVERLAY_SIZE,
+        "np560.data-application-operation-new-journey-frame-init-overlay-alias",
+        "np560.code-application-operation-new-journey-frame-init-overlay-alias",
+        0,
+    },
+    {
+        /* The first 2F:6AB8 child is the exact closed 46:5C22 function.
+         * Keep its linked 29:5C22 destination as coherent writable program
+         * RAM, seeded from flat PRG until the operation-7 guest publisher
+         * replaces the unrelated near-returning continuation. */
+        NP560_APPLICATION_OPERATION_FRAME_CLEAR_OVERLAY_BASE,
+        NP560_APPLICATION_OPERATION_FRAME_CLEAR_OVERLAY_SIZE,
+        "np560.data-application-operation-frame-clear-overlay-alias",
+        "np560.code-application-operation-frame-clear-overlay-alias",
+        0,
+    },
+    {
+        /* Linked 29:5C22's sixth child is exact closed source 4D:7B8C.
+         * Preserve the collided flat 30:7B8C view until operation 7, then
+         * make the guest publisher's bounded writes visible to code fetch. */
+        NP560_APPLICATION_OPERATION_FRAME_CLEAR_DRAW_HELPER_OVERLAY_BASE,
+        NP560_APPLICATION_OPERATION_FRAME_CLEAR_DRAW_HELPER_OVERLAY_SIZE,
+        "np560.data-application-operation-frame-clear-draw-helper-overlay-alias",
+        "np560.code-application-operation-frame-clear-draw-helper-overlay-alias",
+        0,
+    },
+    {
+        /* Exact 4A:C276 object-update body is copied here by the same
+         * operation-7 guest wrapper.  Seed the coherent window with flat PRG
+         * bytes because the earlier application still executes that view. */
+        NP560_APPLICATION_NPE_OBJECT_UPDATE_OVERLAY_BASE,
+        NP560_APPLICATION_NPE_OBJECT_UPDATE_OVERLAY_SIZE,
+        "np560.data-application-npe-object-update-overlay-alias",
+        "np560.code-application-npe-object-update-overlay-alias",
+        0,
+    },
+    {
+        /* Exact 50:03B2 transform wrapper is published only for operation 7.
+         * The coherent window initially exposes the live flat continuation. */
+        NP560_APPLICATION_NPE_TRANSFORM_HELPER_OVERLAY_BASE,
+        NP560_APPLICATION_NPE_TRANSFORM_HELPER_OVERLAY_SIZE,
+        "np560.data-application-npe-transform-helper-overlay-alias",
+        "np560.code-application-npe-transform-helper-overlay-alias",
+        0,
+    },
+    {
+        /* The operation-7 publisher installs the exact 3F:4C58 grid helper
+         * here and then repairs its four collided dispatcher calls. */
+        NP560_APPLICATION_OPERATION_GRID_REPOSITION_OVERLAY_BASE,
+        NP560_APPLICATION_OPERATION_GRID_REPOSITION_OVERLAY_SIZE,
+        "np560.data-application-operation-grid-reposition-overlay-alias",
+        "np560.code-application-operation-grid-reposition-overlay-alias",
+        0,
+    },
+    {
+        NP560_APPLICATION_OPERATION_SCROLL_RENDERER_OVERLAY_BASE,
+        NP560_APPLICATION_OPERATION_SCROLL_RENDERER_OVERLAY_SIZE,
+        "np560.data-application-operation-scroll-renderer-overlay-alias",
+        "np560.code-application-operation-scroll-renderer-overlay-alias",
+        0,
+    },
+    {
+        NP560_APPLICATION_OPERATION_NEW_JOURNEY_INIT_OVERLAY_BASE,
+        NP560_APPLICATION_OPERATION_NEW_JOURNEY_INIT_OVERLAY_SIZE,
+        "np560.data-application-operation-new-journey-init-overlay-alias",
+        "np560.code-application-operation-new-journey-init-overlay-alias",
+        0,
+    },
+    {
+        NP560_APPLICATION_OPERATION_NEW_JOURNEY_RANGE_OVERLAY_BASE,
+        NP560_APPLICATION_OPERATION_NEW_JOURNEY_RANGE_OVERLAY_SIZE,
+        "np560.data-application-operation-new-journey-range-overlay-alias",
+        "np560.code-application-operation-new-journey-range-overlay-alias",
+        0,
+    },
+    {
+        NP560_APPLICATION_OPERATION_NEW_JOURNEY_RANDOMIZE_OVERLAY_BASE,
+        NP560_APPLICATION_OPERATION_NEW_JOURNEY_RANDOMIZE_OVERLAY_SIZE,
+        "np560.data-application-operation-new-journey-randomize-overlay-alias",
+        "np560.code-application-operation-new-journey-randomize-overlay-alias",
+        0,
+    },
+    {
+        NP560_APPLICATION_OPERATION_NEW_JOURNEY_COMPARE_OVERLAY_BASE,
+        NP560_APPLICATION_OPERATION_NEW_JOURNEY_COMPARE_OVERLAY_SIZE,
+        "np560.data-application-operation-new-journey-compare-overlay-alias",
+        "np560.code-application-operation-new-journey-compare-overlay-alias",
+        0,
+    },
+    {
+        NP560_APPLICATION_OPERATION_NEW_JOURNEY_DRAW_OVERLAY_BASE,
+        NP560_APPLICATION_OPERATION_NEW_JOURNEY_DRAW_OVERLAY_SIZE,
+        "np560.data-application-operation-new-journey-draw-overlay-alias",
+        "np560.code-application-operation-new-journey-draw-overlay-alias",
+        0,
+    },
+    {
+        NP560_APPLICATION_OPERATION_NEW_JOURNEY_DRAW_ITEM_OVERLAY_BASE,
+        NP560_APPLICATION_OPERATION_NEW_JOURNEY_DRAW_ITEM_OVERLAY_SIZE,
+        "np560.data-application-operation-new-journey-draw-item-overlay-alias",
+        "np560.code-application-operation-new-journey-draw-item-overlay-alias",
+        0,
+    },
+    {
+        /* Source 4E:A3F4 is copied here by the new-journey publisher before
+         * operation 1 first calls logical 31:A3F4.  Flat 31:A3F4 is only a
+         * large-function continuation, so this bounded window must model the
+         * writable coherent code RAM observed at the lifecycle boundary. */
+        NP560_APPLICATION_OPERATION_TRANSITION_CALLBACK_OVERLAY_BASE,
+        NP560_APPLICATION_OPERATION_TRANSITION_CALLBACK_OVERLAY_SIZE,
+        "np560.data-application-operation-transition-callback-overlay-alias",
+        "np560.code-application-operation-transition-callback-overlay-alias",
+        0,
+    },
+    {
+        /* Resident jump-table slot 03:438C enters linked 32:5F86.  The same
+         * operation-7 publisher installs exact closed source 4F:5F86 here;
+         * keep its bounded data writes coherent with instruction fetch. */
+        NP560_APPLICATION_OPERATION_TRANSITION_SERVICE_OVERLAY_BASE,
+        NP560_APPLICATION_OPERATION_TRANSITION_SERVICE_OVERLAY_SIZE,
+        "np560.data-application-operation-transition-service-overlay-alias",
+        "np560.code-application-operation-transition-service-overlay-alias",
+        0,
+    },
+    {
+        /* Exact 42:0000 operation leaf reached by linked 32:B974.  The flat
+         * 25:0000 window is data until the operation-7 guest publication. */
+        NP560_APPLICATION_OPERATION_TRANSITION_SERVICE_LEAF_OVERLAY_BASE,
+        NP560_APPLICATION_OPERATION_TRANSITION_SERVICE_LEAF_OVERLAY_SIZE,
+        "np560.data-application-operation-transition-service-leaf-overlay-alias",
+        "np560.code-application-operation-transition-service-leaf-overlay-alias",
+        0,
+    },
+    {
+        /* This body has no installed call-word repairs, so preserve its exact
+         * immutable 48:0248 instruction view while the lifecycle publisher
+         * still performs the device's ordinary data-bus copy to 5F:0248. */
+        NP560_APPLICATION_NPE_STATE_RANGE_OVERLAY_BASE,
+        NP560_APPLICATION_NPE_STATE_RANGE_OVERLAY_SIZE,
+        "np560.data-application-npe-state-range-overlay-alias",
+        "np560.code-application-npe-state-range-overlay-alias",
+        NP560_APPLICATION_NPE_STATE_RANGE_OVERLAY_SOURCE,
+    },
     {
         /* Exact source-50 data: ten spaces followed by sixteen ASCII zeroes.
          * Numeric formatting reads this through the Harvard data bus while
@@ -2155,6 +3063,32 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         NP560_DESKTOP_CLOCK_FORMAT_OVERLAY_SIZE,
         "np560.data-desktop-clock-format-overlay-alias",
         NULL,
+        0,
+    },
+    {
+        /* The state-4E dispatcher calls this small wrapper after entering
+         * Dictionary.  The resident loader installs the exact source-50
+         * bytes here, so this 0x1c-byte window is writable executable RAM:
+         * guest data stores and subsequent instruction fetches must observe
+         * the same backing.  The immediately preceding 33:4492 wrapper is a
+         * separate, equally bounded window. */
+        NP560_APPLICATION_FOREGROUND_STATE4E_WRAPPER_OVERLAY_BASE,
+        NP560_APPLICATION_FOREGROUND_STATE4E_WRAPPER_OVERLAY_SIZE,
+        "np560.data-application-foreground-state4e-wrapper-overlay-alias",
+        "np560.code-application-foreground-state4e-wrapper-overlay-alias",
+        0,
+    },
+    {
+        /* The wrapper above calls this source-2A body after the resident
+         * loader copies it to 0D:2F30.  Segment 0D is covered by the broad
+         * reconstructed SoC-ROM mapping, but this exact non-overlapping
+         * subrange is loader-owned writable executable RAM on the device.
+         * Give data stores and code fetches one coherent backing so strict
+         * ROM-missing diagnostics can advance to the body's real children. */
+        NP560_APPLICATION_FOREGROUND_STATE4E_ROM_OVERLAY_BASE,
+        NP560_APPLICATION_FOREGROUND_STATE4E_ROM_OVERLAY_SIZE,
+        "np560.data-application-foreground-state4e-rom-overlay-alias",
+        "np560.code-application-foreground-state4e-rom-overlay-alias",
         0,
     },
     {
@@ -2197,31 +3131,31 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
     },
     {
         NP560_MENU_HW_BIT2_SET_OVERLAY_BASE,
-        NP560_MENU_HW_BIT2_SET_OVERLAY_SIZE,
+        NP560_MENU_HW_BITS_SET_OVERLAY_SIZE,
         "np560.data-menu-hw-bit2-set-overlay-alias",
         "np560.code-menu-hw-bit2-set-overlay-alias",
         NP560_MENU_HW_BIT2_SET_OVERLAY_SOURCE,
     },
     {
-        NP560_MENU_HW_BIT1_SET_OVERLAY_BASE,
-        NP560_MENU_HW_BIT1_SET_OVERLAY_SIZE,
-        "np560.data-menu-hw-bit1-set-overlay-alias",
-        "np560.code-menu-hw-bit1-set-overlay-alias",
-        NP560_MENU_HW_BIT1_SET_OVERLAY_SOURCE,
+        /* State-4E needs the complete source-50 four-instruction predicate,
+         * but linked 33:6BE2 is also a live fall-through in the flat
+         * segment-33 renderer used by Settings.  Keep the leaf in the same
+         * unused segment-5F relocation bank as the adjacent bit helpers;
+         * the reconstructed guest installer retargets only state-4E's two
+         * direct calls.  This preserves every flat renderer instruction and
+         * leaves the numeric segment-33 NAND sector buffer writable. */
+        NP560_APPLICATION_FOREGROUND_READY_RELOCATED_OVERLAY_BASE,
+        NP560_APPLICATION_FOREGROUND_READY_RELOCATED_OVERLAY_SIZE,
+        "np560.data-application-foreground-ready-relocated-overlay-alias",
+        "np560.code-application-foreground-ready-relocated-overlay-alias",
+        NP560_APPLICATION_FOREGROUND_READY_RELOCATED_OVERLAY_SOURCE,
     },
     {
         NP560_MENU_HW_BIT2_CLEAR_OVERLAY_BASE,
-        NP560_MENU_HW_BIT2_CLEAR_OVERLAY_SIZE,
+        NP560_MENU_HW_BITS_CLEAR_OVERLAY_SIZE,
         "np560.data-menu-hw-bit2-clear-overlay-alias",
         "np560.code-menu-hw-bit2-clear-overlay-alias",
         NP560_MENU_HW_BIT2_CLEAR_OVERLAY_SOURCE,
-    },
-    {
-        NP560_MENU_HW_BIT1_CLEAR_OVERLAY_BASE,
-        NP560_MENU_HW_BIT1_CLEAR_OVERLAY_SIZE,
-        "np560.data-menu-hw-bit1-clear-overlay-alias",
-        "np560.code-menu-hw-bit1-clear-overlay-alias",
-        NP560_MENU_HW_BIT1_CLEAR_OVERLAY_SOURCE,
     },
     {
         NP560_MENU_STATE_CLEAR_OVERLAY_BASE,
@@ -2230,16 +3164,12 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         "np560.code-menu-state-clear-overlay-alias",
     },
     {
-        NP560_MENU_HANDLE_RELEASE_OVERLAY_BASE,
-        NP560_MENU_HANDLE_RELEASE_OVERLAY_SIZE,
-        "np560.data-menu-handle-release-overlay-alias",
-        "np560.code-menu-handle-release-overlay-alias",
-    },
-    {
-        NP560_MENU_CONTEXT_RELEASE_OVERLAY_BASE,
-        NP560_MENU_CONTEXT_RELEASE_OVERLAY_SIZE,
-        "np560.data-menu-context-release-overlay-alias",
-        "np560.code-menu-context-release-overlay-alias",
+        NP560_UI_PROPERTY_SET_OVERLAY_BASE,
+        /* UI property-set and key-item-set are adjacent 0x16-byte coherent
+         * leaves at 33:4D14..4D3F. */
+        NP560_UI_PROPERTY_KEY_ITEM_SET_ALIAS_SIZE,
+        "np560.data-ui-property-key-item-set-overlay-alias",
+        "np560.code-ui-property-key-item-set-overlay-alias",
     },
     {
         NP560_MENU_GLOBAL_RESET_OVERLAY_BASE,
@@ -2252,12 +3182,6 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         NP560_MENU_EVENT_STATE_OVERLAY_SIZE,
         "np560.data-menu-event-state-overlay-alias",
         "np560.code-menu-event-state-overlay-alias",
-    },
-    {
-        NP560_MENU_UI_PREPARE_CORE_OVERLAY_BASE,
-        NP560_MENU_UI_PREPARE_CORE_OVERLAY_SIZE,
-        "np560.data-menu-ui-prepare-core-overlay-alias",
-        "np560.code-menu-ui-prepare-core-overlay-alias",
     },
     {
         NP560_MENU_BUFFER_SETUP_OVERLAY_BASE,
@@ -2333,9 +3257,11 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
     },
     {
         NP560_RESOURCE_STORAGE_WRITE_OVERLAY_BASE,
-        NP560_RESOURCE_STORAGE_WRITE_OVERLAY_SIZE,
-        "np560.data-resource-storage-write-overlay-alias",
-        "np560.code-resource-storage-write-overlay-alias",
+        /* Exact source-45 bodies 4CEA..4FEF and 4FF0..52F5 are adjacent;
+         * publish their union without changing either guest function. */
+        NP560_RESOURCE_STORAGE_WRITE_MENU_ALIAS_SIZE,
+        "np560.data-resource-storage-write-menu-overlay-alias",
+        "np560.code-resource-storage-write-menu-overlay-alias",
         NP560_RESOURCE_STORAGE_WRITE_OVERLAY_SOURCE,
     },
     {
@@ -2344,13 +3270,6 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         "np560.data-resource-storage-block-write-overlay-alias",
         "np560.code-resource-storage-block-write-overlay-alias",
         NP560_RESOURCE_STORAGE_BLOCK_WRITE_OVERLAY_SOURCE,
-    },
-    {
-        NP560_RESOURCE_STORAGE_PAGE_OVERLAY_BASE,
-        NP560_RESOURCE_STORAGE_PAGE_OVERLAY_SIZE,
-        "np560.data-resource-storage-page-overlay-alias",
-        "np560.code-resource-storage-page-overlay-alias",
-        NP560_RESOURCE_STORAGE_PAGE_OVERLAY_SOURCE,
     },
     {
         NP560_RESOURCE_STORAGE_INDEX_OVERLAY_BASE,
@@ -2421,34 +3340,215 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         NP560_RESOURCE_STORAGE_STATUS_OVERLAY_SOURCE,
     },
     {
+        NP560_RESOURCE_PERSIST_WRAPPER_OVERLAY_BASE,
+        NP560_RESOURCE_PERSIST_WRAPPER_OVERLAY_SIZE,
+        "np560.data-resource-persist-wrapper-overlay-alias",
+        NULL,
+        0,
+    },
+    {
+        NP560_RESOURCE_PERSIST_BRIDGE_OVERLAY_BASE,
+        NP560_RESOURCE_PERSIST_BRIDGE_OVERLAY_SIZE,
+        "np560.data-resource-persist-bridge-overlay-alias",
+        NULL,
+        0,
+    },
+    {
+        NP560_RESOURCE_PERSIST_PAGE_WRITE_OVERLAY_BASE,
+        NP560_RESOURCE_PERSIST_PAGE_WRITE_OVERLAY_SIZE,
+        "np560.data-resource-persist-page-write-overlay-alias",
+        NULL,
+        0,
+    },
+    {
+        NP560_GAME_WORLD_HELPER_2D0B00_OVERLAY_BASE,
+        NP560_GAME_WORLD_HELPER_2D0B00_OVERLAY_SIZE,
+        "np560.data-game-world-helper-2d0b00-overlay-alias",
+        "np560.code-game-world-helper-2d0b00-overlay-alias",
+        NP560_GAME_WORLD_HELPER_2D0B00_OVERLAY_SOURCE,
+    },
+    {
+        NP560_GAME_WORLD_HELPER_2A8F26_OVERLAY_BASE,
+        NP560_GAME_WORLD_HELPER_2A8F26_OVERLAY_SIZE,
+        "np560.data-game-world-helper-2a8f26-overlay-alias",
+        "np560.code-game-world-helper-2a8f26-overlay-alias",
+        NP560_GAME_WORLD_HELPER_2A8F26_OVERLAY_SOURCE,
+    },
+    {
+        NP560_GAME_WORLD_HELPER_331E22_OVERLAY_BASE,
+        NP560_GAME_WORLD_HELPER_331E22_OVERLAY_SIZE,
+        "np560.data-game-world-helper-331e22-overlay-alias",
+        "np560.code-game-world-helper-331e22-overlay-alias",
+        NP560_GAME_WORLD_HELPER_331E22_OVERLAY_SOURCE,
+    },
+    {
+        NP560_GAME_WORLD_HELPER_3009F2_OVERLAY_BASE,
+        NP560_GAME_WORLD_HELPER_3009F2_OVERLAY_SIZE,
+        "np560.data-game-world-helper-3009f2-overlay-alias",
+        "np560.code-game-world-helper-3009f2-overlay-alias",
+        NP560_GAME_WORLD_HELPER_3009F2_OVERLAY_SOURCE,
+    },
+    {
+        NP560_GAME_WORLD_HELPER_30BC4C_OVERLAY_BASE,
+        NP560_GAME_WORLD_HELPER_30BC4C_OVERLAY_SIZE,
+        "np560.data-game-world-helper-30bc4c-overlay-alias",
+        "np560.code-game-world-helper-30bc4c-overlay-alias",
+        NP560_GAME_WORLD_HELPER_30BC4C_OVERLAY_SOURCE,
+    },
+    {
+        NP560_GAME_WORLD_HELPER_2C682E_OVERLAY_BASE,
+        NP560_GAME_WORLD_HELPER_2C682E_OVERLAY_SIZE,
+        "np560.data-game-world-helper-2c682e-overlay-alias",
+        "np560.code-game-world-helper-2c682e-overlay-alias",
+        NP560_GAME_WORLD_HELPER_2C682E_OVERLAY_SOURCE,
+    },
+    {
+        NP560_GAME_WORLD_HELPER_20CE3A_OVERLAY_BASE,
+        NP560_GAME_WORLD_HELPER_20CE3A_OVERLAY_SIZE,
+        "np560.data-game-world-helper-20ce3a-overlay-alias",
+        "np560.code-game-world-helper-20ce3a-overlay-alias",
+        NP560_GAME_WORLD_HELPER_20CE3A_OVERLAY_SOURCE,
+    },
+    {
+        NP560_GAME_WORLD_HELPER_30E81A_OVERLAY_BASE,
+        NP560_GAME_WORLD_HELPER_30E81A_OVERLAY_SIZE,
+        "np560.data-game-world-helper-30e81a-overlay-alias",
+        "np560.code-game-world-helper-30e81a-overlay-alias",
+        NP560_GAME_WORLD_HELPER_30E81A_OVERLAY_SOURCE,
+    },
+    {
+        NP560_GAME_WORLD_HELPER_2D6070_OVERLAY_BASE,
+        NP560_GAME_WORLD_HELPER_2D6070_OVERLAY_SIZE,
+        "np560.data-game-world-helper-2d6070-overlay-alias",
+        "np560.code-game-world-helper-2d6070-overlay-alias",
+        NP560_GAME_WORLD_HELPER_2D6070_OVERLAY_SOURCE,
+    },
+    {
+        NP560_GAME_WORLD_HELPER_2E6822_OVERLAY_BASE,
+        NP560_GAME_WORLD_HELPER_2E6822_OVERLAY_SIZE,
+        "np560.data-game-world-helper-2e6822-overlay-alias",
+        "np560.code-game-world-helper-2e6822-overlay-alias",
+        NP560_GAME_WORLD_HELPER_2E6822_OVERLAY_SOURCE,
+    },
+    {
+        NP560_GAME_WORLD_HELPER_32DCAC_OVERLAY_BASE,
+        NP560_GAME_WORLD_HELPER_32DCAC_OVERLAY_SIZE,
+        "np560.data-game-world-helper-32dcac-overlay-alias",
+        "np560.code-game-world-helper-32dcac-overlay-alias",
+        NP560_GAME_WORLD_HELPER_32DCAC_OVERLAY_SOURCE,
+    },
+    {
+        NP560_GAME_WORLD_DEP_2D622E_OVERLAY_BASE,
+        NP560_GAME_WORLD_DEP_2D622E_OVERLAY_SIZE,
+        "np560.data-game-world-dep-2d622e-overlay-alias",
+        "np560.code-game-world-dep-2d622e-overlay-alias",
+    },
+    {
+        NP560_GAME_WORLD_DEP_30A0FC_OVERLAY_BASE,
+        NP560_GAME_WORLD_DEP_30A0FC_OVERLAY_SIZE,
+        "np560.data-game-world-dep-30a0fc-overlay-alias",
+        "np560.code-game-world-dep-30a0fc-overlay-alias",
+    },
+    {
+        NP560_GAME_WORLD_DEP_287408_OVERLAY_BASE,
+        NP560_GAME_WORLD_DEP_287408_OVERLAY_SIZE,
+        "np560.data-game-world-dep-287408-overlay-alias",
+        "np560.code-game-world-dep-287408-overlay-alias",
+    },
+    {
+        NP560_GAME_WORLD_DEP_30EE12_OVERLAY_BASE,
+        NP560_GAME_WORLD_DEP_30EE12_OVERLAY_SIZE,
+        "np560.data-game-world-dep-30ee12-overlay-alias",
+        "np560.code-game-world-dep-30ee12-overlay-alias",
+    },
+    {
+        NP560_GAME_WORLD_DEP_3150D0_OVERLAY_BASE,
+        NP560_GAME_WORLD_DEP_3150D0_OVERLAY_SIZE,
+        "np560.data-game-world-dep-3150d0-overlay-alias",
+        "np560.code-game-world-dep-3150d0-overlay-alias",
+    },
+    {
+        NP560_GAME_WORLD_DEP_323E52_OVERLAY_BASE,
+        NP560_GAME_WORLD_DEP_323E52_OVERLAY_SIZE,
+        "np560.data-game-world-dep-323e52-overlay-alias",
+        "np560.code-game-world-dep-323e52-overlay-alias",
+    },
+    {
+        NP560_GAME_WORLD_DEP_282844_OVERLAY_BASE,
+        NP560_GAME_WORLD_DEP_282844_OVERLAY_SIZE,
+        "np560.data-game-world-dep-282844-overlay-alias",
+        "np560.code-game-world-dep-282844-overlay-alias",
+    },
+    {
+        NP560_GAME_WORLD_DEP_32E06C_OVERLAY_BASE,
+        NP560_GAME_WORLD_DEP_32E06C_OVERLAY_SIZE,
+        "np560.data-game-world-dep-32e06c-overlay-alias",
+        "np560.code-game-world-dep-32e06c-overlay-alias",
+    },
+    {
+        /* The controller source first occupies data bank 2B while this
+         * helper's exact linked body remains at source 48:DB86.  Keep its
+         * code fetch on that immutable source and its data view writable. */
+        NP560_GAME_WORLD_DEP_2BDB86_OVERLAY_BASE,
+        NP560_GAME_WORLD_DEP_2BDB86_OVERLAY_SIZE,
+        "np560.data-game-world-dep-2bdb86-overlay-alias",
+        "np560.code-game-world-dep-2bdb86-overlay-alias",
+        NP560_GAME_WORLD_DEP_2BDB86_OVERLAY_SOURCE,
+    },
+    {
+        /* Browser event 0x86 calls logical 33:384E with one far pointer.
+         * Its flat bytes are an unrelated unframed suffix, while 50:384E is
+         * the complete field accessor through a balanced RETS.  The guest
+         * installer supplies the writable data view; pin instruction fetch
+         * to the exact source because segment 50 is mutable at runtime. */
+        NP560_FILE_BROWSER_CONFIRM_FIELD_OVERLAY_BASE,
+        NP560_FILE_BROWSER_CONFIRM_FIELD_OVERLAY_SIZE,
+        "np560.data-file-browser-confirm-field-overlay-alias",
+        "np560.code-file-browser-confirm-field-overlay-alias",
+        NP560_FILE_BROWSER_CONFIRM_FIELD_OVERLAY_SOURCE,
+    },
+    {
+        /* The browser's two seven-word range branches call 25:F992.  The
+         * flat bytes are resource data, while 42:F992..FD4A is the complete
+         * framed worker.  Keep the data destination writable for the guest
+         * installer and fetch instructions from the exact immutable source. */
+        NP560_FILE_BROWSER_PATH_RANGE_OVERLAY_BASE,
+        NP560_FILE_BROWSER_PATH_RANGE_OVERLAY_SIZE,
+        "np560.data-file-browser-path-range-overlay-alias",
+        "np560.code-file-browser-path-range-overlay-alias",
+        NP560_FILE_BROWSER_PATH_RANGE_OVERLAY_SOURCE,
+    },
+    {
+        /* The resident item renderer obtains this callback from object field
+         * +1e/+20.  Its exact guest-installed body contains an inline
+         * computed-RET table at 22:175A, so instruction fetches and Harvard
+         * data reads must share the same writable destination backing. */
+        NP560_APPLICATION_MAIN_ITEM_CALLBACK_OVERLAY_BASE,
+        NP560_APPLICATION_MAIN_ITEM_CALLBACK_OVERLAY_SIZE,
+        "np560.data-application-main-item-callback-overlay-alias",
+        "np560.code-application-main-item-callback-overlay-alias",
+    },
+    {
+        /* Both conditional range branches in 22:147A call this exact
+         * guest-installed two-far-pointer predicate. */
+        NP560_APPLICATION_MAIN_ITEM_CALLBACK_RANGE_OVERLAY_BASE,
+        NP560_APPLICATION_MAIN_ITEM_CALLBACK_RANGE_OVERLAY_SIZE,
+        "np560.data-application-main-item-callback-range-overlay-alias",
+        "np560.code-application-main-item-callback-range-overlay-alias",
+    },
+    {
+        /* The common item-callback epilogue unconditionally calls this exact
+         * five-word finalizer.  Keep guest writes and code fetch coherent. */
+        NP560_APPLICATION_MAIN_ITEM_CALLBACK_FINALIZE_OVERLAY_BASE,
+        NP560_APPLICATION_MAIN_ITEM_CALLBACK_FINALIZE_OVERLAY_SIZE,
+        "np560.data-application-main-item-callback-finalize-overlay-alias",
+        "np560.code-application-main-item-callback-finalize-overlay-alias",
+    },
+    {
         NP560_APPLICATION_KEY_DISPATCH_OVERLAY_BASE,
         NP560_APPLICATION_KEY_DISPATCH_OVERLAY_SIZE,
         "np560.data-application-key-dispatch-overlay-alias",
         "np560.code-application-key-dispatch-overlay-alias",
-    },
-    {
-        NP560_APPLICATION_KEY_HW_CLEAR_OVERLAY_BASE,
-        NP560_APPLICATION_KEY_HW_CLEAR_OVERLAY_SIZE,
-        "np560.data-application-key-hw-clear-overlay-alias",
-        "np560.code-application-key-hw-clear-overlay-alias",
-    },
-    {
-        NP560_APPLICATION_KEY_HW_PATH_A_OVERLAY_BASE,
-        NP560_APPLICATION_KEY_HW_PATH_A_OVERLAY_SIZE,
-        "np560.data-application-key-hw-path-a-overlay-alias",
-        "np560.code-application-key-hw-path-a-overlay-alias",
-    },
-    {
-        NP560_APPLICATION_KEY_HW_PATH_B_OVERLAY_BASE,
-        NP560_APPLICATION_KEY_HW_PATH_B_OVERLAY_SIZE,
-        "np560.data-application-key-hw-path-b-overlay-alias",
-        "np560.code-application-key-hw-path-b-overlay-alias",
-    },
-    {
-        NP560_APPLICATION_KEY_COMPLETION_OVERLAY_BASE,
-        NP560_APPLICATION_KEY_COMPLETION_OVERLAY_SIZE,
-        "np560.data-application-key-completion-overlay-alias",
-        "np560.code-application-key-completion-overlay-alias",
     },
     {
         NP560_APPLICATION_KEY_COMPLETION_WORKER_OVERLAY_BASE,
@@ -2462,13 +3562,6 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         "np560.data-application-bit-or-overlay-alias",
         "np560.code-application-bit-or-overlay-alias",
         NP560_APPLICATION_BIT_OR_OVERLAY_SOURCE,
-    },
-    {
-        NP560_APPLICATION_BIT_AND_OVERLAY_BASE,
-        NP560_APPLICATION_BIT_AND_OVERLAY_SIZE,
-        "np560.data-application-bit-and-overlay-alias",
-        "np560.code-application-bit-and-overlay-alias",
-        NP560_APPLICATION_BIT_AND_OVERLAY_SOURCE,
     },
     {
         NP560_APPLICATION_KEY_INPUT_STATE_OVERLAY_BASE,
@@ -2501,13 +3594,6 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         "np560.code-application-key-special-crc-table-alias",
     },
     {
-        NP560_APPLICATION_KEY_SPECIAL_RESET_OVERLAY_BASE,
-        NP560_APPLICATION_KEY_SPECIAL_RESET_OVERLAY_SIZE,
-        "np560.data-application-key-special-reset-overlay-alias",
-        "np560.code-application-key-special-reset-overlay-alias",
-        NP560_APPLICATION_KEY_SPECIAL_RESET_OVERLAY_SOURCE,
-    },
-    {
         NP560_APPLICATION_KEY_ITEM_REFRESH_OVERLAY_BASE,
         NP560_APPLICATION_KEY_ITEM_REFRESH_OVERLAY_SIZE,
         "np560.data-application-key-item-refresh-overlay-alias",
@@ -2518,12 +3604,6 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         NP560_APPLICATION_KEY_ITEM_CLEAR_OVERLAY_SIZE,
         "np560.data-application-key-item-clear-overlay-alias",
         "np560.code-application-key-item-clear-overlay-alias",
-    },
-    {
-        NP560_APPLICATION_KEY_ITEM_SET_OVERLAY_BASE,
-        NP560_APPLICATION_KEY_ITEM_SET_OVERLAY_SIZE,
-        "np560.data-application-key-item-set-overlay-alias",
-        "np560.code-application-key-item-set-overlay-alias",
     },
     {
         NP560_APPLICATION_KEY_MODE_OVERLAY_BASE,
@@ -2644,9 +3724,11 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
     },
     {
         NP560_MENU_UNALIGNED_U16_OVERLAY_BASE,
-        NP560_MENU_UNALIGNED_U16_OVERLAY_SIZE,
-        "np560.data-menu-unaligned-u16-overlay-alias",
-        "np560.code-menu-unaligned-u16-overlay-alias",
+        /* Menu u16 helper and storage-state reset occupy adjacent 0x56-byte
+         * target ranges and share the same guest-published RAM backing. */
+        NP560_MENU_UNALIGNED_STORAGE_RESET_ALIAS_SIZE,
+        "np560.data-menu-unaligned-storage-reset-overlay-alias",
+        "np560.code-menu-unaligned-storage-reset-overlay-alias",
     },
     {
         /* Linked 2F:8E8E is a runtime overlay destination.  Its flat bytes
@@ -2695,15 +3777,6 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         "np560.code-menu-render-overlay-alias",
     },
     {
-        /* Linked callers enter flat 23:DA24 midway through an unrelated
-         * routine, causing 2E:4572 to consume a return PC as its copy length.
-         * Restore the complete source-40 LINK #3 resource formatter. */
-        NP560_MENU_RESOURCE_FORMAT_OVERLAY_BASE,
-        NP560_MENU_RESOURCE_FORMAT_OVERLAY_SIZE,
-        "np560.data-menu-resource-format-overlay-alias",
-        "np560.code-menu-resource-format-overlay-alias",
-    },
-    {
         /* Generic-menu callers enter flat 31:7D02 inside an unrelated body,
          * whose unmatched epilogue corrupts the far return into F6:0001.
          * Restore the complete source-4E LINK #4 resource binder. */
@@ -2722,15 +3795,6 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         "np560.code-menu-resource-bind-wrapper-overlay-alias",
     },
     {
-        /* 30:0054 calls linked 31:4974 after resource binding.  Its flat
-         * image lacks the LINK/register-save prefix, so restore the complete
-         * source-4E result-record attachment function. */
-        NP560_MENU_RESULT_ATTACH_OVERLAY_BASE,
-        NP560_MENU_RESULT_ATTACH_OVERLAY_SIZE,
-        "np560.data-menu-result-attach-overlay-alias",
-        "np560.code-menu-result-attach-overlay-alias",
-    },
-    {
         /* 2A:AE0A is linked as the result-list builder, but its flat bytes
          * are inside a different large frame.  Restore the complete
          * source-47 LINK #0x12 function and balanced epilogue. */
@@ -2738,6 +3802,15 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         NP560_MENU_RESULT_LIST_OVERLAY_SIZE,
         "np560.data-menu-result-list-overlay-alias",
         "np560.code-menu-result-list-overlay-alias",
+    },
+    {
+        /* A direct caller next enters flat 2A:B066 inside an unrelated
+         * 0x100-byte frame.  Restore source 47:B066's complete LINK #4
+         * range adjuster so its UNLINK/RETS consumes its own frame. */
+        NP560_MENU_RESULT_RANGE_OVERLAY_BASE,
+        NP560_MENU_RESULT_RANGE_OVERLAY_SIZE,
+        "np560.data-menu-result-range-overlay-alias",
+        "np560.code-menu-result-range-overlay-alias",
     },
     {
         /* 31:C5EE calls linked 25:B202, whose flat image is payload data.
@@ -2777,12 +3850,6 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         "np560.code-menu-page-objects-overlay-alias",
     },
     {
-        NP560_MENU_PAGE_OBJECTS_CONDITIONAL_OVERLAY_BASE,
-        NP560_MENU_PAGE_OBJECTS_CONDITIONAL_OVERLAY_SIZE,
-        "np560.data-menu-page-objects-conditional-overlay-alias",
-        "np560.code-menu-page-objects-conditional-overlay-alias",
-    },
-    {
         /* 44:0040 calls linked 26:FBBA, whose flat bytes are resource data.
          * The late application installer restores the complete source-43
          * resource-index function before the first foreground caller. */
@@ -2799,16 +3866,6 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         NP560_MENU_RESOURCE_DECODER_OVERLAY_SIZE,
         "np560.data-menu-resource-decoder-overlay-alias",
         "np560.code-menu-resource-decoder-overlay-alias",
-    },
-    {
-        /* 3B:F74A calls linked 2F:FA32 as a standalone hardware-state
-         * sampler.  The resident menu installer restores its complete
-         * same-PC source-4C body before event polling begins. */
-        NP560_MENU_POWER_STATE_OVERLAY_BASE,
-        NP560_MENU_POWER_STATE_OVERLAY_SIZE,
-        "np560.data-menu-power-state-overlay-alias",
-        "np560.code-menu-power-state-overlay-alias",
-        NP560_MENU_POWER_STATE_OVERLAY_SOURCE,
     },
     {
         NP560_GENERIC_MENU_OVERLAY_BASE,
@@ -2909,13 +3966,6 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         NP560_COMMAND_TABLE_TEMPLATE_OVERLAY_SOURCE,
     },
     {
-        NP560_LCD_RESOURCE_DISPATCH_THUNK_BASE,
-        NP560_LCD_RESOURCE_DISPATCH_THUNK_SIZE,
-        "np560.data-lcd-resource-dispatch-thunk-alias",
-        "np560.code-lcd-resource-dispatch-thunk-alias",
-        NP560_LCD_RESOURCE_DISPATCH_THUNK_SOURCE,
-    },
-    {
         NP560_LCD_RESOURCE_TRANSFER_OVERLAY_BASE,
         NP560_LCD_RESOURCE_TRANSFER_OVERLAY_SIZE,
         "np560.data-lcd-resource-transfer-overlay-alias",
@@ -2923,11 +3973,14 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         NP560_LCD_RESOURCE_TRANSFER_OVERLAY_SOURCE,
     },
     {
+        /* Linked 2D:261C lies inside the live 2D:2400 function.  The guest
+         * installer publishes the exact source-4A reader in collision-free
+         * bank 5F and retargets its signature-proven callers.  Code and data
+         * therefore share the writable relocated backing here. */
         NP560_APPLICATION_RESOURCE_PAGE_READ_OVERLAY_BASE,
         NP560_APPLICATION_RESOURCE_PAGE_READ_OVERLAY_SIZE,
         "np560.data-application-resource-page-read-overlay-alias",
         "np560.code-application-resource-page-read-overlay-alias",
-        NP560_APPLICATION_RESOURCE_PAGE_READ_OVERLAY_SOURCE,
     },
     {
         NP560_APPLICATION_POWER_STATE_OVERLAY_BASE,
@@ -2937,9 +3990,13 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
     },
     {
         NP560_APPLICATION_PAGE_SETUP_OVERLAY_BASE,
-        NP560_APPLICATION_PAGE_SETUP_OVERLAY_SIZE,
-        "np560.data-application-page-setup-overlay-alias",
-        "np560.code-application-page-setup-overlay-alias",
+        /* 29:13DC..16AF and 29:16B0..1983 are contiguous exact source-46
+         * functions.  One union alias is byte-for-byte equivalent to the
+         * former two aliases and avoids consuming another Harvard subpage
+         * section. */
+        NP560_APPLICATION_PAGE_SETUP_CONTEXT_ALIAS_SIZE,
+        "np560.data-application-page-setup-context-overlay-alias",
+        "np560.code-application-page-setup-context-overlay-alias",
     },
     {
         NP560_APPLICATION_TEXT_LOOP_OVERLAY_BASE,
@@ -2965,7 +4022,9 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         NP560_APPLICATION_STORAGE_REGISTRY_OVERLAY_SIZE,
         "np560.data-application-storage-registry-overlay-alias",
         "np560.code-application-storage-registry-overlay-alias",
-        NP560_APPLICATION_STORAGE_REGISTRY_OVERLAY_SOURCE,
+        /* ROM-01 patches 25:5AE6 to its guest capacity wrapper.  Keep the
+         * instruction view coherent with the writable overlay so that hook,
+         * and later guest-owned registry changes, reach instruction fetch. */
     },
     {
         NP560_STORAGE_BAD_BLOCK_STATUS_OVERLAY_BASE,
@@ -2997,38 +4056,24 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
     },
     {
         NP560_STORAGE_PACKED_FIELD_OVERLAY_BASE,
-        NP560_STORAGE_PACKED_FIELD_OVERLAY_SIZE,
+        NP560_STORAGE_PACKED_INIT_OVERLAY_SIZE,
         "np560.data-storage-packed-field-overlay-alias",
         "np560.code-storage-packed-field-overlay-alias",
         NP560_STORAGE_PACKED_FIELD_OVERLAY_SOURCE,
     },
-      {
+    {
         NP560_STORAGE_SECONDARY_DRIVER_OVERLAY_BASE,
-        NP560_STORAGE_SECONDARY_DRIVER_OVERLAY_SIZE,
+        NP560_STORAGE_DRIVER_READERS_OVERLAY_SIZE,
         "np560.data-storage-secondary-driver-overlay-alias",
         "np560.code-storage-secondary-driver-overlay-alias",
         NP560_STORAGE_SECONDARY_DRIVER_OVERLAY_SOURCE,
       },
-      {
-        NP560_STORAGE_PRIMARY_READER_OVERLAY_BASE,
-        NP560_STORAGE_PRIMARY_READER_OVERLAY_SIZE,
-        "np560.data-storage-primary-reader-overlay-alias",
-        "np560.code-storage-primary-reader-overlay-alias",
-        NP560_STORAGE_PRIMARY_READER_OVERLAY_SOURCE,
-      },
     {
         NP560_STORAGE_TRANSFER_WORKER_OVERLAY_BASE,
-        NP560_STORAGE_TRANSFER_WORKER_OVERLAY_SIZE,
+        NP560_STORAGE_TRANSFER_WORKERS_OVERLAY_SIZE,
         "np560.data-storage-transfer-worker-overlay-alias",
         "np560.code-storage-transfer-worker-overlay-alias",
         NP560_STORAGE_TRANSFER_WORKER_OVERLAY_SOURCE,
-    },
-    {
-        NP560_STORAGE_PRIMARY_TRANSFER_OVERLAY_BASE,
-        NP560_STORAGE_PRIMARY_TRANSFER_OVERLAY_SIZE,
-        "np560.data-storage-primary-transfer-overlay-alias",
-        "np560.code-storage-primary-transfer-overlay-alias",
-        NP560_STORAGE_PRIMARY_TRANSFER_OVERLAY_SOURCE,
     },
     {
         NP560_STORAGE_PRIMARY_SECTOR_READ_OVERLAY_BASE,
@@ -3043,13 +4088,6 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         "np560.data-storage-nand-status-overlay-alias",
         "np560.code-storage-nand-status-overlay-alias",
         NP560_STORAGE_NAND_STATUS_OVERLAY_SOURCE,
-    },
-    {
-        NP560_STORAGE_BLOCK_TRANSFER_OVERLAY_BASE,
-        NP560_STORAGE_BLOCK_TRANSFER_OVERLAY_SIZE,
-        "np560.data-storage-block-transfer-overlay-alias",
-        "np560.code-storage-block-transfer-overlay-alias",
-        NP560_STORAGE_BLOCK_TRANSFER_OVERLAY_SOURCE,
     },
     {
         NP560_STORAGE_RECORD_CALLBACK_OVERLAY_BASE,
@@ -3109,38 +4147,24 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
     },
     {
         NP560_STORAGE_RECORD_DISPATCH_OVERLAY_BASE,
-        NP560_STORAGE_RECORD_DISPATCH_OVERLAY_SIZE,
+        NP560_STORAGE_RECORD_KEY_RESET_OVERLAY_SIZE,
         "np560.data-storage-record-dispatch-overlay-alias",
         "np560.code-storage-record-dispatch-overlay-alias",
         NP560_STORAGE_RECORD_DISPATCH_OVERLAY_SOURCE,
     },
     {
         NP560_TIMER_IDLE_SET_BIT2_OVERLAY_BASE,
-        NP560_TIMER_IDLE_SET_BIT2_OVERLAY_SIZE,
+        NP560_TIMER_IDLE_SET_BITS_OVERLAY_SIZE,
         "np560.data-timer-idle-set-bit2-relocated-overlay-alias",
         "np560.code-timer-idle-set-bit2-relocated-overlay-alias",
         0x00506bb2u,
     },
     {
-        NP560_TIMER_IDLE_SET_BIT1_OVERLAY_BASE,
-        NP560_TIMER_IDLE_SET_BIT1_OVERLAY_SIZE,
-        "np560.data-timer-idle-set-bit1-relocated-overlay-alias",
-        "np560.code-timer-idle-set-bit1-relocated-overlay-alias",
-        0x00506bbau,
-    },
-    {
         NP560_TIMER_IDLE_CLEAR_BIT2_OVERLAY_BASE,
-        NP560_TIMER_IDLE_CLEAR_BIT2_OVERLAY_SIZE,
+        NP560_TIMER_IDLE_CLEAR_BITS_OVERLAY_SIZE,
         "np560.data-timer-idle-clear-bit2-relocated-overlay-alias",
         "np560.code-timer-idle-clear-bit2-relocated-overlay-alias",
         0x00506c2au,
-    },
-    {
-        NP560_TIMER_IDLE_CLEAR_BIT1_OVERLAY_BASE,
-        NP560_TIMER_IDLE_CLEAR_BIT1_OVERLAY_SIZE,
-        "np560.data-timer-idle-clear-bit1-relocated-overlay-alias",
-        "np560.code-timer-idle-clear-bit1-relocated-overlay-alias",
-        0x00506c32u,
     },
     {
         NP560_STORAGE_RECORD_ACCEPT_OVERLAY_BASE,
@@ -3204,12 +4228,6 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         "np560.code-application-pointer-update-overlay-alias",
     },
     {
-        NP560_STORAGE_RUNTIME_STATE_RESET_OVERLAY_BASE,
-        NP560_STORAGE_RUNTIME_STATE_RESET_OVERLAY_SIZE,
-        "np560.data-storage-runtime-state-reset-overlay-alias",
-        "np560.code-storage-runtime-state-reset-overlay-alias",
-    },
-    {
         NP560_STORAGE_RUNTIME_TABLE_RESET_OVERLAY_BASE,
         NP560_STORAGE_RUNTIME_TABLE_RESET_OVERLAY_SIZE,
         "np560.data-storage-runtime-table-reset-overlay-alias",
@@ -3229,9 +4247,11 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
     },
     {
         NP560_APPLICATION_STORAGE_BLOCK_OVERLAY_BASE,
-        NP560_APPLICATION_STORAGE_BLOCK_OVERLAY_SIZE,
-        "np560.data-application-storage-block-overlay-alias",
-        "np560.code-application-storage-block-overlay-alias",
+        /* The application block body and resource page body are contiguous
+         * at 27:0000..06C3 and at their linked source 44:0000..06C3. */
+        NP560_APPLICATION_STORAGE_BLOCK_PAGE_ALIAS_SIZE,
+        "np560.data-application-storage-block-page-overlay-alias",
+        "np560.code-application-storage-block-page-overlay-alias",
     },
     {
         NP560_APPLICATION_STORAGE_SCAN_OVERLAY_BASE,
@@ -3298,26 +4318,6 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         NP560_APPLICATION_STATE_SERVICE_OVERLAY_SOURCE,
     },
     {
-        NP560_APPLICATION_STATE_TRANSFORM_OVERLAY_BASE,
-        NP560_APPLICATION_STATE_TRANSFORM_OVERLAY_SIZE,
-        "np560.data-application-state-transform-overlay-alias",
-        "np560.code-application-state-transform-overlay-alias",
-    },
-    {
-        NP560_APPLICATION_STATE_FLAGS_OVERLAY_BASE,
-        NP560_APPLICATION_STATE_FLAGS_OVERLAY_SIZE,
-        "np560.data-application-state-flags-overlay-alias",
-        "np560.code-application-state-flags-overlay-alias",
-        NP560_APPLICATION_STATE_FLAGS_OVERLAY_SOURCE,
-    },
-    {
-        NP560_APPLICATION_STATE_POWER_OVERLAY_BASE,
-        NP560_APPLICATION_STATE_POWER_OVERLAY_SIZE,
-        "np560.data-application-state-power-overlay-alias",
-        "np560.code-application-state-power-overlay-alias",
-        NP560_APPLICATION_STATE_POWER_OVERLAY_SOURCE,
-    },
-    {
         NP560_APPLICATION_STATE_TICK_OVERLAY_BASE,
         NP560_APPLICATION_STATE_TICK_OVERLAY_SIZE,
         "np560.data-application-state-tick-overlay-alias",
@@ -3339,23 +4339,10 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         0x004fc336u,
     },
     {
-        NP560_APPLICATION_STATE_MODE_OVERLAY_BASE,
-        NP560_APPLICATION_STATE_MODE_OVERLAY_SIZE,
-        "np560.data-application-state-mode-overlay-alias",
-        "np560.code-application-state-mode-overlay-alias",
-        NP560_APPLICATION_STATE_MODE_OVERLAY_SOURCE,
-    },
-    {
         NP560_APPLICATION_EVENT_INDEX_OVERLAY_BASE,
         NP560_APPLICATION_EVENT_INDEX_OVERLAY_SIZE,
         "np560.data-application-event-index-overlay-alias",
         "np560.code-application-event-index-overlay-alias",
-    },
-    {
-        NP560_APPLICATION_CONTEXT_LOOKUP_OVERLAY_BASE,
-        NP560_APPLICATION_CONTEXT_LOOKUP_OVERLAY_SIZE,
-        "np560.data-application-context-lookup-overlay-alias",
-        "np560.code-application-context-lookup-overlay-alias",
     },
     {
         NP560_APPLICATION_CONTEXT_PROPERTY_OVERLAY_BASE,
@@ -3482,12 +4469,6 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         "np560.data-factory-default-2a-7e3e-overlay-alias",
         "np560.code-factory-default-2a-7e3e-overlay-alias",
         0x00477e3eu,
-    },
-    {
-        0x0032e5a2u, 0x0042u,
-        "np560.data-factory-default-32-e5a2-overlay-alias",
-        "np560.code-factory-default-32-e5a2-overlay-alias",
-        0x004fe5a2u,
     },
     {
         0x00327c74u, 0x0066u,
@@ -3719,16 +4700,10 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         "np560.code-application-compare-mode-overlay-alias",
     },
     {
-        NP560_APPLICATION_TEXT_DISPATCH_OVERLAY_BASE,
-        NP560_APPLICATION_TEXT_DISPATCH_OVERLAY_SIZE,
-        "np560.data-application-text-dispatch-overlay-alias",
-        "np560.code-application-text-dispatch-overlay-alias",
-    },
-    {
-        NP560_APPLICATION_TEXT_DISPATCH_F0_OVERLAY_BASE,
-        NP560_APPLICATION_TEXT_DISPATCH_F0_OVERLAY_SIZE,
-        "np560.data-application-text-dispatch-f0-overlay-alias",
-        "np560.code-application-text-dispatch-f0-overlay-alias",
+        NP560_APPLICATION_TEXT_DISPATCH_PAIR_OVERLAY_BASE,
+        NP560_APPLICATION_TEXT_DISPATCH_PAIR_OVERLAY_SIZE,
+        "np560.data-application-text-dispatch-pair-overlay-alias",
+        "np560.code-application-text-dispatch-pair-overlay-alias",
     },
     {
         NP560_APPLICATION_INDEX_ACTION_OVERLAY_BASE,
@@ -3755,6 +4730,12 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         "np560.code-application-rect-draw-overlay-alias",
     },
     {
+        NP560_APPLICATION_PAGE_RASTER_OVERLAY_BASE,
+        NP560_APPLICATION_PAGE_RASTER_OVERLAY_SIZE,
+        "np560.data-application-page-raster-overlay-alias",
+        "np560.code-application-page-raster-overlay-alias",
+    },
+    {
         NP560_APPLICATION_IMAGE_WINDOW_OVERLAY_BASE,
         NP560_APPLICATION_IMAGE_WINDOW_OVERLAY_SIZE,
         "np560.data-application-image-window-overlay-alias",
@@ -3778,6 +4759,12 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         NP560_MODAL_CALLBACK_OVERLAY_SIZE,
         "np560.data-modal-callback-overlay-alias",
         "np560.code-modal-callback-overlay-alias",
+    },
+    {
+        NP560_APPLICATION_OPERATION_ACTION_OVERLAY_BASE,
+        NP560_APPLICATION_OPERATION_ACTION_OVERLAY_SIZE,
+        "np560.data-application-operation-action-overlay-alias",
+        "np560.code-application-operation-action-overlay-alias",
     },
     {
         NP560_MODAL_IMAGE_RENDER_OVERLAY_BASE,
@@ -3902,16 +4889,131 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         "np560.code-modal-item-format-overlay-alias",
     },
     {
-        NP560_MODAL_WORKER_OVERLAY_BASE,
-        NP560_MODAL_WORKER_OVERLAY_SIZE,
-        "np560.data-modal-worker-overlay-alias",
-        "np560.code-modal-worker-overlay-alias",
-    },
-    {
         NP560_MODAL_WORKER_CORE_OVERLAY_BASE,
         NP560_MODAL_WORKER_CORE_OVERLAY_SIZE,
         "np560.data-modal-worker-core-overlay-alias",
         "np560.code-modal-worker-core-overlay-alias",
+    },
+    {
+        NP560_APPLICATION_OPERATION_CONTEXT_BUILD_OVERLAY_BASE,
+        NP560_APPLICATION_OPERATION_CONTEXT_BUILD_OVERLAY_SIZE,
+        "np560.data-application-operation-context-build-overlay-alias",
+        "np560.code-application-operation-context-build-overlay-alias",
+        0,
+    },
+    {
+        NP560_APPLICATION_OPERATION_MODE_ROUTER_OVERLAY_BASE,
+        NP560_APPLICATION_OPERATION_MODE_ROUTER_OVERLAY_SIZE,
+        "np560.data-application-operation-mode-router-overlay-alias",
+        "np560.code-application-operation-mode-router-overlay-alias",
+    },
+    {
+        NP560_APPLICATION_OPERATION_NUMBER_DISPATCH_OVERLAY_BASE,
+        NP560_APPLICATION_OPERATION_NUMBER_DISPATCH_OVERLAY_SIZE,
+        "np560.data-application-operation-number-dispatch-overlay-alias",
+        "np560.code-application-operation-number-dispatch-overlay-alias",
+    },
+    {
+        NP560_APPLICATION_OPERATION_CONTEXT_CHILD_OVERLAY_BASE,
+        NP560_APPLICATION_OPERATION_CONTEXT_CHILD_OVERLAY_SIZE,
+        "np560.data-application-operation-context-child-overlay-alias",
+        "np560.code-application-operation-context-child-overlay-alias",
+        NP560_APPLICATION_OPERATION_CONTEXT_CHILD_OVERLAY_SOURCE,
+    },
+    {
+        NP560_APPLICATION_OPERATION_CONTEXT_CASEFOLD_OVERLAY_BASE,
+        NP560_APPLICATION_OPERATION_CONTEXT_CASEFOLD_OVERLAY_SIZE,
+        "np560.data-application-operation-context-casefold-overlay-alias",
+        "np560.code-application-operation-context-casefold-overlay-alias",
+        0,
+    },
+    {
+        NP560_APPLICATION_OPERATION_CONTEXT_UPPER_PREDICATE_OVERLAY_BASE,
+        NP560_APPLICATION_OPERATION_CONTEXT_UPPER_PREDICATE_OVERLAY_SIZE,
+        "np560.data-application-operation-context-upper-predicate-overlay-alias",
+        "np560.code-application-operation-context-upper-predicate-overlay-alias",
+        0,
+    },
+    {
+        NP560_APPLICATION_OPERATION_CONTEXT_TOLOWER_OVERLAY_BASE,
+        NP560_APPLICATION_OPERATION_CONTEXT_TOLOWER_OVERLAY_SIZE,
+        "np560.data-application-operation-context-tolower-overlay-alias",
+        "np560.code-application-operation-context-tolower-overlay-alias",
+        0,
+    },
+    {
+        /* Data-only Harvard RAM used by the original lifecycle-bound copy.
+         * NULL code_name deliberately leaves instruction fetches on PRG. */
+        NP560_APPLICATION_NPE_FORMAT_LITERAL_DATA_BASE,
+        NP560_APPLICATION_NPE_FORMAT_LITERAL_DATA_SIZE,
+        "np560.data-application-npe-format-literal-overlay-alias",
+        NULL,
+        0,
+    },
+    {
+        /* Exact 4C:AA00 title/menu data is published by the operation-7
+         * wrapper.  NULL keeps the overlapping flat 2F:A0B6 instruction
+         * body visible on the Harvard code bus. */
+        NP560_APPLICATION_NPE_OPERATION7_MENU_DATA_BASE,
+        NP560_APPLICATION_NPE_OPERATION7_MENU_DATA_SIZE,
+        "np560.data-application-npe-operation7-menu-data-alias",
+        NULL,
+        0,
+    },
+    {
+        /* Exact 4F:F38A body is installed here by the final ROM-01 guest
+         * loader before resident trampoline 03:4128 can dispatch status 2. */
+        NP560_APPLICATION_NPE_LOADER_SLOT_WRITE_OVERLAY_BASE,
+        NP560_APPLICATION_NPE_LOADER_SLOT_WRITE_OVERLAY_SIZE,
+        "np560.data-application-npe-loader-slot-write-overlay-alias",
+        "np560.code-application-npe-loader-slot-write-overlay-alias",
+        0,
+    },
+    {
+        /* The loaded NPE module directly calls linked 32:F38A.  Keep this
+         * coherent window initialized from the flat PRG like ordinary code
+         * RAM; the operation-7 guest wrapper publishes the exact 4F:F38A
+         * body only after the earlier flat application path has retired. */
+        NP560_APPLICATION_NPE_LOADER_SLOT_WRITE_LINKED_OVERLAY_BASE,
+        NP560_APPLICATION_NPE_LOADER_SLOT_WRITE_OVERLAY_SIZE,
+        "np560.data-application-npe-loader-slot-write-linked-overlay-alias",
+        "np560.code-application-npe-loader-slot-write-linked-overlay-alias",
+        0,
+    },
+    {
+        NP560_APPLICATION_OPERATION_CONTEXT_PREDICATE_OVERLAY_BASE,
+        NP560_APPLICATION_OPERATION_CONTEXT_PREDICATE_OVERLAY_SIZE,
+        "np560.data-application-operation-context-predicate-overlay-alias",
+        "np560.code-application-operation-context-predicate-overlay-alias",
+        NP560_APPLICATION_OPERATION_CONTEXT_PREDICATE_OVERLAY_SOURCE,
+    },
+    {
+        NP560_APPLICATION_FILE_BROWSER_LAYOUT_RANGE_OVERLAY_BASE,
+        NP560_APPLICATION_FILE_BROWSER_LAYOUT_RANGE_OVERLAY_SIZE,
+        "np560.data-application-file-browser-layout-range-overlay-alias",
+        "np560.code-application-file-browser-layout-range-overlay-alias",
+        NP560_APPLICATION_FILE_BROWSER_LAYOUT_RANGE_OVERLAY_SOURCE,
+    },
+    {
+        NP560_APPLICATION_FILE_BROWSER_LAYOUT_HELPER_OVERLAY_BASE,
+        NP560_APPLICATION_FILE_BROWSER_LAYOUT_HELPER_OVERLAY_SIZE,
+        "np560.data-application-file-browser-layout-helper-overlay-alias",
+        "np560.code-application-file-browser-layout-helper-overlay-alias",
+        0,
+    },
+    {
+        NP560_APPLICATION_FILE_BROWSER_LAYOUT_CHILD_OVERLAY_BASE,
+        NP560_APPLICATION_FILE_BROWSER_LAYOUT_CHILD_OVERLAY_SIZE,
+        "np560.data-application-file-browser-layout-child-overlay-alias",
+        "np560.code-application-file-browser-layout-child-overlay-alias",
+        0,
+    },
+    {
+        NP560_APPLICATION_OPERATION_ACTION_MODE_PREDICATE_OVERLAY_BASE,
+        NP560_APPLICATION_OPERATION_ACTION_MODE_PREDICATE_OVERLAY_SIZE,
+        "np560.data-application-operation-action-mode-predicate-overlay-alias",
+        "np560.code-application-operation-action-mode-predicate-overlay-alias",
+        0,
     },
     {
         NP560_MODAL_BUFFER_PREPARE_OVERLAY_BASE,
@@ -3926,10 +5028,14 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         "np560.code-modal-field-decode-overlay-alias",
     },
     {
-        NP560_MODAL_FIELD_EXPAND_OVERLAY_BASE,
-        NP560_MODAL_FIELD_EXPAND_OVERLAY_SIZE,
-        "np560.data-modal-field-expand-overlay-alias",
-        "np560.code-modal-field-expand-overlay-alias",
+        /* The complete 23:DA24 formatter ends exactly where the independently
+         * published 23:DEA6 modal-field helper begins.  Both destinations
+         * are coherent RAM, so one alias represents the same exact union
+         * without an artificial FlatView boundary between them. */
+        NP560_MENU_RESOURCE_MODAL_FIELD_PAIR_OVERLAY_BASE,
+        NP560_MENU_RESOURCE_MODAL_FIELD_PAIR_OVERLAY_SIZE,
+        "np560.data-menu-resource-modal-field-pair-overlay-alias",
+        "np560.code-menu-resource-modal-field-pair-overlay-alias",
     },
     {
         NP560_MODAL_BUFFER_COMMIT_OVERLAY_BASE,
@@ -3948,6 +5054,17 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         NP560_APPLICATION_STATE_COMMIT_OVERLAY_SIZE,
         "np560.data-application-state-commit-overlay-alias",
         "np560.code-application-state-commit-overlay-alias",
+    },
+    {
+        /* The operation handlers call 33:6610 as a no-argument function.
+         * Keep its Harvard instruction view on the exact shipped 50:6610
+         * LINK/SCALL 2F:D266/UNLINK/RETS wrapper.  This matches the adjacent
+         * 33:65D4 wrapper and does not replace the same numeric data RAM. */
+        NP560_APPLICATION_OPERATION_UI_PREPARE_OVERLAY_BASE,
+        NP560_APPLICATION_OPERATION_UI_PREPARE_OVERLAY_SIZE,
+        "np560.data-application-operation-ui-prepare-overlay-alias",
+        "np560.code-application-operation-ui-prepare-overlay-alias",
+        NP560_APPLICATION_OPERATION_UI_PREPARE_OVERLAY_SOURCE,
     },
     {
         NP560_APPLICATION_IMAGE_DISPATCH_OVERLAY_BASE,
@@ -4032,7 +5149,7 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
     },
     {
         NP560_UINT32_DIVIDE_WRAPPER_OVERLAY_BASE,
-        NP560_UINT32_DIVIDE_WRAPPER_OVERLAY_SIZE,
+        NP560_INTEGER_DIVIDE_WRAPPERS_OVERLAY_SIZE,
         "np560.data-uint32-divide-wrapper-overlay-alias",
         "np560.code-uint32-divide-wrapper-overlay-alias",
         NP560_UINT32_DIVIDE_WRAPPER_OVERLAY_SOURCE,
@@ -4046,17 +5163,10 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
     },
     {
         NP560_UINT32_MSB_INDEX_OVERLAY_BASE,
-        NP560_UINT32_MSB_INDEX_OVERLAY_SIZE,
+        NP560_UINT32_NORMALIZATION_OVERLAY_SIZE,
         "np560.data-uint32-msb-index-overlay-alias",
         "np560.code-uint32-msb-index-overlay-alias",
         NP560_UINT32_MSB_INDEX_OVERLAY_SOURCE,
-    },
-    {
-        NP560_UINT32_NORMALIZE_OVERLAY_BASE,
-        NP560_UINT32_NORMALIZE_OVERLAY_SIZE,
-        "np560.data-uint32-normalize-overlay-alias",
-        "np560.code-uint32-normalize-overlay-alias",
-        NP560_UINT32_NORMALIZE_OVERLAY_SOURCE,
     },
     {
         NP560_APPLICATION_INIT_TASK_OVERLAY_BASE,
@@ -4091,9 +5201,11 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
     },
     {
         NP560_APPLICATION_VALIDATION_CRC16_OVERLAY_BASE,
-        NP560_APPLICATION_VALIDATION_CRC16_OVERLAY_SIZE,
-        "np560.data-application-validation-crc16-overlay-alias",
-        "np560.code-application-validation-crc16-overlay-alias",
+        /* CRC16 31:F162..F1F1 and modal worker 31:F1F2..F281 are adjacent
+         * guest-published functions sharing the same coherent RAM. */
+        NP560_APPLICATION_VALIDATION_MODAL_ALIAS_SIZE,
+        "np560.data-application-validation-modal-overlay-alias",
+        "np560.code-application-validation-modal-overlay-alias",
     },
     {
         NP560_APPLICATION_CONTEXT_LAUNCH_OVERLAY_BASE,
@@ -4109,7 +5221,7 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
     },
     {
         NP560_APPLICATION_ADDRESS_RESOLVE_OVERLAY_BASE,
-        NP560_APPLICATION_ADDRESS_RESOLVE_OVERLAY_SIZE,
+        NP560_APPLICATION_ADDRESS_FILE_WRAPPER_OVERLAY_SIZE,
         "np560.data-application-address-resolve-overlay-alias",
         "np560.code-application-address-resolve-overlay-alias",
         NP560_APPLICATION_ADDRESS_RESOLVE_OVERLAY_SOURCE,
@@ -4180,12 +5292,6 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         "np560.code-application-post-registry-overlay-alias",
     },
     {
-        NP560_APPLICATION_POST_REGISTRY_STATE_OVERLAY_BASE,
-        NP560_APPLICATION_POST_REGISTRY_STATE_OVERLAY_SIZE,
-        "np560.data-application-post-registry-state-overlay-alias",
-        "np560.code-application-post-registry-state-overlay-alias",
-    },
-    {
         NP560_APPLICATION_POST_REGISTRY_BINDINGS_OVERLAY_BASE,
         NP560_APPLICATION_POST_REGISTRY_BINDINGS_OVERLAY_SIZE,
         "np560.data-application-post-registry-bindings-overlay-alias",
@@ -4220,6 +5326,45 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         NP560_APPLICATION_MAIN_STATE_INIT_OVERLAY_SIZE,
         "np560.data-application-main-state-init-overlay-alias",
         "np560.code-application-main-state-init-overlay-alias",
+    },
+    {
+        NP560_APPLICATION_START_CONTEXT_INIT_OVERLAY_BASE,
+        NP560_APPLICATION_START_CONTEXT_INIT_OVERLAY_SIZE,
+        "np560.data-application-start-context-init-overlay-alias",
+        "np560.code-application-start-context-init-overlay-alias",
+    },
+    {
+        /* The state importer dispatches logical 32:F15C after the late guest
+         * installer has replaced its colliding flat-image body with the
+         * exact standalone source-4F callback.  Model this narrow range as
+         * executable RAM so the guest store and instruction fetch are
+         * coherent, just like the adjacent recovered application islands. */
+        NP560_APPLICATION_START_CALLBACK_OVERLAY_BASE,
+        NP560_APPLICATION_START_CALLBACK_OVERLAY_SIZE,
+        "np560.data-application-start-callback-overlay-alias",
+        "np560.code-application-start-callback-overlay-alias",
+    },
+    {
+        NP560_APPLICATION_START_RECORD_HANDLER_OVERLAY_BASE,
+        NP560_APPLICATION_START_RECORD_HANDLER_OVERLAY_SIZE,
+        "np560.data-application-start-record-handler-overlay-alias",
+        "np560.code-application-start-record-handler-overlay-alias",
+    },
+    {
+        /* The late resident installer replaces the colliding flat suffix at
+         * 31:6518 through the DMCU data bus.  Back both Harvard views with
+         * the same executable RAM so the guest's exact source-4E state-mask
+         * helper is visible to instruction fetch. */
+        NP560_APPLICATION_START_STATE_MASK_OVERLAY_BASE,
+        NP560_APPLICATION_START_STATE_MASK_OVERLAY_SIZE,
+        "np560.data-application-start-state-mask-overlay-alias",
+        "np560.code-application-start-state-mask-overlay-alias",
+    },
+    {
+        NP560_APPLICATION_START_RELEASE_OVERLAY_BASE,
+        NP560_APPLICATION_START_RELEASE_OVERLAY_SIZE,
+        "np560.data-application-start-release-overlay-alias",
+        "np560.code-application-start-release-overlay-alias",
     },
     {
         NP560_APPLICATION_MAIN_STATE_BUILD_OVERLAY_BASE,
@@ -4298,6 +5443,7 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         NP560_APPLICATION_MAIN_STORAGE_FLAG_OVERLAY_SIZE,
         "np560.data-application-main-storage-flag-overlay-alias",
         "np560.code-application-main-storage-flag-overlay-alias",
+        NP560_APPLICATION_MAIN_STORAGE_FLAG_OVERLAY_SOURCE,
     },
     {
         NP560_APPLICATION_MAIN_MODE_DISPATCH_OVERLAY_BASE,
@@ -4353,7 +5499,7 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
     },
     {
         NP560_APPLICATION_MAIN_INPUT_STATE_OVERLAY_BASE,
-        NP560_APPLICATION_MAIN_INPUT_STATE_OVERLAY_SIZE,
+        NP560_APPLICATION_INPUT_OBJECT_RESOLVE_OVERLAY_SIZE,
         "np560.data-application-main-input-state-overlay-alias",
         "np560.code-application-main-input-state-overlay-alias",
         NP560_APPLICATION_MAIN_INPUT_STATE_OVERLAY_SOURCE,
@@ -4400,6 +5546,13 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         "np560.code-application-main-action-overlay-alias",
     },
     {
+        NP560_APPLICATION_MAIN_ACTION_BUFFER_PREPARE_OVERLAY_BASE,
+        NP560_APPLICATION_MAIN_ACTION_BUFFER_PREPARE_OVERLAY_SIZE,
+        "np560.data-application-main-action-buffer-prepare-overlay-alias",
+        "np560.code-application-main-action-buffer-prepare-overlay-alias",
+        NP560_APPLICATION_MAIN_ACTION_BUFFER_PREPARE_OVERLAY_SOURCE,
+    },
+    {
         NP560_APPLICATION_MAIN_ACTION_QUERY_OVERLAY_BASE,
         NP560_APPLICATION_MAIN_ACTION_QUERY_OVERLAY_SIZE,
         "np560.data-application-main-action-query-overlay-alias",
@@ -4412,10 +5565,122 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         "np560.code-application-main-action-render-overlay-alias",
     },
     {
+        NP560_APPLICATION_MAIN_RENDER_LAYOUT_OVERLAY_BASE,
+        NP560_APPLICATION_MAIN_RENDER_LAYOUT_OVERLAY_SIZE,
+        "np560.data-application-main-render-layout-overlay-alias",
+        "np560.code-application-main-render-layout-overlay-alias",
+    },
+    {
+        /* The recovered ROM's own loader fills this exact window from
+         * 4B:2B6E.  Keep guest data writes and subsequent CPU instruction
+         * fetches coherent; using the source bytes directly would hide later
+         * guest writes and would not model the hardware overlay RAM. */
+        NP560_APPLICATION_MAIN_ACTION_RENDER_HELPER_OVERLAY_BASE,
+        NP560_APPLICATION_MAIN_ACTION_RENDER_HELPER_OVERLAY_SIZE,
+        "np560.data-application-main-action-render-helper-overlay-alias",
+        "np560.code-application-main-action-render-helper-overlay-alias",
+    },
+    {
+        NP560_APPLICATION_MAIN_RENDER_FINALIZE_OVERLAY_BASE,
+        NP560_APPLICATION_MAIN_RENDER_FINALIZE_OVERLAY_SIZE,
+        "np560.data-application-main-render-finalize-overlay-alias",
+        "np560.code-application-main-render-finalize-overlay-alias",
+    },
+    {
         NP560_APPLICATION_MAIN_ACTION_RENDER_CLEAR_OVERLAY_BASE,
-        NP560_APPLICATION_MAIN_ACTION_RENDER_CLEAR_OVERLAY_SIZE,
-        "np560.data-application-main-action-render-clear-overlay-alias",
-        "np560.code-application-main-action-render-clear-overlay-alias",
+        /* 32:B922..B973 and exact transition child 32:B974..B9C5 form one
+         * contiguous guest-published coherent window. */
+        NP560_APPLICATION_RENDER_CLEAR_TRANSITION_CHILD_ALIAS_SIZE,
+        "np560.data-application-render-clear-transition-child-overlay-alias",
+        "np560.code-application-render-clear-transition-child-overlay-alias",
+    },
+    {
+        /* 1F:D210 calls this exact guest-installed loader context helper.
+         * Keep its writes and instruction fetches coherent; flat 32:CF38 is
+         * retained as its original continuation and the framed renderer is
+         * relocated to 5F:CF38 below. */
+        NP560_APPLICATION_NPE_LOADER_CONTEXT_INIT_OVERLAY_BASE,
+        NP560_APPLICATION_NPE_LOADER_CONTEXT_INIT_OVERLAY_SIZE,
+        "np560.data-application-npe-loader-context-init-overlay-alias",
+        "np560.code-application-npe-loader-context-init-overlay-alias",
+    },
+    {
+        /* The v777 launch trace proves that live 2B:0E18 calls flat
+         * 2B:0000, an unrelated LINK #0x49 body which destroys its return
+         * frame.  The recovered ROM copies the exact closed 48:0000 LINK #7
+         * body here and runtime preprocessing retargets that source call.
+         * This remains ordinary guest-writable coherent code/data RAM. */
+        NP560_APPLICATION_NPE_STATE_DISPATCH_OVERLAY_BASE,
+        NP560_APPLICATION_NPE_STATE_DISPATCH_OVERLAY_SIZE,
+        "np560.data-application-npe-state-dispatch-overlay-alias",
+        "np560.code-application-npe-state-dispatch-overlay-alias",
+    },
+    {
+        /* Calls at 2D:6A1C and 32:5CD6 originally target the extension word
+         * at flat 2B:4E3E.  The recovered ROM installs the complete same-PC
+         * 48:4E3E stream classifier here; keep the guest copy coherent on
+         * data and instruction buses rather than manufacturing its result. */
+        NP560_APPLICATION_NPE_STREAM_CLASSIFY_OVERLAY_BASE,
+        NP560_APPLICATION_NPE_STREAM_CLASSIFY_OVERLAY_SIZE,
+        "np560.data-application-npe-stream-classify-overlay-alias",
+        "np560.code-application-npe-stream-classify-overlay-alias",
+    },
+    {
+        /* The reconstructed ROM retargets resident 1F:1464 and runtime
+         * preprocessing retargets the six source-proven segment-2B calls to
+         * this guest-installed exact 44:716C bitmap decoder.  Flat 27:716C
+         * remains available to its unrelated compiler continuation. */
+        NP560_APPLICATION_NPE_LOADER_BITMAP_DECODE_OVERLAY_BASE,
+        NP560_APPLICATION_NPE_LOADER_BITMAP_DECODE_OVERLAY_SIZE,
+        "np560.data-application-npe-loader-bitmap-decode-overlay-alias",
+        "np560.code-application-npe-loader-bitmap-decode-overlay-alias",
+    },
+    {
+        /* Exact source 46:8202 is the framed child used by the relocated
+         * bitmap decoder and three resident 1F:12B4 paths.  Flat 29:8202 is
+         * an unrelated compiler continuation and remains unmapped. */
+        NP560_APPLICATION_NPE_BITMAP_CONTEXT_OVERLAY_BASE,
+        NP560_APPLICATION_NPE_BITMAP_CONTEXT_OVERLAY_SIZE,
+        "np560.data-application-npe-bitmap-context-overlay-alias",
+        "np560.code-application-npe-bitmap-context-overlay-alias",
+    },
+    {
+        /* The exact 38:C5EC LINK #8 body replaces no flat code: callers are
+         * retargeted here because linked 1B:C5EC is erased storage until an
+         * unrelated RETS at 1B:CE3A.  NPE loading concurrently reuses the
+         * 5F:C5EC data window (v775 observed 2089/2128 bytes overwritten),
+         * so model the Harvard/bank-switched hardware explicitly: data stays
+         * guest-writable while instruction fetches remain pinned to the
+         * shipped source-bank body. */
+        NP560_APPLICATION_NPE_NODE_TRANSFER_OVERLAY_BASE,
+        NP560_APPLICATION_NPE_NODE_TRANSFER_OVERLAY_SIZE,
+        "np560.data-application-npe-node-transfer-overlay-alias",
+        "np560.code-application-npe-node-transfer-overlay-alias",
+        0x0038c5ecu,
+    },
+    {
+        NP560_APPLICATION_NPE_LOADER_PREPARE_OVERLAY_BASE,
+        NP560_APPLICATION_NPE_LOADER_PREPARE_OVERLAY_SIZE,
+        "np560.data-application-npe-loader-prepare-overlay-alias",
+        "np560.code-application-npe-loader-prepare-overlay-alias",
+    },
+    {
+        NP560_APPLICATION_NPE_LOADER_MODE_OVERLAY_BASE,
+        NP560_APPLICATION_NPE_LOADER_MODE_OVERLAY_SIZE,
+        "np560.data-application-npe-loader-mode-overlay-alias",
+        "np560.code-application-npe-loader-mode-overlay-alias",
+    },
+    {
+        NP560_APPLICATION_NPE_OPERATION7_OVERLAY_BASE,
+        NP560_APPLICATION_NPE_OPERATION7_OVERLAY_SIZE,
+        "np560.data-application-npe-operation7-overlay-alias",
+        "np560.code-application-npe-operation7-overlay-alias",
+    },
+    {
+        NP560_APPLICATION_NPE_OPERATION7_DECODE_OVERLAY_BASE,
+        NP560_APPLICATION_NPE_OPERATION7_DECODE_OVERLAY_SIZE,
+        "np560.data-application-npe-operation7-decode-overlay-alias",
+        "np560.code-application-npe-operation7-decode-overlay-alias",
     },
     {
         NP560_APPLICATION_MAIN_ACTION_RENDER_LINE_OVERLAY_BASE,
@@ -4730,6 +5995,18 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         0x00501bbau,
     },
     {
+        NP560_APPLICATION_OPERATION_RECORD_ACCESSOR_OVERLAY_BASE,
+        NP560_APPLICATION_OPERATION_RECORD_ACCESSOR_OVERLAY_SIZE,
+        "np560.data-application-operation-record-accessor-overlay-alias",
+        "np560.code-application-operation-record-accessor-overlay-alias",
+    },
+    {
+        NP560_APPLICATION_OPERATION_FRAME_DRAW_OVERLAY_BASE,
+        NP560_APPLICATION_OPERATION_FRAME_DRAW_OVERLAY_SIZE,
+        "np560.data-application-operation-frame-draw-overlay-alias",
+        "np560.code-application-operation-frame-draw-overlay-alias",
+    },
+    {
         NP560_WIDE_ACCUMULATE_OVERLAY_BASE,
         NP560_WIDE_ACCUMULATE_OVERLAY_SIZE,
         "np560.data-wide-accumulate-overlay-alias",
@@ -4920,6 +6197,12 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         "np560.code-application-root-menu-mode-query-overlay-alias",
     },
     {
+        NP560_APPLICATION_ROOT_OBJECT_SELECT_OVERLAY_BASE,
+        NP560_APPLICATION_ROOT_OBJECT_SELECT_OVERLAY_SIZE,
+        "np560.data-application-root-object-select-overlay-alias",
+        "np560.code-application-root-object-select-overlay-alias",
+    },
+    {
         NP560_APPLICATION_FOREGROUND_STATE_DISPATCH_OVERLAY_BASE,
         NP560_APPLICATION_FOREGROUND_STATE_DISPATCH_OVERLAY_SIZE,
         "np560.data-application-foreground-state-dispatch-overlay-alias",
@@ -5043,7 +6326,7 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
     },
     {
         NP560_APPLICATION_EVENT_FETCH_OVERLAY_BASE,
-        NP560_APPLICATION_EVENT_FETCH_OVERLAY_SIZE,
+        NP560_APPLICATION_EVENT_REGISTRY_OVERLAY_SIZE,
         "np560.data-application-event-fetch-overlay-alias",
         "np560.code-application-event-fetch-overlay-alias",
     },
@@ -5067,7 +6350,7 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
     },
     {
         NP560_APPLICATION_STORAGE_CAPACITY_OVERLAY_BASE,
-        NP560_APPLICATION_STORAGE_CAPACITY_OVERLAY_SIZE,
+        NP560_STORAGE_CAPACITY_TRANSFER_OVERLAY_SIZE,
         "np560.data-application-storage-capacity-overlay-alias",
         "np560.code-application-storage-capacity-overlay-alias",
         NP560_APPLICATION_STORAGE_CAPACITY_OVERLAY_SOURCE,
@@ -5131,6 +6414,15 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         "np560.code-application-far-query-wrapper-overlay-alias",
     },
     {
+        /* The Start callback's 30:09D4 caller enters logical 31:E1E4.
+         * Its exact source-4E status reporter is guest-installed immediately
+         * before the already-modelled 31:E27A numeric helper. */
+        NP560_APPLICATION_FLAG_REPORT_OVERLAY_BASE,
+        NP560_APPLICATION_FLAG_REPORT_OVERLAY_SIZE,
+        "np560.data-application-flag-report-overlay-alias",
+        "np560.code-application-flag-report-overlay-alias",
+    },
+    {
         NP560_APPLICATION_REGISTER_QUAD_CONVERT_OVERLAY_BASE,
         NP560_APPLICATION_REGISTER_QUAD_CONVERT_OVERLAY_SIZE,
         "np560.data-application-register-quad-convert-overlay-alias",
@@ -5185,12 +6477,6 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         NP560_APPLICATION_EVENT_PACKET_COPY_OVERLAY_SIZE,
         "np560.data-application-event-packet-copy-overlay-alias",
         "np560.code-application-event-packet-copy-overlay-alias",
-    },
-    {
-        NP560_APPLICATION_EVENT_ENABLE_OVERLAY_BASE,
-        NP560_APPLICATION_EVENT_ENABLE_OVERLAY_SIZE,
-        "np560.data-application-event-enable-overlay-alias",
-        "np560.code-application-event-enable-overlay-alias",
     },
     {
         NP560_APPLICATION_DISPATCH_POLL_OVERLAY_BASE,
@@ -5353,13 +6639,6 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         NP560_APPLICATION_INIT_31_C3FC_OVERLAY_SOURCE,
     },
     {
-        NP560_APPLICATION_INIT_32_519E_OVERLAY_BASE,
-        NP560_APPLICATION_INIT_32_519E_OVERLAY_SIZE,
-        "np560.data-application-init-32-519e-overlay-alias",
-        "np560.code-application-init-32-519e-overlay-alias",
-        NP560_APPLICATION_INIT_32_519E_OVERLAY_SOURCE,
-    },
-    {
         NP560_APPLICATION_INIT_32_F3C6_OVERLAY_BASE,
         NP560_APPLICATION_INIT_32_F3C6_OVERLAY_SIZE,
         "np560.data-application-init-32-f3c6-overlay-alias",
@@ -5372,13 +6651,6 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         "np560.data-application-init-31-b6fc-overlay-alias",
         "np560.code-application-init-31-b6fc-overlay-alias",
         NP560_APPLICATION_INIT_31_B6FC_OVERLAY_SOURCE,
-    },
-    {
-        NP560_APPLICATION_INIT_31_CC84_OVERLAY_BASE,
-        NP560_APPLICATION_INIT_31_CC84_OVERLAY_SIZE,
-        "np560.data-application-init-31-cc84-overlay-alias",
-        "np560.code-application-init-31-cc84-overlay-alias",
-        NP560_APPLICATION_INIT_31_CC84_OVERLAY_SOURCE,
     },
     {
         NP560_APPLICATION_INIT_32_C514_OVERLAY_BASE,
@@ -5396,7 +6668,7 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
     },
     {
         NP560_APPLICATION_RESOURCE_DRIVER_OVERLAY_BASE,
-        NP560_APPLICATION_RESOURCE_DRIVER_OVERLAY_SIZE,
+        NP560_APPLICATION_RESOURCE_DRIVER_INIT_OVERLAY_SIZE,
         "np560.data-application-resource-driver-overlay-alias",
         "np560.code-application-resource-driver-overlay-alias",
         NP560_APPLICATION_RESOURCE_DRIVER_OVERLAY_SOURCE,
@@ -5407,13 +6679,6 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         "np560.data-application-file-attach-overlay-alias",
         "np560.code-application-file-attach-overlay-alias",
         NP560_APPLICATION_FILE_ATTACH_OVERLAY_SOURCE,
-    },
-    {
-        NP560_APPLICATION_FILE_WRAPPER_OVERLAY_BASE,
-        NP560_APPLICATION_FILE_WRAPPER_OVERLAY_SIZE,
-        "np560.data-application-file-wrapper-overlay-alias",
-        "np560.code-application-file-wrapper-overlay-alias",
-        NP560_APPLICATION_FILE_WRAPPER_OVERLAY_SOURCE,
     },
     {
         NP560_FILE_STATE_COPY_OVERLAY_BASE,
@@ -5455,14 +6720,16 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         NP560_STORAGE_CAPACITY_SERVICE_OVERLAY_SIZE,
         "np560.data-storage-capacity-service-overlay-alias",
         "np560.code-storage-capacity-service-overlay-alias",
-        0x005013f8u,
+        /* The guest installer retargets this body's child SCALL from
+         * 32:6B58 to 5F:6DA0.  Fetch the written words, not source 50:13F8. */
     },
     {
         NP560_STORAGE_CAPACITY_WRAPPER_OVERLAY_BASE,
         NP560_STORAGE_CAPACITY_WRAPPER_OVERLAY_SIZE,
         "np560.data-storage-capacity-wrapper-overlay-alias",
         "np560.code-storage-capacity-wrapper-overlay-alias",
-        0x0050661au,
+        /* The guest installer retargets this wrapper from 33:13F8 to
+         * 5F:13F8, so its code view must remain coherent with data RAM. */
     },
     {
         NP560_STORAGE_CAPACITY_CHILD_OVERLAY_BASE,
@@ -5479,11 +6746,11 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         NP560_APPLICATION_FILE_OBJECT_OPEN_OVERLAY_SOURCE,
     },
     {
-        NP560_APPLICATION_FILE_OBJECT_RESOLVE_OVERLAY_BASE,
-        NP560_APPLICATION_FILE_OBJECT_RESOLVE_OVERLAY_SIZE,
-        "np560.data-application-file-object-resolve-overlay-alias",
-        "np560.code-application-file-object-resolve-overlay-alias",
-        NP560_APPLICATION_FILE_OBJECT_RESOLVE_OVERLAY_SOURCE,
+        NP560_APPLICATION_STATE_DESCRIPTOR_OVERLAY_BASE,
+        NP560_APPLICATION_STATE_DESCRIPTOR_OVERLAY_SIZE,
+        "np560.data-application-state-descriptor-overlay-alias",
+        "np560.code-application-state-descriptor-overlay-alias",
+        NP560_APPLICATION_STATE_DESCRIPTOR_OVERLAY_SOURCE,
     },
     {
         NP560_APPLICATION_FILE_OBJECT_RELEASE_OVERLAY_BASE,
@@ -5529,17 +6796,12 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
     },
     {
         NP560_APPLICATION_FILE_CREATE_VALIDATE_OVERLAY_BASE,
-        NP560_APPLICATION_FILE_CREATE_VALIDATE_OVERLAY_SIZE,
-        "np560.data-application-file-create-validate-overlay-alias",
-        "np560.code-application-file-create-validate-overlay-alias",
+        /* Source-4F validation leaves E560..E5A1 and E5A2..E5E3 are exact
+         * contiguous functions, so expose one source-pinned union. */
+        NP560_APPLICATION_FILE_CREATE_VALIDATE_PAIR_ALIAS_SIZE,
+        "np560.data-application-file-create-validate-pair-overlay-alias",
+        "np560.code-application-file-create-validate-pair-overlay-alias",
         NP560_APPLICATION_FILE_CREATE_VALIDATE_OVERLAY_SOURCE,
-    },
-    {
-        NP560_APPLICATION_STORAGE_CONTEXT_RESOLVE_OVERLAY_BASE,
-        NP560_APPLICATION_STORAGE_CONTEXT_RESOLVE_OVERLAY_SIZE,
-        "np560.data-application-storage-context-resolve-overlay-alias",
-        "np560.code-application-storage-context-resolve-overlay-alias",
-        NP560_APPLICATION_STORAGE_CONTEXT_RESOLVE_OVERLAY_SOURCE,
     },
     {
         NP560_APPLICATION_FILE_ENTRY_BUILD_OVERLAY_BASE,
@@ -5595,6 +6857,12 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         NP560_APPLICATION_FILE_RECORD_LEAF_66EC_OVERLAY_SIZE,
         "np560.data-application-file-record-leaf-66ec-overlay-alias",
         "np560.code-application-file-record-leaf-66ec-overlay-alias",
+    },
+    {
+        NP560_APPLICATION_ROOT_OBJECT_FIELD_OVERLAY_BASE,
+        NP560_APPLICATION_ROOT_OBJECT_FIELD_OVERLAY_SIZE,
+        "np560.data-application-root-object-field-overlay-alias",
+        "np560.code-application-root-object-field-overlay-alias",
     },
     {
         NP560_APPLICATION_FILE_RECORD_LEAF_673C_OVERLAY_BASE,
@@ -5653,6 +6921,14 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         NP560_APPLICATION_GLYPH_DRAW_OVERLAY_SIZE,
         "np560.data-application-glyph-draw-overlay-alias",
         "np560.code-application-glyph-draw-overlay-alias",
+    },
+    {
+        /* Messages up to 64 bytes from the exact page renderer use the
+         * guest-installed 4C:0000 wrapped-text routine at logical 2F:0000. */
+        NP560_APPLICATION_WRAPPED_TEXT_DRAW_OVERLAY_BASE,
+        NP560_APPLICATION_WRAPPED_TEXT_DRAW_OVERLAY_SIZE,
+        "np560.data-application-wrapped-text-draw-overlay-alias",
+        "np560.code-application-wrapped-text-draw-overlay-alias",
     },
     {
         NP560_CHARACTER_DRAW_OVERLAY_BASE,
@@ -5777,19 +7053,13 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         NP560_APPLICATION_RESOURCE_OPEN_WRAPPER_OVERLAY_SIZE,
         "np560.data-application-resource-open-wrapper-overlay-alias",
         "np560.code-application-resource-open-wrapper-overlay-alias",
+        NP560_APPLICATION_RESOURCE_OPEN_WRAPPER_OVERLAY_SOURCE,
     },
     {
         NP560_APPLICATION_RESOURCE_COORDINATE_OVERLAY_BASE,
         NP560_APPLICATION_RESOURCE_COORDINATE_OVERLAY_SIZE,
         "np560.data-application-resource-coordinate-overlay-alias",
         "np560.code-application-resource-coordinate-overlay-alias",
-    },
-    {
-        NP560_INT32_DIVIDE_WRAPPER_OVERLAY_BASE,
-        NP560_INT32_DIVIDE_WRAPPER_OVERLAY_SIZE,
-        "np560.data-int32-divide-wrapper-overlay-alias",
-        "np560.code-int32-divide-wrapper-overlay-alias",
-        NP560_INT32_DIVIDE_WRAPPER_OVERLAY_SOURCE,
     },
     {
         NP560_INT32_DIVIDE_OVERLAY_BASE,
@@ -5800,17 +7070,10 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
     },
     {
         NP560_WIDE_FROM_INT16_OVERLAY_BASE,
-        NP560_WIDE_FROM_INT16_OVERLAY_SIZE,
+        NP560_WIDE_FROM_INT_COMPARE_OVERLAY_SIZE,
         "np560.data-wide-from-int16-overlay-alias",
         "np560.code-wide-from-int16-overlay-alias",
         NP560_WIDE_FROM_INT16_OVERLAY_SOURCE,
-    },
-    {
-        NP560_WIDE_COMPARE_OVERLAY_BASE,
-        NP560_WIDE_COMPARE_OVERLAY_SIZE,
-        "np560.data-wide-compare-overlay-alias",
-        "np560.code-wide-compare-overlay-alias",
-        NP560_WIDE_COMPARE_OVERLAY_SOURCE,
     },
     {
         NP560_WIDE_OPERATION_DISPATCH_OVERLAY_BASE,
@@ -5841,17 +7104,10 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
     },
     {
         NP560_WIDE_LEFT_NONZERO_OVERLAY_BASE,
-        NP560_WIDE_LEFT_NONZERO_OVERLAY_SIZE,
+        NP560_WIDE_NONZERO_OVERLAY_SIZE,
         "np560.data-wide-left-nonzero-overlay-alias",
         "np560.code-wide-left-nonzero-overlay-alias",
         NP560_WIDE_LEFT_NONZERO_OVERLAY_SOURCE,
-    },
-    {
-        NP560_WIDE_RIGHT_NONZERO_OVERLAY_BASE,
-        NP560_WIDE_RIGHT_NONZERO_OVERLAY_SIZE,
-        "np560.data-wide-right-nonzero-overlay-alias",
-        "np560.code-wide-right-nonzero-overlay-alias",
-        NP560_WIDE_RIGHT_NONZERO_OVERLAY_SOURCE,
     },
     {
         NP560_APPLICATION_PAIR_STORE_OVERLAY_BASE,
@@ -5864,12 +7120,6 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
         NP560_APPLICATION_STATE_BYTE_OVERLAY_SIZE,
         "np560.data-application-state-byte-overlay-alias",
         "np560.code-application-state-byte-overlay-alias",
-    },
-    {
-        NP560_RESIDENT_FIXED_LAUNCH_WRAPPER_OVERLAY_BASE,
-        NP560_RESIDENT_FIXED_LAUNCH_WRAPPER_OVERLAY_SIZE,
-        "np560.data-resident-fixed-launch-wrapper-overlay-alias",
-        "np560.code-resident-fixed-launch-wrapper-overlay-alias",
     },
     {
         NP560_APPLICATION_RESULT_HEADER_PARSE_OVERLAY_BASE,
@@ -5890,11 +7140,226 @@ static const NP560ProgramOverlay np560_late_overlays[] = {
 G_STATIC_ASSERT(G_N_ELEMENTS(np560_late_overlays) ==
                 NP560_LATE_OVERLAY_COUNT);
 
+typedef struct NP560LateCodeView {
+    uint32_t base;
+    uint32_t size;
+    uint32_t source;
+    bool mergeable;
+} NP560LateCodeView;
+
+static NP560LateCodeView np560_late_code_view(size_t index)
+{
+    const NP560ProgramOverlay *overlay = &np560_late_overlays[index];
+    NP560LateCodeView view = {
+        .base = overlay->base,
+        .size = overlay->size,
+        .source = overlay->code_source,
+        .mergeable = overlay->code_name != NULL,
+    };
+
+    /* Resource-buffer execution remains on the exact +0x1D source even
+     * while the data bus reuses the target banks for sector payloads. */
+    if (!view.source &&
+        overlay->base >= NP560_RESOURCE_BUFFER_CODE_BANK_BASE &&
+        overlay->base + overlay->size <=
+            NP560_RESOURCE_BUFFER_CODE_BANK_LIMIT &&
+        overlay->base !=
+            NP560_APPLICATION_OPERATION_CONTEXT_BUILD_OVERLAY_BASE &&
+        overlay->base !=
+            NP560_APPLICATION_OPERATION_NEW_JOURNEY_RANDOMIZE_OVERLAY_BASE &&
+        overlay->base !=
+            NP560_APPLICATION_OPERATION_NEW_JOURNEY_DRAW_OVERLAY_BASE) {
+        view.source = overlay->base +
+            NP560_RESOURCE_BUFFER_CODE_SOURCE_DELTA;
+    }
+
+    /* These four entries deliberately map a larger dispatch page than their
+     * writable data aperture.  Keep them independent from ordinary adjacent
+     * range coalescing. */
+    if (overlay->base ==
+        NP560_APPLICATION_OPERATION_TRANSITION_SERVICE_OVERLAY_BASE) {
+        view.base =
+            NP560_APPLICATION_OPERATION_TRANSITION_SERVICE_CODE_BASE;
+        view.size =
+            NP560_APPLICATION_OPERATION_TRANSITION_SERVICE_CODE_SIZE;
+        view.source = 0;
+        view.mergeable = false;
+    } else if (overlay->base ==
+               NP560_APPLICATION_OPERATION_TRANSITION_SERVICE_LEAF_OVERLAY_BASE) {
+        view.size =
+            NP560_APPLICATION_OPERATION_TRANSITION_SERVICE_LEAF_CODE_SIZE;
+        view.mergeable = false;
+    } else if (overlay->base ==
+               NP560_APPLICATION_OPERATION_GRID_REPOSITION_OVERLAY_BASE) {
+        view.base = NP560_APPLICATION_OPERATION_GRID_REPOSITION_CODE_BASE;
+        view.size = NP560_APPLICATION_OPERATION_GRID_REPOSITION_CODE_SIZE;
+        view.source = 0;
+        view.mergeable = false;
+    } else if (overlay->base ==
+               NP560_APPLICATION_OPERATION_SCROLL_RENDERER_OVERLAY_BASE) {
+        view.base = NP560_APPLICATION_OPERATION_SCROLL_RENDERER_CODE_BASE;
+        view.size = NP560_APPLICATION_OPERATION_SCROLL_RENDERER_CODE_SIZE;
+        view.source = 0;
+        view.mergeable = false;
+    }
+    /* Keep the arena reset entry independently addressable for explicit
+     * MP3 HLE lifetime integration; otherwise it coalesces into the
+     * preceding unlock routine and has no alias of its own. */
+    if (overlay->base == NP560_APPLICATION_DISPLAY_STATE_OVERLAY_BASE) {
+        view.mergeable = false;
+    }
+    return view;
+}
+
+static size_t np560_late_data_base_count(uint32_t base)
+{
+    size_t count = 0;
+    size_t index;
+
+    for (index = 0; index < G_N_ELEMENTS(np560_late_overlays); index++) {
+        count += np560_late_overlays[index].base == base;
+    }
+    return count;
+}
+
+static size_t np560_late_data_predecessor_count(uint32_t base)
+{
+    size_t count = 0;
+    size_t index;
+
+    for (index = 0; index < G_N_ELEMENTS(np560_late_overlays); index++) {
+        const NP560ProgramOverlay *item = &np560_late_overlays[index];
+
+        if (item->base + item->size == base &&
+            np560_late_data_base_count(item->base) == 1) {
+            count++;
+        }
+    }
+    return count;
+}
+
+/* Adjacent aliases with identical data backing are one physical range.  The
+ * old one-alias-per-function form needlessly consumed DMCU subpage sections;
+ * returning zero marks a non-root member already covered by its predecessor. */
+static uint32_t np560_late_data_union_size(size_t index)
+{
+    const NP560ProgramOverlay *overlay = &np560_late_overlays[index];
+    uint32_t end = overlay->base + overlay->size;
+
+    if (np560_late_data_base_count(overlay->base) != 1) {
+        return overlay->size;
+    }
+    if (np560_late_data_predecessor_count(overlay->base) == 1) {
+        return 0;
+    }
+    for (;;) {
+        size_t candidate = G_N_ELEMENTS(np560_late_overlays);
+        size_t count = 0;
+        size_t next;
+
+        for (next = 0; next < G_N_ELEMENTS(np560_late_overlays); next++) {
+            if (np560_late_overlays[next].base == end &&
+                np560_late_data_base_count(end) == 1 &&
+                np560_late_data_predecessor_count(end) == 1) {
+                candidate = next;
+                count++;
+            }
+        }
+        if (count != 1) {
+            break;
+        }
+        end += np560_late_overlays[candidate].size;
+    }
+    return end - overlay->base;
+}
+
+static bool np560_late_code_adjacent(const NP560LateCodeView *left,
+                                     const NP560LateCodeView *right)
+{
+    if (!left->mergeable || !right->mergeable ||
+        left->base + left->size != right->base) {
+        return false;
+    }
+    if (!left->source && !right->source) {
+        return true;
+    }
+    return left->source && right->source &&
+        left->source + left->size == right->source;
+}
+
+static size_t np560_late_code_base_count(const NP560LateCodeView *view)
+{
+    size_t count = 0;
+    size_t index;
+
+    for (index = 0; index < G_N_ELEMENTS(np560_late_overlays); index++) {
+        NP560LateCodeView item = np560_late_code_view(index);
+
+        count += item.mergeable && item.base == view->base;
+    }
+    return count;
+}
+
+static size_t np560_late_code_predecessor_count(
+    const NP560LateCodeView *view)
+{
+    size_t count = 0;
+    size_t index;
+
+    for (index = 0; index < G_N_ELEMENTS(np560_late_overlays); index++) {
+        NP560LateCodeView item = np560_late_code_view(index);
+
+        if (np560_late_code_adjacent(&item, view) &&
+            np560_late_code_base_count(&item) == 1) {
+            count++;
+        }
+    }
+    return count;
+}
+
+static uint32_t np560_late_code_union_size(size_t index)
+{
+    NP560LateCodeView view = np560_late_code_view(index);
+    NP560LateCodeView tail = view;
+
+    if (!view.mergeable) {
+        return view.size;
+    }
+    if (np560_late_code_base_count(&view) != 1) {
+        return view.size;
+    }
+    if (np560_late_code_predecessor_count(&view) == 1) {
+        return 0;
+    }
+    for (;;) {
+        size_t candidate = G_N_ELEMENTS(np560_late_overlays);
+        size_t count = 0;
+        size_t next;
+
+        for (next = 0; next < G_N_ELEMENTS(np560_late_overlays); next++) {
+            NP560LateCodeView item = np560_late_code_view(next);
+
+            if (np560_late_code_adjacent(&tail, &item) &&
+                np560_late_code_base_count(&item) == 1 &&
+                np560_late_code_predecessor_count(&item) == 1) {
+                candidate = next;
+                count++;
+            }
+        }
+        if (count != 1) {
+            break;
+        }
+        tail = np560_late_code_view(candidate);
+        view.size = tail.base + tail.size - view.base;
+    }
+    return view.size;
+}
+
 struct NP560MachineState {
     MachineState parent_obj;
     MemoryRegion code;
     MemoryRegion missing_soc_rom;
-    MemoryRegion code_internal_prefix_alias;
+    MemoryRegion code_internal_x_alias;
     MemoryRegion code_resident_record_load_overlay_alias;
     MemoryRegion code_program_alias;
     MemoryRegion code_resource_pointer_build_linked_alias;
@@ -6018,6 +7483,9 @@ struct NP560MachineState {
     MemoryRegion code_application_triple_overlay_alias;
     MemoryRegion data_application_hw_state_overlay_alias;
     MemoryRegion code_application_hw_state_overlay_alias;
+    MemoryRegion application_operation_action_ui_ram;
+    MemoryRegion application_operation_action_code_page_ram;
+    MemoryRegion code_application_operation_action_ui_tail_alias;
     MemoryRegion data_late_overlay_alias[NP560_LATE_OVERLAY_COUNT];
     MemoryRegion code_late_overlay_alias[NP560_LATE_OVERLAY_COUNT];
     MemoryRegion code_resident_root_policy_alias[
@@ -6035,6 +7503,7 @@ struct NP560MachineState {
     MemoryRegion data_init_source_075_alias;
     MemoryRegion data_init_source_07a_alias;
     MemoryRegion code_soc_rom_alias;
+    MemoryRegion data_soc_rom_alias;
     MemoryRegion data_application_post_modal_text_rom_alias;
     MemoryRegion data_application_foreground_state50_rom_alias;
     MemoryRegion code_bootrom_alias;
@@ -6046,6 +7515,22 @@ struct NP560MachineState {
     MemoryRegion data_direct_menu_text_alias;
     MemoryRegion data_resident_menu_event_table_alias;
     MemoryRegion data_resident_root_menu_controller_table_alias;
+    MemoryRegion data_resident_root_event_table_80_alias;
+    MemoryRegion data_resident_root_event_table_8e_alias;
+    MemoryRegion data_resident_game_world_controller_table_alias;
+    MemoryRegion data_resident_game_world_event_dispatch_table_alias;
+    MemoryRegion data_resident_main_action_event_table_alias;
+    MemoryRegion data_resident_application_input_event_table_alias;
+    MemoryRegion data_resident_event_e0_handler_table_alias;
+    MemoryRegion data_resident_resource_dispatch_kind_table_alias;
+    MemoryRegion data_resident_resource_dispatch_event_table_alias;
+    MemoryRegion data_resident_sound_effect_switch_event_table_alias;
+    MemoryRegion data_resident_operation_dispatch_table_alias;
+    MemoryRegion data_resident_application_page_mode_table_alias;
+    MemoryRegion data_resident_application_compare_mode_table_alias;
+    MemoryRegion data_resident_application_compare_inner_table_aliases[
+        NP560_RESIDENT_APPLICATION_COMPARE_INNER_TABLE_COUNT
+    ];
     MemoryRegion data_maskrom_resource_alias;
     MemoryRegion bootrom;
     MemoryRegion program;
@@ -6058,13 +7543,13 @@ struct NP560MachineState {
     MemoryRegion ecc_banked_alias;
     MemoryRegion adc_mmio;
     MemoryRegion adc_banked_alias;
-    MemoryRegion keyboard_gpio_mmio;
     MemoryRegion system_control_mmio;
     MemoryRegion system_control_banked_alias;
+    MemoryRegion low_sfr_mmio;
+    MemoryRegion low_sfr_banked_alias;
     MemoryRegion key_matrix_mmio;
     MemoryRegion key_matrix_banked_alias;
     MemoryRegion keyboard_mmio;
-    MemoryRegion timer_mmio;
     MemoryRegion usb_loader_region;
     MemoryRegion burn_code_region;
     MemoryRegion driver_code_region;
@@ -6077,22 +7562,32 @@ struct NP560MachineState {
     char *nand_image;
     char *nand_checkpoint;
     char *nand_save;
+    char *nand_journal;
     char *debug_data_load;
     char *debug_data_write;
     char *debug_data_save;
+    char *debug_code_save;
     char *debug_program_load;
     char *boot_mode;
+    Error *migration_blocker;
+    uint8_t *reset_data_snapshot;
+    uint8_t *reset_action_ui_snapshot;
+    uint8_t *reset_action_code_page_snapshot;
     bool rom_hle;
+    uint32_t rom_mp3_hle_base;
+    uint32_t rom_mp3_arena_image;
+    NP560MP3HLE *mp3_hle;
     bool soc_rom_skeleton;
     bool hle_ui;
+    bool firmware_vma03;
     uint32_t startup_context;
     NP560ST7529State lcd;
     NP560NANDState nand;
     NP560ECCState ecc;
     NP560ADCState adc;
     NP560KeyboardState keyboard;
-    NP560TimerState timer;
-    QEMUTimer *system_tick_timer;
+    NP560TimersState periodic_timers;
+    NP560AudioState audio;
     uint32_t adc_level;
     uint32_t external_power;
 };
@@ -6102,10 +7597,21 @@ static void np560_seed_program_overlay(NP560MachineState *s,
 {
     uint8_t *data = memory_region_get_ram_ptr(&s->data);
     uint8_t *program = memory_region_get_ram_ptr(&s->program);
+    uint32_t linked_base = DMCU_PROGRAM_BASE;
 
-    g_assert(address >= DMCU_PROGRAM_BASE);
-    g_assert(address + size <= DMCU_PROGRAM_BASE + DMCU_PROGRAM_SIZE);
-    memcpy(data + address, program + address - DMCU_PROGRAM_BASE, size);
+    /* Destinations inside the proposed 03..42 linked image have a direct
+     * same-address PRG byte range.  A handful of separately evidenced RAM
+     * overlays live above 42:FFFF; keep their legacy source-window seeding
+     * for this experiment instead of pretending the PRG extends past 4 MiB. */
+    if (s->firmware_vma03 &&
+        address >= NP560_PROGRAM_VMA03_BASE &&
+        address + size <= NP560_PROGRAM_VMA03_BASE + DMCU_PROGRAM_SIZE) {
+        linked_base = NP560_PROGRAM_VMA03_BASE;
+    }
+
+    g_assert(address >= linked_base);
+    g_assert(address + size <= linked_base + DMCU_PROGRAM_SIZE);
+    memcpy(data + address, program + address - linked_base, size);
 }
 
 static void np560_ecc_clear(NP560ECCState *ecc)
@@ -6216,11 +7722,15 @@ static uint64_t np560_adc_read(void *opaque, hwaddr offset, unsigned size)
 {
     NP560MachineState *s = opaque;
 
-    if (offset != 0) {
-        return 0;
+    if (offset >= 2) {
+        unsigned reg = offset < 4 ? DMCU_SFR_PLL : DMCU_SFR_AUDIO_PLL;
+        uint16_t value = dmcu_sfr_read_word(&s->cpu->env, reg);
+
+        return size == 1 ? (value >> ((offset & 1) * 8)) & 0xff : value;
     }
     s->adc.reads++;
-    return np560_adc_value(s);
+    return size == 1 ? (np560_adc_value(s) >> ((offset & 1) * 8)) & 0xff :
+                       np560_adc_value(s);
 }
 
 static void np560_adc_write(void *opaque, hwaddr offset, uint64_t value,
@@ -6228,10 +7738,26 @@ static void np560_adc_write(void *opaque, hwaddr offset, uint64_t value,
 {
     NP560MachineState *s = opaque;
 
-    if (offset == 0) {
-        s->adc.control = value & 0x007fu;
-        s->adc.writes++;
+    if (offset >= 2) {
+        unsigned reg = offset < 4 ? DMCU_SFR_PLL : DMCU_SFR_AUDIO_PLL;
+
+        if (size == 1) {
+            unsigned shift = (offset & 1) * 8;
+            uint16_t old = dmcu_sfr_read_word(&s->cpu->env, reg);
+
+            value = (old & ~(0xffu << shift)) | ((value & 0xff) << shift);
+        }
+        dmcu_sfr_write_word(&s->cpu->env, reg, value);
+        return;
     }
+    if (size == 1) {
+        unsigned shift = (offset & 1) * 8;
+
+        value = (s->adc.control & ~(0xffu << shift)) |
+                ((value & 0xff) << shift);
+    }
+    s->adc.control = value & 0x007fu;
+    s->adc.writes++;
 }
 
 static const MemoryRegionOps np560_adc_ops = {
@@ -6239,14 +7765,232 @@ static const MemoryRegionOps np560_adc_ops = {
     .write = np560_adc_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = {
-        .min_access_size = 2,
+        .min_access_size = 1,
         .max_access_size = 2,
     },
     .impl = {
-        .min_access_size = 2,
+        .min_access_size = 1,
         .max_access_size = 2,
     },
 };
+
+static char *np560_get_timer0_state(Object *obj, Error **errp)
+{
+    return np560_periodic_timer_state(&NP560_MACHINE(obj)->periodic_timers, 0);
+}
+
+static char *np560_get_timebase_state(Object *obj, Error **errp)
+{
+    return np560_timebase_state(&NP560_MACHINE(obj)->periodic_timers);
+}
+
+static char *np560_get_audio_pcm(Object *obj, Error **errp)
+{
+    return np560_audio_snapshot(&NP560_MACHINE(obj)->audio);
+}
+
+static uint16_t np560_sfr_device_read(void *opaque, unsigned reg, uint16_t value)
+{
+    NP560MachineState *s = opaque;
+
+    g_assert(qemu_mutex_iothread_locked());
+    return np560_timers_read(&s->periodic_timers, reg, value);
+}
+
+static void np560_sfr_device_write(void *opaque, unsigned reg,
+                                   uint16_t old_value, uint16_t value)
+{
+    NP560MachineState *s = opaque;
+
+    g_assert(qemu_mutex_iothread_locked());
+    if ((reg >= DMCU_SFR_DAC0 && reg <= DMCU_SFR_DACC) ||
+        reg == DMCU_SFR_AUDIO_PLL) {
+        np560_audio_write(&s->audio, reg, value);
+    } else {
+        np560_timers_write(&s->periodic_timers, reg, old_value, value);
+    }
+}
+
+static char *np560_get_timer1_state(Object *obj, Error **errp)
+{
+    return np560_periodic_timer_state(&NP560_MACHINE(obj)->periodic_timers, 1);
+}
+
+static char *np560_get_timer2_state(Object *obj, Error **errp)
+{
+    return np560_periodic_timer_state(&NP560_MACHINE(obj)->periodic_timers, 2);
+}
+
+static char *np560_get_dtu_state(Object *obj, Error **errp)
+{
+    CPUDMCUState *env = &NP560_MACHINE(obj)->cpu->env;
+    GString *text = g_string_new(NULL);
+    unsigned channel;
+
+    g_string_append_printf(text, "FAULT_SOURCES:%08x", env->dtu_fault_sources);
+    for (channel = 0; channel < DMCU_DTU_CHANNELS; channel++) {
+        g_string_append_printf(text, " CH%u:%04x/%" PRIu64 "/%" PRIu64,
+                               channel, env->sfr[DMCU_DTUC_FIRST + channel],
+                               env->dtu_transfers[channel],
+                               env->dtu_completions[channel]);
+    }
+    /* Raw, read-only ICR latches: memory dumps may show RAM backing rather
+     * than device registers. Do not acknowledge requests while observing. */
+    g_string_append_printf(text, " ICR60:%04x ICR61:%04x",
+                           env->sfr[0x60], env->sfr[0x61]);
+    return g_string_free(text, false);
+}
+
+static bool np560_get_dtu_refill_trace(Object *obj, Error **errp)
+{
+    return NP560_MACHINE(obj)->cpu->dtu_refill_trace_enabled;
+}
+
+static bool np560_get_control_observers_minimal(Object *obj, Error **errp)
+{
+    return NP560_MACHINE(obj)->cpu->control_observers_minimal;
+}
+
+static bool np560_get_instruction_clock(Object *obj, Error **errp)
+{
+    return NP560_MACHINE(obj)->cpu->instruction_clock_enabled;
+}
+
+static void np560_set_instruction_clock(Object *obj, bool enabled, Error **errp)
+{
+    DMCUCPU *cpu = NP560_MACHINE(obj)->cpu;
+
+    if (runstate_is_running()) {
+        error_setg(errp, "Pause the CPU before changing instruction clock");
+        return;
+    }
+    if (enabled && (icount_enabled() != 1 || icount_to_ns(1) != 1 ||
+                    replay_mode != REPLAY_MODE_NONE ||
+                    MACHINE(obj)->smp.cpus != 1)) {
+        error_setg(errp, "Instruction clock requires one CPU, fixed icount shift=0, no replay");
+        return;
+    }
+    if (icount_enabled() && icount_get_raw() != 0) {
+        error_setg(errp, "Instruction clock can only be selected before first execution");
+        return;
+    }
+    if (enabled && (cpu->rom_hle_enabled || cpu->hle_ui_enabled)) {
+        error_setg(errp, "Instruction clock cannot use legacy ROM/UI HLE");
+        return;
+    }
+    cpu->instruction_clock_enabled = enabled;
+    cpu->env.instruction_clock_enabled = enabled;
+}
+
+static char *np560_get_instruction_clock_state(Object *obj, Error **errp)
+{
+    CPUDMCUState *env = &NP560_MACHINE(obj)->cpu->env;
+
+    return g_strdup_printf("ENABLED:%u MODEL:documented-partial-v1 HZ:%u "
+        "INSTRUCTIONS:%" PRIu64 " NS:%" PRIu64 " FRACTION:%08x FAULT:%u "
+        "CYCLES:%" PRIu64 " DATA_WAITS:%" PRIu64 " EXTERNAL_DATA:%" PRIu64
+        " UNKNOWN_MAP:%" PRIu64 " UNKNOWN_COST:%" PRIu64 " LAST_UNKNOWN:%04x",
+        env->instruction_clock_enabled, dmcu_system_clock_hz(env),
+        env->instruction_clock_count, env->instruction_clock_ns,
+        env->instruction_clock_fraction, env->instruction_clock_fault,
+        env->instruction_clock_cycles, env->instruction_clock_data_waits,
+        env->instruction_clock_external_data, env->instruction_clock_unknown_map,
+        env->instruction_clock_unknown, env->instruction_clock_last_unknown);
+}
+
+static void np560_set_control_observers_minimal(Object *obj, bool enabled,
+                                               Error **errp)
+{
+    DMCUCPU *cpu = NP560_MACHINE(obj)->cpu;
+
+    if (runstate_is_running()) {
+        error_setg(errp, "Pause the CPU before changing control observers");
+        return;
+    }
+    if (enabled && (cpu->rom_hle_enabled || cpu->hle_ui_enabled)) {
+        error_setg(errp, "Minimal observers are not supported with legacy ROM/UI HLE");
+        return;
+    }
+    cpu->control_observers_minimal = enabled;
+    cpu->env.control_observers_minimal = enabled;
+}
+
+static void np560_set_dtu_refill_trace(Object *obj, bool enabled, Error **errp)
+{
+    NP560_MACHINE(obj)->cpu->dtu_refill_trace_enabled = enabled;
+}
+
+static char *np560_get_dtu_refill_state(Object *obj, Error **errp)
+{
+    return dmcu_dtu_refill_state(NP560_MACHINE(obj)->cpu);
+}
+
+static char *np560_get_dtu_config_trace(Object *obj, Error **errp)
+{
+    CPUDMCUState *env = &NP560_MACHINE(obj)->cpu->env;
+    uint64_t first = env->dtu_config_count -
+        MIN(env->dtu_config_count, DMCU_DTU_CONFIG_TRACE_SLOTS);
+    GString *text = g_string_new(NULL);
+    uint64_t seq;
+    unsigned i;
+
+    g_string_append_printf(text, "{\"count\":%" PRIu64 ",\"events\":[",
+                           env->dtu_config_count);
+    for (seq = first; seq < env->dtu_config_count; seq++) {
+        DMCUDTUConfigEvent *e = &env->dtu_config_trace[
+            seq % DMCU_DTU_CONFIG_TRACE_SLOTS];
+        g_string_append_printf(text,
+            "%s{\"seq\":%" PRIu64 ",\"pc\":%u,\"reg\":%u,\"old\":%u,"
+            "\"value\":%u,\"sp\":%u,\"fp\":%u,\"ds0\":%u,\"ds1\":%u,"
+            "\"irq\":%s,\"stack\":[", seq == first ? "" : ",", seq, e->pc,
+            e->reg, e->old_value, e->value, e->sp, e->fp, e->ds0, e->ds1,
+            e->in_interrupt ? "true" : "false");
+        for (i = 0; i < ARRAY_SIZE(e->stack); i++) {
+            g_string_append_printf(text, "%s%u", i ? "," : "", e->stack[i]);
+        }
+        g_string_append(text, "],\"dtu\":[");
+        for (i = 0; i < ARRAY_SIZE(e->dtu); i++) {
+            g_string_append_printf(text, "%s%u", i ? "," : "", e->dtu[i]);
+        }
+        g_string_append(text, "]}");
+    }
+    g_string_append(text, "]}");
+    return g_string_free(text, false);
+}
+
+static char *np560_get_audio_file_trace(Object *obj, Error **errp)
+{
+    CPUDMCUState *env = &NP560_MACHINE(obj)->cpu->env;
+    uint64_t first = env->audio_file_count -
+        MIN(env->audio_file_count, DMCU_AUDIO_FILE_TRACE_SLOTS);
+    GString *text = g_string_new(NULL);
+    uint64_t seq;
+    unsigned i, array;
+
+    g_string_append_printf(text, "{\"count\":%" PRIu64 ",\"events\":[", env->audio_file_count);
+    for (seq = first; seq < env->audio_file_count; seq++) {
+        DMCUAudioFileEvent *e = &env->audio_file_trace[seq % DMCU_AUDIO_FILE_TRACE_SLOTS];
+        const uint16_t *values[] = {e->gpr, e->stack, e->locals, e->flags};
+        const char *names[] = {"gpr", "stack", "locals", "flags"};
+        const unsigned sizes[] = {ARRAY_SIZE(e->gpr), ARRAY_SIZE(e->stack),
+                                  ARRAY_SIZE(e->locals), ARRAY_SIZE(e->flags)};
+        g_string_append_printf(text,
+            "%s{\"seq\":%" PRIu64 ",\"pc\":%u,\"previous_pc\":%u,"
+            "\"sp\":%u,\"fp\":%u,\"ds0\":%u,\"ds1\":%u,\"psw\":%u,\"irq\":%s",
+            seq == first ? "" : ",", seq, e->pc, e->previous_pc, e->sp, e->fp,
+            e->ds0, e->ds1, e->psw, e->in_interrupt ? "true" : "false");
+        for (array = 0; array < ARRAY_SIZE(values); array++) {
+            g_string_append_printf(text, ",\"%s\":[", names[array]);
+            for (i = 0; i < sizes[array]; i++) {
+                g_string_append_printf(text, "%s%u", i ? "," : "", values[array][i]);
+            }
+            g_string_append(text, "]");
+        }
+        g_string_append(text, "}");
+    }
+    g_string_append(text, "]}");
+    return g_string_free(text, false);
+}
 
 static uint32_t np560_nand_page(const NP560NANDState *nand)
 {
@@ -6283,6 +8027,21 @@ static void np560_nand_set_failure(NP560NANDState *nand, uint16_t error)
 {
     nand->status = 0;
     nand->error = error;
+}
+
+static bool np560_nand_commit(NP560NANDState *nand, unsigned operation,
+                              uint32_t page, uint32_t column,
+                              const uint8_t *bytes, uint32_t length)
+{
+    Error *error = NULL;
+
+    if (!np560_nand_journal_append(nand->journal, operation, page, column,
+                                  bytes, length, &error)) {
+        error_report_err(error);
+        np560_nand_set_failure(nand, NP560_NAND_ERROR_BACKING);
+        return false;
+    }
+    return true;
 }
 
 static bool np560_nand_validate_transfer(NP560NANDState *nand,
@@ -6663,6 +8422,20 @@ static void np560_nand_execute(NP560MachineState *s)
                                  np560_nand_is_oob_stream(nand) ?
                                  oob_stream : page_bytes + column,
                                  nand->length);
+        if (env && page == 0x1004bu && column == 0 &&
+            nand->length == NP560_NAND_PAGE_TOTAL) {
+            /* The isolated hero-game checkpoint maps the first sector of
+             * application-directory cluster 5 to this physical page.  Arm a
+             * bounded read-only control trace at each exact DMA completion so
+             * the directory parser/filter path survives later UI redraws.
+             * The latest read is the one immediately preceding the browser
+             * controller.  No guest-visible state is modified. */
+            env->control_trace_count = 0;
+            env->control_trace_frozen = false;
+            env->npe_directory_trace_remaining = DMCU_CONTROL_TRACE_WORDS;
+            env->npe_directory_trace_triggered = true;
+            env->npe_directory_data_read_count = 0;
+        }
         if (!np560_nand_is_oob_stream(nand)) {
             np560_nand_trace_cafe_record(nand, trace_slot,
                                          page_bytes + column,
@@ -6722,6 +8495,10 @@ static void np560_nand_execute(NP560MachineState *s)
             }
             np560_nand_trace_payload(nand, trace_slot, oob_stream,
                                      nand->length);
+            if (!np560_nand_commit(nand, NP560_JOURNAL_OOB, page, column,
+                                   oob_stream, nand->length)) {
+                return;
+            }
             for (copied = 0; copied < nand->length; copied++) {
                 size_t offset = column - NP560_NAND_PAGE_DATA + copied;
                 uint32_t target_page =
@@ -6771,6 +8548,10 @@ static void np560_nand_execute(NP560MachineState *s)
         np560_nand_trace_maskrom(nand, env, page_bytes + column,
                                  nand->length, page, logical_buffer);
         /* NAND programming can only change one bits to zero bits. */
+        if (!np560_nand_commit(nand, NP560_JOURNAL_PROGRAM, page, column,
+                               page_bytes + column, nand->length)) {
+            return;
+        }
         for (i = column; i < column + nand->length; i++) {
             if (i < NP560_NAND_PAGE_DATA) {
                 nand->data[(size_t)page * NP560_NAND_PAGE_DATA + i] &=
@@ -6818,6 +8599,9 @@ static void np560_nand_execute(NP560MachineState *s)
             nand->page3f_erase_flags = nand->trace_flags[trace_slot];
             np560_nand_log_page3f_event(nand, trace_slot, "erase");
         }
+        if (!np560_nand_commit(nand, NP560_JOURNAL_ERASE, page, 0, NULL, 0)) {
+            return;
+        }
         memset(nand->data + (size_t)page * NP560_NAND_PAGE_DATA, 0xff,
                NP560_NAND_PAGES_PER_BLOCK * NP560_NAND_PAGE_DATA);
         memset(nand->oob + (size_t)page * NP560_NAND_PAGE_OOB, 0xff,
@@ -6850,6 +8634,10 @@ static void np560_nand_execute(NP560MachineState *s)
         np560_nand_trace_maskrom(nand, env, page_bytes,
                                  NP560_NAND_PAGE_TOTAL, destination, buffer);
         /* Copy-back is still NAND programming: only one-to-zero changes. */
+        if (!np560_nand_commit(nand, NP560_JOURNAL_PROGRAM, destination, 0,
+                               page_bytes, NP560_NAND_PAGE_TOTAL)) {
+            return;
+        }
         for (i = 0; i < NP560_NAND_PAGE_TOTAL; i++) {
             if (i < NP560_NAND_PAGE_DATA) {
                 nand->data[(size_t)destination * NP560_NAND_PAGE_DATA + i] &=
@@ -7023,111 +8811,55 @@ static const MemoryRegionOps np560_nand_ops = {
     },
 };
 
-/*
- * Three unbanked 16-bit down-counters at 0494/0496/0498.  The shipped guest
- * converts milliseconds to (milliseconds * 64) / 1000 before programming
- * these words, and its event paths test each word for zero.  Keep the
- * counters in the SoC model: resident/application code observes ordinary
- * hardware reads and no SCALL is intercepted.
- */
-static void np560_schedule_system_tick(NP560MachineState *s)
+/* Diagnostic view of software counters owned by original 08:40D0. These
+ * are ordinary SRAM, never decremented by a host timer or a memory hook. */
+static uint16_t np560_timer_remaining(NP560MachineState *s, unsigned index)
 {
-    if (s->system_tick_timer) {
-        timer_mod(s->system_tick_timer,
-                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                  NANOSECONDS_PER_SECOND / NP560_TIMER_FREQUENCY);
-    }
+    g_assert(index < 3);
+    return lduw_le_p(s->cpu->internal_data + 0x0494 + index * 2);
 }
 
-static void np560_system_tick(void *opaque)
+/* The published ICR map and original Timer2 driver agree on
+ * memory_address = F100 + 2 * direct_register for the low SFR bank.
+ * This is a fallback below dedicated board devices, not another RAM copy.
+ * Higher-priority GPIO/system-control devices retain their own pin/IRQ
+ * semantics; their direct-register views still require integration. */
+static uint64_t np560_low_sfr_read(void *opaque, hwaddr offset, unsigned size)
 {
     NP560MachineState *s = opaque;
+    uint16_t value = dmcu_sfr_read_word(&s->cpu->env, offset >> 1);
 
-    s->timer.irq_ticks++;
-    if (s->timer.irq_enabled && s->cpu) {
-        s->timer.irq_requests++;
-        cpu_interrupt(CPU(s->cpu), CPU_INTERRUPT_HARD);
-    }
-    np560_schedule_system_tick(s);
+    return size == 1 ? (value >> ((offset & 1) * 8)) & 0xff : value;
 }
 
-static void np560_timer_reset(void *opaque)
+static void np560_low_sfr_write(void *opaque, hwaddr offset, uint64_t value,
+                                 unsigned size)
 {
     NP560MachineState *s = opaque;
+    unsigned reg = offset >> 1;
 
-    memset(&s->timer, 0, sizeof(s->timer));
-    np560_schedule_system_tick(s);
+    if (size == 1) {
+        unsigned shift = (offset & 1) * 8;
+        uint16_t old = dmcu_sfr_read_word(&s->cpu->env, reg);
+
+        value = (old & ~(0xffu << shift)) | ((value & 0xff) << shift);
+    }
+    dmcu_sfr_write_word(&s->cpu->env, reg, value);
 }
 
-static uint16_t np560_timer_remaining(NP560TimerState *timer, unsigned index)
-{
-    int64_t now;
-    int64_t delta;
-
-    if (index >= NP560_TIMER_COUNT || !timer->initial[index]) {
-        return 0;
-    }
-    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    delta = timer->deadline_ns[index] - now;
-    if (delta <= 0) {
-        return 0;
-    }
-    return MIN((uint64_t)timer->initial[index],
-               ((uint64_t)delta * NP560_TIMER_FREQUENCY +
-                NANOSECONDS_PER_SECOND - 1) / NANOSECONDS_PER_SECOND);
-}
-
-static uint64_t np560_timer_read(void *opaque, hwaddr offset, unsigned size)
-{
-    NP560MachineState *s = opaque;
-
-    return np560_timer_remaining(&s->timer, offset >> 1);
-}
-
-static void np560_timer_write(void *opaque, hwaddr offset, uint64_t value,
-                              unsigned size)
-{
-    NP560MachineState *s = opaque;
-    unsigned index = offset >> 1;
-    uint16_t count = value;
-
-    if (index >= NP560_TIMER_COUNT) {
-        return;
-    }
-    s->timer.initial[index] = count;
-    if (count) {
-        s->timer.deadline_ns[index] =
-            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-            DIV_ROUND_UP((uint64_t)count * NANOSECONDS_PER_SECOND,
-                         NP560_TIMER_FREQUENCY);
-    } else {
-        s->timer.deadline_ns[index] = 0;
-    }
-}
-
-static const MemoryRegionOps np560_timer_ops = {
-    .read = np560_timer_read,
-    .write = np560_timer_write,
+static const MemoryRegionOps np560_low_sfr_ops = {
+    .read = np560_low_sfr_read,
+    .write = np560_low_sfr_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid = {
-        .min_access_size = 2,
-        .max_access_size = 2,
-    },
-    .impl = {
-        .min_access_size = 2,
-        .max_access_size = 2,
-    },
+    .valid = { .min_access_size = 1, .max_access_size = 2 },
+    .impl = { .min_access_size = 1, .max_access_size = 2 },
 };
 
-/*
- * F010 is a combined board-input word, not a plain five-bit GPIO register.
- * The shipped PRG tests its low nibble for the active storage unit (4 is the
- * internal NP560+ medium).  The exact 31:D9AA routine called once per resident
- * dispatcher pass samples 0010/0020/0040/0080/0800, matching the product's
- * documented five-way navigation key.  Other code compares 4xxx/8xxx values,
- * but there is not yet evidence that those high bits mean key release/press;
- * do not synthesize them.  The private F340 latch remains only for obsolete
- * segment-03 diagnostics and is not used by the strict resident scheduler.
+/* Physical keyboard input is exposed by the F160/F164 matrix. F010 is
+ * ordinary DPRAM: original 08:3292 writes the stopped audio state 4 there,
+ * 08:2F22 writes mode flags, and BIT[88] updates that very same word.
+ * Original 31:D9AA inspects those software flags; it is not a GPIO reader.
+ * The private F340 latch remains only for obsolete segment-03 diagnostics.
  */
 static void np560_keyboard_reset(void *opaque)
 {
@@ -7135,6 +8867,7 @@ static void np560_keyboard_reset(void *opaque)
 
     memset(&s->keyboard, 0, sizeof(s->keyboard));
     s->keyboard.matrix_drive = 0xffff;
+    qatomic_set(&s->keyboard.matrix_pulse_index, 64);
     if (s->cpu) {
         s->cpu->env.web_key_state = 0;
         s->cpu->env.web_key_code = 0;
@@ -7165,126 +8898,17 @@ static uint16_t np560_keyboard_event(uint32_t raw)
     }
 }
 
-static uint16_t np560_keyboard_key_bits(uint32_t keys)
-{
-    /* Web key-state bits: Up, Down, Left, Right, Enter, in the order sampled
-     * by the exact five-input 31:D9AA resident activity scanner. */
-    if (keys & (1u << 0)) {
-        return 0x0010;
-    }
-    if (keys & (1u << 1)) {
-        return 0x0020;
-    }
-    if (keys & (1u << 2)) {
-        return 0x0040;
-    }
-    if (keys & (1u << 3)) {
-        return 0x0080;
-    }
-    if (keys & (1u << 4)) {
-        return 0x0800;
-    }
-    return 0;
-}
-
-static uint16_t np560_keyboard_gpio_state(uint32_t keys)
-{
-    uint16_t key_bits = np560_keyboard_key_bits(keys);
-
-    /* 0004 is the evidenced idle/internal-storage selector. */
-    return 0x0004 | key_bits;
-}
-
-static uint16_t np560_keyboard_gpio_event(uint16_t state)
-{
-    switch (state & 0x0ff0) {
-    case 0x0010:
-        return 0x0082;
-    case 0x0020:
-        return 0x0083;
-    case 0x0040:
-        return 0x0084;
-    case 0x0080:
-    case 0x0800:
-        return 0x0085;
-    default:
-        return 0;
-    }
-}
-
-static uint64_t np560_keyboard_gpio_read(void *opaque, hwaddr offset,
-                                         unsigned size)
-{
-    NP560MachineState *s = opaque;
-    CPUDMCUState *env = &s->cpu->env;
-    uint16_t key_bits = np560_keyboard_key_bits(env->web_key_state);
-    uint16_t state;
-
-    /* Count a physical assertion once, even though the guest samples F010
-     * repeatedly.  The idle storage selector (0004) is not a key event. */
-    if (key_bits != s->keyboard.last_gpio_state) {
-        if (key_bits) {
-            uint16_t event = np560_keyboard_event(env->web_key_code);
-
-            if (!event) {
-                event = np560_keyboard_gpio_event(key_bits);
-            }
-            s->keyboard.last_event = event;
-            s->keyboard.events_read++;
-        }
-        s->keyboard.last_gpio_state = key_bits;
-    }
-    state = np560_keyboard_gpio_state(env->web_key_state);
-    s->keyboard.gpio_reads++;
-    if (state != 0x0004) {
-        uint32_t slot = s->keyboard.trace_index++ % NP560_KEYBOARD_TRACE;
-
-        s->keyboard.trace_pc[slot] = env->pc & 0x00ffffffu;
-        s->keyboard.trace_value[slot] = state;
-    }
-    return state;
-}
-
-static void np560_keyboard_gpio_write(void *opaque, hwaddr offset,
-                                      uint64_t value, unsigned size)
-{
-    NP560MachineState *s = opaque;
-
-    /* The strict application also reaches F010 through a banked data
-     * mapping.  The available firmware proves that writes are accepted, but
-     * not yet which output/configuration bits are externally observable.
-     * Preserve that evidence without changing the input pins returned by
-     * the read path.  Supplying a write callback is also required by QEMU's
-     * MMIO dispatch; a read-only MemoryRegionOps would call a null handler. */
-    s->keyboard.gpio_writes++;
-    s->keyboard.gpio_last_write = value & 0xffff;
-    s->keyboard.gpio_last_write_pc = s->cpu->env.pc & 0x00ffffffu;
-}
-
-static const MemoryRegionOps np560_keyboard_gpio_ops = {
-    .read = np560_keyboard_gpio_read,
-    .write = np560_keyboard_gpio_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid = {
-        .min_access_size = 2,
-        .max_access_size = 2,
-    },
-    .impl = {
-        .min_access_size = 2,
-        .max_access_size = 2,
-    },
-};
-
-/* F100 bit 15 enables the 64-Hz system interrupt used by the exact 08:40D0
- * vector.  Application startup writes A082 after installing callback
- * 27:E528.  Keeping the enable in the device contract prevents timer IRQs
- * from reaching an uninitialised overlay during reset/loader execution. */
+/* F100 and direct REG[00] are the same architectural SOCR. In particular,
+ * BCLR BIT[00].15 must mask interrupts even after an earlier MMIO write.
+ * Timer requests are routed through their ICRs, independently of this view. */
 static uint64_t np560_system_control_read(void *opaque, hwaddr offset,
                                          unsigned size)
 {
     NP560MachineState *s = opaque;
 
-    return s->keyboard.system_control;
+    uint16_t value = dmcu_sfr_read_word(&s->cpu->env, DMCU_SFR_SOCR);
+
+    return (value >> (offset * 8)) & (size == 1 ? 0xff : 0xffff);
 }
 
 static void np560_system_control_write(void *opaque, hwaddr offset,
@@ -7294,6 +8918,13 @@ static void np560_system_control_write(void *opaque, hwaddr offset,
     CPUDMCUState *env = &s->cpu->env;
     uint32_t trace = s->keyboard.system_control_trace_index++;
     uint32_t slot = trace % NP560_SYSTEM_CONTROL_TRACE;
+    uint16_t old = dmcu_sfr_read_word(env, DMCU_SFR_SOCR);
+
+    if (size == 1) {
+        unsigned shift = offset * 8;
+
+        value = (old & ~(0xffu << shift)) | ((value & 0xff) << shift);
+    }
 
     /*
      * Keep a bounded, observer-only history while the F100 contract is being
@@ -7306,8 +8937,7 @@ static void np560_system_control_write(void *opaque, hwaddr offset,
         env->current_instruction_pc & 0x00ffffffu;
     s->keyboard.system_control_trace_next_pc[slot] =
         env->pc & 0x00ffffffu;
-    s->keyboard.system_control_trace_old[slot] =
-        s->keyboard.system_control;
+    s->keyboard.system_control_trace_old[slot] = old;
     s->keyboard.system_control_trace_new[slot] = value;
     s->keyboard.system_control_trace_ds0[slot] =
         env->sfr[DMCU_SFR_DS0] & 0x1ff;
@@ -7315,8 +8945,7 @@ static void np560_system_control_write(void *opaque, hwaddr offset,
         env->sfr[DMCU_SFR_DS1] & 0x1ff;
     s->keyboard.system_control_trace_in_interrupt[slot] = env->in_interrupt;
 
-    s->keyboard.system_control = value;
-    s->timer.irq_enabled = (value & 0x8000) != 0;
+    dmcu_sfr_write_word(env, DMCU_SFR_SOCR, value);
 }
 
 static const MemoryRegionOps np560_system_control_ops = {
@@ -7324,23 +8953,25 @@ static const MemoryRegionOps np560_system_control_ops = {
     .write = np560_system_control_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = {
-        .min_access_size = 2,
+        .min_access_size = 1,
         .max_access_size = 2,
     },
     .impl = {
-        .min_access_size = 2,
+        .min_access_size = 1,
         .max_access_size = 2,
     },
 };
 
+static const uint16_t np560_matrix_row_masks[8] = {
+    0x0004, 0x0008, 0x0010, 0x0020,
+    0x0040, 0x0080, 0x4000, 0x8000,
+};
+
 static uint16_t np560_key_matrix_input(const NP560MachineState *s,
-                                       uint16_t drive)
+                                       uint16_t drive,
+                                       uint32_t pulse_index)
 {
     const CPUDMCUState *env = &s->cpu->env;
-    static const uint16_t row_masks[8] = {
-        0x0004, 0x0008, 0x0010, 0x0020,
-        0x0040, 0x0080, 0x4000, 0x8000,
-    };
     uint64_t matrix = ((uint64_t)env->web_matrix_state_high << 32) |
                       env->web_matrix_state_low;
     uint32_t keys = env->web_key_state;
@@ -7352,6 +8983,10 @@ static uint16_t np560_key_matrix_input(const NP560MachineState *s,
      * discarding it or assuming a fixed board state. */
     uint16_t input = 0x00ff | (s->external_power ? 0x1000 : 0);
     unsigned index;
+
+    if (pulse_index < 64) {
+        matrix |= 1ull << pulse_index;
+    }
 
     /* 50:5416 supplies the eight F164 row strobes and 50:5426 the eight
      * active-low F160 column masks used by exact scanner 2E:5F28.  The raw
@@ -7377,7 +9012,7 @@ static uint16_t np560_key_matrix_input(const NP560MachineState *s,
      * therefore active-low.  Combine columns when multiple keys in the same
      * selected row are held, matching a passive keyboard matrix. */
     for (index = 0; index < 64; index++) {
-        uint16_t row = row_masks[index & 7];
+        uint16_t row = np560_matrix_row_masks[index & 7];
         uint16_t column = 1u << (index >> 3);
 
         if ((matrix & (1ull << index)) && !(drive & row)) {
@@ -7396,7 +9031,26 @@ static uint64_t np560_key_matrix_read(void *opaque, hwaddr offset,
     s->keyboard.matrix_reads++;
     switch (offset) {
     case 0x00:
-        input = np560_key_matrix_input(s, s->keyboard.matrix_drive);
+        {
+            uint32_t pulse_index = qatomic_read(
+                &s->keyboard.matrix_pulse_index);
+
+            input = np560_key_matrix_input(s, s->keyboard.matrix_drive,
+                                           pulse_index);
+        /* 44:E528 first samples F160 with the idle 3F00 drive, for which all
+         * eight row strobes appear selected, before calling the exact
+         * 2E:5F28 row scanner.  Do not consume a pulse on that pre-read.
+         * Release it only after a drive with exactly its one row selected
+         * has been sampled, so the guest sees one physical scan and then a
+         * natural all-released matrix on the next scan. */
+            uint16_t selected = (~s->keyboard.matrix_drive) & 0xc0fc;
+
+            if (pulse_index < 64 &&
+                selected == np560_matrix_row_masks[pulse_index & 7]) {
+                qatomic_cmpxchg(&s->keyboard.matrix_pulse_index,
+                                pulse_index, 64);
+            }
+        }
         if ((input & 0x00ff) != 0x00ff) {
             s->keyboard.matrix_active_reads++;
             s->keyboard.matrix_last_active_drive = s->keyboard.matrix_drive;
@@ -7501,14 +9155,32 @@ static void np560_st7529_reset(void *opaque)
     NP560ST7529State *lcd = &s->lcd;
 
     memset(lcd, 0, sizeof(*lcd));
-    lcd->column_end = NP560_ST7529_RAM_COLUMNS - 1;
-    lcd->line_end = NP560_ST7529_RAM_LINES - 1;
+    /* ST7529 v1.8 pp34-35: reset selects 2B3P and a zero/zero window.
+     * The original driver explicitly programs its 3B3P mode and window. */
+    lcd->scan[2] = 1;
+    lcd->area_scroll[3] = 3; /* Reset selects whole-screen scroll mode. */
     lcd->display_lines = 4;
     lcd->sleeping = true;
 }
 
-static uint8_t np560_st7529_parameter_count(uint8_t command)
+static uint8_t np560_st7529_parameter_count(uint8_t command, bool extended)
 {
+    /* ST7529 v1.8 pp36-38,50: only EXT IN/OUT are shared commands.
+     * In particular, 20 is PWRCTRL with one byte in EXT=0, but a complete
+     * 16-entry odd-frame gray table in EXT=1. */
+    if (extended) {
+        switch (command) {
+        case 0x20: /* Gray 1 Set */
+        case 0x21: /* Gray 2 Set */
+            return 16;
+        case 0x32: /* ANASET; analog behavior is not yet modeled. */
+            return 3;
+        case 0xcd: /* EPCTIN; EEPROM behavior is not yet modeled. */
+            return 1;
+        default:
+            return 0;
+        }
+    }
     switch (command) {
     case 0x15: /* CASET */
     case 0x75: /* LASET */
@@ -7521,7 +9193,7 @@ static uint8_t np560_st7529_parameter_count(uint8_t command)
     case 0x20: /* PWRCTRL */
     case 0xab: /* SCSTART */
     case 0xbb: /* COMSCN */
-    case 0xcd: /* EPCTL */
+    case 0x07: /* EPINT */
         return 1;
     case 0xaa: /* ASCSET */
         return 4;
@@ -7532,6 +9204,21 @@ static uint8_t np560_st7529_parameter_count(uint8_t command)
 
 static void np560_st7529_apply_parameters(NP560ST7529State *lcd)
 {
+    if (lcd->extended) {
+        if (lcd->command == 0x20 || lcd->command == 0x21) {
+            unsigned bank = lcd->command - 0x20;
+            unsigned i;
+
+            /* PB1..PB16 each contain one 5-bit PWM value. Preserve the
+             * programmed registers, without inventing the undocumented
+             * 32-code-to-16-level FRC selection or analog transfer curve. */
+            for (i = 0; i < 16; i++) {
+                lcd->gray_pwm[bank][i] = lcd->parameters[i] & 0x1f;
+            }
+            lcd->gray_pwm_programmed[bank] = true;
+        }
+        return;
+    }
     switch (lcd->command) {
     case 0x15: /* Column addresses select groups of three SEG pixels. */
         lcd->column_start = MIN(lcd->parameters[0],
@@ -7553,6 +9240,10 @@ static void np560_st7529_apply_parameters(NP560ST7529State *lcd)
         break;
     case 0xbc:
         memcpy(lcd->scan, lcd->parameters, sizeof(lcd->scan));
+        if ((lcd->scan[2] & 7) != 1 && (lcd->scan[2] & 7) != 2) {
+            qemu_log_mask(LOG_UNIMP, "ST7529 unsupported gray-scale mode %u\n",
+                          lcd->scan[2] & 7);
+        }
         break;
     case 0xbb:
         lcd->com_scan = lcd->parameters[0] & 7;
@@ -7562,11 +9253,27 @@ static void np560_st7529_apply_parameters(NP560ST7529State *lcd)
             ((lcd->parameters[1] & 0x3f) + 1u) * 4u,
             NP560_ST7529_RAM_LINES);
         break;
-    case 0xa8:
-        lcd->partial_start = lcd->parameters[0] & 0x3f;
-        lcd->partial_end = lcd->parameters[1] & 0x3f;
+    case 0xa8: {
+        unsigned start = lcd->parameters[0] & 0x3f;
+        unsigned end = lcd->parameters[1] & 0x3f;
+
+        /* Section 7.5: out-of-range partial settings are no operation.
+         * Addresses are four-line RAM blocks, not individual panel rows. */
+        if (start >= NP560_ST7529_RAM_LINES / 4 ||
+            end >= NP560_ST7529_RAM_LINES / 4) {
+            break;
+        }
+        if (start > end) {
+            qemu_log_mask(LOG_UNIMP,
+                          "ST7529 reversed partial range %u..%u\n",
+                          start, end);
+            break;
+        }
+        lcd->partial_start = start;
+        lcd->partial_end = end;
         lcd->partial_display = true;
         break;
+    }
     case 0xaa:
         memcpy(lcd->area_scroll, lcd->parameters,
                sizeof(lcd->area_scroll));
@@ -7584,17 +9291,26 @@ static void np560_st7529_command(NP560ST7529State *lcd, uint8_t command)
     lcd->command = command;
     lcd->command_writes++;
     lcd->parameter_index = 0;
-    lcd->parameter_count = np560_st7529_parameter_count(command);
+    lcd->parameter_count = np560_st7529_parameter_count(command, lcd->extended);
     lcd->ram_write = false;
     lcd->ram_read = false;
+    lcd->read_modify_write = false;
+    /* Any command terminates the RAM transfer, including an incomplete
+     * pixel group. A later RAMWR/RAMRD starts at byte zero, not the old phase. */
+    lcd->pixel = 0;
+    lcd->read_pixel = 0;
+    lcd->write_latch = 0;
+
+    if (command == 0x30 || command == 0x31) {
+        lcd->extended = command == 0x31;
+        return;
+    }
+    if (lcd->extended) {
+        /* Do not execute ordinary RAM/display commands in the EXT=1 bank. */
+        return;
+    }
 
     switch (command) {
-    case 0x30: /* EXT=0 */
-        lcd->extended = false;
-        break;
-    case 0x31: /* EXT=1 */
-        lcd->extended = true;
-        break;
     case 0x5c: /* RAMWR */
         lcd->column = lcd->column_start;
         lcd->line = lcd->line_start;
@@ -7606,6 +9322,17 @@ static void np560_st7529_command(NP560ST7529State *lcd, uint8_t command)
         lcd->line = lcd->line_start;
         lcd->pixel = 0;
         lcd->ram_read = true;
+        break;
+    case 0xe0: /* RMWIN, EXT=0 (ST7529 v1.8 pp45-46, example p63). */
+        if (!lcd->extended) {
+            lcd->column = lcd->column_start;
+            lcd->line = lcd->line_start;
+            lcd->read_modify_write = true;
+            lcd->ram_read = true;
+            lcd->ram_write = true;
+        }
+        break;
+    case 0xee: /* RMWOUT; like any command, cancels the mode above. */
         break;
     case 0x94: /* SLPOUT */
         lcd->sleeping = false;
@@ -7633,15 +9360,9 @@ static void np560_st7529_command(NP560ST7529State *lcd, uint8_t command)
     }
 }
 
-static bool np560_st7529_advance(NP560ST7529State *lcd)
+static bool np560_st7529_advance_group(NP560ST7529State *lcd)
 {
     bool wrapped = false;
-
-    lcd->pixel++;
-    if (lcd->pixel < NP560_ST7529_PIXELS_PER_COLUMN) {
-        return false;
-    }
-    lcd->pixel = 0;
 
     /* DATSDR C/L=0 scans column groups first; C/L=1 scans lines first. */
     if (!(lcd->scan[0] & 0x04)) {
@@ -7673,11 +9394,52 @@ static bool np560_st7529_advance(NP560ST7529State *lcd)
     return wrapped;
 }
 
+/* Return -1 for an undriven partial-display electrode, not gray level zero. */
+static int np560_st7529_output_level(const NP560ST7529State *lcd,
+                                     unsigned segment, unsigned line)
+{
+    /*
+     * ST7529 v1.8 sections 7.3.2/7.3.3 and the RAM map: LI/CI reverse
+     * DDRAM-to-COM/SEG correspondence, not the ascending MPU counters.
+     * CI reverses all 85 column groups, preserving each group's three
+     * pixels.  CLR controls that separate within-group bus arrangement.
+     * Apply this to the controller's full RAM geometry before cropping
+     * to the NP560 panel, including the off-raster status electrodes.
+     */
+    if (lcd->scan[0] & 0x02) {
+        unsigned pixel = segment % NP560_ST7529_PIXELS_PER_COLUMN;
+        unsigned column = segment / NP560_ST7529_PIXELS_PER_COLUMN;
+
+        segment = (NP560_ST7529_RAM_COLUMNS - 1 - column) *
+            NP560_ST7529_PIXELS_PER_COLUMN + pixel;
+    }
+    if (lcd->scan[0] & 0x01) {
+        line = NP560_ST7529_RAM_LINES - 1 - line;
+    }
+    if (lcd->partial_display &&
+        (line / 4 < lcd->partial_start || line / 4 > lcd->partial_end)) {
+        return -1;
+    }
+    return lcd->gram[line][segment] & 0x1f;
+}
+
+/* Export optical darkness, not the controller's post-DISINV code. The
+ * positive-mode NP560 glass is light with no drive. Original 14:69B4 selects
+ * A7 and 14:6B94..6BBC sends native ink 15 as F0 (RAM code 30); that ink must
+ * remain dark. Treating post-INV code 1 as darkness made every image negative.
+ * This module-level conversion does not alter GRAM or DISNOR/DISINV state.
+ * The exact analog PWM/contrast curve is not yet modeled. */
+static uint8_t np560_st7529_panel_darkness(const NP560ST7529State *lcd,
+                                          uint8_t level)
+{
+    return lcd->inverse ? level : 0x1f - level;
+}
+
 static uint8_t np560_st7529_visible_level(const NP560ST7529State *lcd,
                                           unsigned x, unsigned y)
 {
     unsigned panel_y;
-    uint8_t level;
+    int level;
 
     /*
      * The NP560+ glass crosses the ST7529's two 80-COM banks: physical rows
@@ -7705,12 +9467,13 @@ static uint8_t np560_st7529_visible_level(const NP560ST7529State *lcd,
     } else if (lcd->com_scan & 1) {
         panel_y = DMCU_LCD_HEIGHT + DMCU_LCD_HEIGHT / 2 - 1 - panel_y;
     }
-    level = lcd->gram[panel_y + NP560_LCD_VISIBLE_LINE][x] & 0x1f;
+    level = np560_st7529_output_level(lcd, x,
+                                      panel_y + NP560_LCD_VISIBLE_LINE);
 
-    if (!lcd->display_on || lcd->sleeping) {
+    if (!lcd->display_on || lcd->sleeping || level < 0) {
         return 0;
     }
-    return lcd->inverse ? 0x1f - level : level;
+    return np560_st7529_panel_darkness(lcd, level);
 }
 
 static void np560_st7529_record_frame(NP560MachineState *s)
@@ -7733,10 +9496,12 @@ static void np560_st7529_record_frame(NP560MachineState *s)
         for (x = 0; x < DMCU_LCD_WIDTH; x++) {
             uint8_t level = np560_st7529_visible_level(lcd, x, y);
 
+            lcd->completed_frame[y * DMCU_LCD_WIDTH + x] = level;
             levels |= UINT32_C(1) << level;
             hash = (hash ^ level) * UINT32_C(16777619);
         }
     }
+    lcd->completed_frame_valid = true;
     lcd->frame_sequence[slot] = sequence;
     lcd->frame_data_writes[slot] = lcd->data_writes;
     lcd->frame_pc[slot] = s->cpu->env.pc;
@@ -7751,9 +9516,59 @@ static void np560_st7529_record_frame(NP560MachineState *s)
     lcd->frame_ds0[slot] = s->cpu->env.sfr[DMCU_SFR_DS0] & 0x1ff;
 }
 
+static unsigned np560_st7529_pixel_x(const NP560ST7529State *lcd,
+                                      unsigned pixel)
+{
+    if (lcd->scan[1] & 1) { /* CLR reverses P1/P2/P3 in each group. */
+        pixel = NP560_ST7529_PIXELS_PER_COLUMN - 1 - pixel;
+    }
+    return lcd->column * NP560_ST7529_PIXELS_PER_COLUMN + pixel;
+}
+
+static void np560_st7529_store_pixel(NP560MachineState *s, unsigned pixel,
+                                      uint8_t level)
+{
+    NP560ST7529State *lcd = &s->lcd;
+    unsigned x = np560_st7529_pixel_x(lcd, pixel);
+
+    if (lcd->line < NP560_ST7529_RAM_LINES &&
+        x < NP560_ST7529_RAM_WIDTH) {
+        lcd->gram[lcd->line][x] = level;
+        if (lcd->line >= 140 && level) {
+            uint32_t slot = lcd->status_write_count %
+                            NP560_ST7529_STATUS_TRACE;
+            uint8_t *data = memory_region_get_ram_ptr(&s->data);
+            uint16_t fp = s->cpu->env.gpr[DMCU_FP] & 0xffff;
+            uint16_t parent_fp = lduw_le_p(data + fp);
+
+            lcd->status_write_pc[slot] = s->cpu->env.pc & 0x00ffffffu;
+            lcd->status_write_caller[slot] =
+                ((lduw_le_p(data + ((fp + 2u) & 0xffff)) & 0xffu) << 16) |
+                lduw_le_p(data + ((fp + 4u) & 0xffff));
+            lcd->status_write_parent[slot] =
+                ((lduw_le_p(data + ((parent_fp + 2u) & 0xffff)) & 0xffu) << 16) |
+                lduw_le_p(data + ((parent_fp + 4u) & 0xffff));
+            lcd->status_write_x[slot] = x;
+            lcd->status_write_y[slot] = lcd->line;
+            lcd->status_write_level[slot] = level;
+            lcd->status_write_count++;
+        }
+    }
+}
+
+static uint8_t np560_st7529_load_pixel(const NP560ST7529State *lcd,
+                                        unsigned pixel)
+{
+    unsigned x = np560_st7529_pixel_x(lcd, pixel);
+
+    return lcd->line < NP560_ST7529_RAM_LINES &&
+           x < NP560_ST7529_RAM_WIDTH ? lcd->gram[lcd->line][x] & 0x1f : 0;
+}
+
 static void np560_st7529_data_write(NP560MachineState *s, uint8_t value)
 {
     NP560ST7529State *lcd = &s->lcd;
+    bool wrapped;
 
     lcd->data_writes++;
     if (lcd->parameter_index < lcd->parameter_count) {
@@ -7763,67 +9578,94 @@ static void np560_st7529_data_write(NP560MachineState *s, uint8_t value)
         }
         return;
     }
-    if (lcd->ram_write) {
-        unsigned pixel = lcd->pixel;
-        unsigned x;
-
-        if (lcd->scan[1] & 1) { /* CLR reverses P1/P2/P3 in each group. */
-            pixel = NP560_ST7529_PIXELS_PER_COLUMN - 1 - pixel;
+    if (!lcd->ram_write) {
+        return;
+    }
+    switch (lcd->scan[2] & 7) {
+    case 1:
+        /* ST7529 v1.8 p16: 8-bit 2B3P commits after the second byte.
+         * First: P0[4:0],P1[4:2]. Second: P1[1:0],X,P2[4:0].
+         * D5 in the second byte is ignored, not part of a pixel. */
+        if (!lcd->pixel) {
+            lcd->write_latch = value;
+            lcd->pixel = 1;
+            return;
         }
-        x = lcd->column * NP560_ST7529_PIXELS_PER_COLUMN + pixel;
-        if (lcd->line < NP560_ST7529_RAM_LINES &&
-            x < NP560_ST7529_RAM_WIDTH) {
-            uint8_t level = value >> 3;
-
-            /* In 3-byte/3-pixel mode D7..D3 contain the 5-bit gray value. */
-            lcd->gram[lcd->line][x] = level;
-            if (lcd->line >= 140 && level) {
-                uint32_t slot = lcd->status_write_count %
-                                NP560_ST7529_STATUS_TRACE;
-                uint8_t *data = memory_region_get_ram_ptr(&s->data);
-                uint16_t fp = s->cpu->env.gpr[DMCU_FP] & 0xffff;
-                uint16_t parent_fp = lduw_le_p(data + fp);
-
-                lcd->status_write_pc[slot] =
-                    s->cpu->env.pc & 0x00ffffffu;
-                lcd->status_write_caller[slot] =
-                    ((lduw_le_p(data + ((fp + 2u) & 0xffff)) & 0xffu) << 16) |
-                    lduw_le_p(data + ((fp + 4u) & 0xffff));
-                lcd->status_write_parent[slot] =
-                    ((lduw_le_p(data + ((parent_fp + 2u) & 0xffff)) &
-                      0xffu) << 16) |
-                    lduw_le_p(data + ((parent_fp + 4u) & 0xffff));
-                lcd->status_write_x[slot] = x;
-                lcd->status_write_y[slot] = lcd->line;
-                lcd->status_write_level[slot] = level;
-                lcd->status_write_count++;
-            }
+        np560_st7529_store_pixel(s, 0, lcd->write_latch >> 3);
+        np560_st7529_store_pixel(s, 1,
+                                ((lcd->write_latch & 7) << 2) | (value >> 6));
+        np560_st7529_store_pixel(s, 2, value & 0x1f);
+        lcd->pixel = 0;
+        wrapped = np560_st7529_advance_group(lcd);
+        break;
+    case 2:
+        /* p17: 3B3P also commits the whole group, on the third write.
+         * A command after only one or two bytes must leave GRAM intact. */
+        if (lcd->pixel < 2) {
+            lcd->write_latch = (lcd->write_latch << 8) | value;
+            lcd->pixel++;
+            return;
         }
-        if (np560_st7529_advance(lcd)) {
-            np560_st7529_record_frame(s);
-        }
+        np560_st7529_store_pixel(s, 0, lcd->write_latch >> 11);
+        np560_st7529_store_pixel(s, 1, (lcd->write_latch >> 3) & 0x1f);
+        np560_st7529_store_pixel(s, 2, value >> 3);
+        lcd->pixel = 0;
+        wrapped = np560_st7529_advance_group(lcd);
+        break;
+    default:
+        return;
+    }
+    if (lcd->read_modify_write) {
+        /* Each completed write moves to the next group. Its next read
+         * sequence starts with a dummy cycle, independent of write phase. */
+        lcd->read_pixel = 0;
+    }
+    if (wrapped) {
+        np560_st7529_record_frame(s);
     }
 }
 
 static uint8_t np560_st7529_data_read(NP560ST7529State *lcd)
 {
-    uint8_t value = 0;
-    unsigned pixel = lcd->pixel;
-    unsigned x;
+    uint8_t value;
+    uint8_t previous = lcd->read_latch;
 
     if (!lcd->ram_read) {
         return 0;
     }
-    if (lcd->scan[1] & 1) {
-        pixel = NP560_ST7529_PIXELS_PER_COLUMN - 1 - pixel;
+    switch (lcd->scan[2] & 7) {
+    case 1:
+        if (!lcd->read_pixel) {
+            value = (np560_st7529_load_pixel(lcd, 0) << 3) |
+                    (np560_st7529_load_pixel(lcd, 1) >> 2);
+            lcd->read_pixel = 1;
+        } else {
+            /* The unused bus bit reads zero; it carries no GRAM state. */
+            value = ((np560_st7529_load_pixel(lcd, 1) & 3) << 6) |
+                    np560_st7529_load_pixel(lcd, 2);
+            lcd->read_pixel = 0;
+            if (!lcd->read_modify_write) {
+                np560_st7529_advance_group(lcd);
+            }
+        }
+        break;
+    case 2:
+        value = np560_st7529_load_pixel(lcd, lcd->read_pixel) << 3;
+        if (++lcd->read_pixel == NP560_ST7529_PIXELS_PER_COLUMN) {
+            lcd->read_pixel = 0;
+            if (!lcd->read_modify_write) {
+                np560_st7529_advance_group(lcd);
+            }
+        }
+        break;
+    default:
+        return 0;
     }
-    x = lcd->column * NP560_ST7529_PIXELS_PER_COLUMN + pixel;
-    if (lcd->line < NP560_ST7529_RAM_LINES &&
-        x < NP560_ST7529_RAM_WIDTH) {
-        value = lcd->gram[lcd->line][x] << 3;
-    }
-    np560_st7529_advance(lcd);
-    return value;
+    /* Section 7.2 / fig.7.2.1: a read fills the bus holder and returns
+     * the preceding value. After RAMRD/RMWIN the first result is dummy,
+     * with unspecified contents. A0=0 status does not use this pipeline. */
+    lcd->read_latch = value;
+    return previous;
 }
 
 static uint64_t np560_st7529_read(void *opaque, hwaddr offset, unsigned size)
@@ -7833,7 +9675,14 @@ static uint64_t np560_st7529_read(void *opaque, hwaddr offset, unsigned size)
     if ((offset & 2) != 0) {
         return np560_st7529_data_read(&s->lcd);
     }
-    return s->lcd.display_on ? 0x40 : 0;
+    /* STREAD (A0=0), ST7529 v1.8 p49. EEPROM access is not yet
+     * implemented and remains out; do not confuse display-on with SCM0. */
+    return ((s->lcd.area_scroll[3] & 3) << 6) |
+           (s->lcd.read_modify_write ? 0x20 : 0) |
+           ((s->lcd.scan[0] & 4) << 2) |
+           (s->lcd.display_on ? 8 : 0) |
+           (s->lcd.inverse ? 0 : 2) |
+           (s->lcd.partial_display ? 1 : 0);
 }
 
 static void np560_st7529_write(void *opaque, hwaddr offset, uint64_t value,
@@ -7877,6 +9726,24 @@ static char *np560_get_lcd_frame(Object *obj, Error **errp)
     return (char *)g_base64_encode(frame, sizeof(frame));
 }
 
+static char *np560_get_lcd_completed_frame(Object *obj, Error **errp)
+{
+    NP560ST7529State *lcd = &NP560_MACHINE(obj)->lcd;
+
+    if (!lcd->completed_frame_valid) {
+        return g_strdup("");
+    }
+    return (char *)g_base64_encode(lcd->completed_frame,
+                                   sizeof(lcd->completed_frame));
+}
+
+static char *np560_get_lcd_completed_frame_sequence(Object *obj, Error **errp)
+{
+    NP560ST7529State *lcd = &NP560_MACHINE(obj)->lcd;
+
+    return g_strdup_printf("%" G_GUINT64_FORMAT, lcd->completed_frames);
+}
+
 static char *np560_get_lcd_gram_frame(Object *obj, Error **errp)
 {
     NP560ST7529State *lcd = &NP560_MACHINE(obj)->lcd;
@@ -7884,15 +9751,15 @@ static char *np560_get_lcd_gram_frame(Object *obj, Error **errp)
     unsigned x;
     unsigned y;
 
-    /* Observer-only controller-line view, before the NP560 glass wiring. */
+    /* Observer-only logical RAM view, before LI/CI and NP560 glass wiring. */
     for (y = 0; y < NP560_ST7529_RAM_LINES; y++) {
         for (x = 0; x < DMCU_LCD_WIDTH; x++) {
             uint8_t level = lcd->gram[y][x] & 0x1f;
 
             if (!lcd->display_on || lcd->sleeping) {
                 level = 0;
-            } else if (lcd->inverse) {
-                level = 0x1f - level;
+            } else {
+                level = np560_st7529_panel_darkness(lcd, level);
             }
             frame[y * DMCU_LCD_WIDTH + x] = level;
         }
@@ -7922,7 +9789,8 @@ static char *np560_get_lcd_annunciators(Object *obj, Error **errp)
     if (lcd->display_on && !lcd->sleeping) {
         for (plane = 0; plane < NP560_LCD_ANNUNCIATOR_PLANES; plane++) {
             for (x = 0; x < DMCU_LCD_WIDTH; x++) {
-                bool active = (lcd->gram[lines[plane]][x] & 0x1f) != 0;
+                int level = np560_st7529_output_level(lcd, x, lines[plane]);
+                bool active = level > 0;
 
                 /*
                  * DATSDR/INV selects dot-matrix optical polarity; it does
@@ -8023,14 +9891,28 @@ static char *np560_get_lcd_state(Object *obj, Error **errp)
         "ST7529 DISPLAY=%s SLEEP=%s INV=%s EXT=%u CMD=%02x "
         "COM=%u DUTY=%u SCAN=%02x,%02x,%02x WINDOW=C%u-%u,L%u-%u "
         "CUR=C%u,L%u,P%u COMMANDS=%" G_GUINT64_FORMAT
-        " DATA=%" G_GUINT64_FORMAT " FRAMES=%" G_GUINT64_FORMAT,
+        " DATA=%" G_GUINT64_FORMAT " FRAMES=%" G_GUINT64_FORMAT
+        " ENCODING=gray5-darkness PARAM=%u/%u",
         lcd->display_on ? "on" : "off", lcd->sleeping ? "on" : "off",
         lcd->inverse ? "on" : "off", lcd->extended, lcd->command,
         lcd->com_scan, lcd->display_lines,
         lcd->scan[0], lcd->scan[1], lcd->scan[2],
         lcd->column_start, lcd->column_end, lcd->line_start, lcd->line_end,
         lcd->column, lcd->line, lcd->pixel, lcd->command_writes,
-        lcd->data_writes, lcd->completed_frames);
+        lcd->data_writes, lcd->completed_frames,
+        lcd->parameter_index, lcd->parameter_count);
+    for (unsigned bank = 0; bank < 2; bank++) {
+        g_string_append_printf(text, " GRAY%u=", bank + 1);
+        if (!lcd->gray_pwm_programmed[bank]) {
+            g_string_append(text, "unknown");
+        } else {
+            for (unsigned i = 0; i < 16; i++) {
+                g_string_append_printf(text, "%s%02x", i ? "," : "",
+                                       lcd->gray_pwm[bank][i]);
+            }
+        }
+    }
+    g_string_append(text, " PWM=unmodeled");
     g_string_append_printf(text,
         " GRAM=L0-19:%u/%08x,L20-139:%u/%08x,L140-159:%u/%08x",
         gram_nonzero[0], gram_hash[0], gram_nonzero[1], gram_hash[1],
@@ -8185,6 +10067,318 @@ static char *np560_get_ecc_state(Object *obj, Error **errp)
         ecc->reset_writes, ecc->feed_writes);
 }
 
+static char *np560_get_key_pipeline_status(Object *obj, Error **errp)
+{
+    NP560MachineState *s = NP560_MACHINE(obj);
+    CPUDMCUState *env;
+    uint16_t application_state;
+    uint16_t guest_key_gate;
+    uint16_t game_current_map_index;
+    uint16_t game_current_scroll;
+    uint16_t game_current_move_state;
+    uint8_t game_current_direction;
+    uint8_t game_current_x;
+    uint8_t game_current_y;
+    uint8_t game_current_offset_x;
+    uint8_t game_current_offset_y;
+    bool matrix_rearmed;
+    bool faulted;
+
+    if (!s->cpu) {
+        return g_strdup("{}");
+    }
+    env = &s->cpu->env;
+    application_state = address_space_lduw_le(
+        &address_space_memory, 0x512aaau, MEMTXATTRS_UNSPECIFIED, NULL);
+    guest_key_gate = address_space_lduw_le(
+        &address_space_memory, 0x512a5cu, MEMTXATTRS_UNSPECIFIED, NULL);
+    game_current_direction = address_space_ldub(
+        &address_space_memory, 0x5269d4u ^ 1u,
+        MEMTXATTRS_UNSPECIFIED, NULL);
+    game_current_x = address_space_ldub(
+        &address_space_memory, 0x5269d5u ^ 1u,
+        MEMTXATTRS_UNSPECIFIED, NULL);
+    game_current_y = address_space_ldub(
+        &address_space_memory, 0x5269d6u ^ 1u,
+        MEMTXATTRS_UNSPECIFIED, NULL);
+    game_current_offset_x = address_space_ldub(
+        &address_space_memory, 0x527a2eu ^ 1u,
+        MEMTXATTRS_UNSPECIFIED, NULL);
+    game_current_offset_y = address_space_ldub(
+        &address_space_memory, 0x527a2cu ^ 1u,
+        MEMTXATTRS_UNSPECIFIED, NULL);
+    /* 19:8628 stores the exit's destination map here before loading it.
+     * 52:7A66 is used for event-range conditions, not the map number. */
+    game_current_map_index = address_space_lduw_le(
+        &address_space_memory, 0x527a58u,
+        MEMTXATTRS_UNSPECIFIED, NULL);
+    game_current_scroll = address_space_lduw_le(
+        &address_space_memory, 0x527a84u,
+        MEMTXATTRS_UNSPECIFIED, NULL);
+    game_current_move_state = address_space_lduw_le(
+        &address_space_memory, 0x527a86u,
+        MEMTXATTRS_UNSPECIFIED, NULL);
+    matrix_rearmed = env->web_key_state == 0 &&
+                     env->web_matrix_state_low == 0 &&
+                     env->web_matrix_state_high == 0 &&
+                     qatomic_read(&s->keyboard.matrix_pulse_index) >= 64 &&
+                     (np560_key_matrix_input(
+                          s, s->keyboard.matrix_drive,
+                          qatomic_read(&s->keyboard.matrix_pulse_index)) &
+                      0xff) == 0xff &&
+                     guest_key_gate == 0;
+    faulted = env->missing_rom_valid || env->invalid_control_valid ||
+              env->unsupported_valid;
+    return g_strdup_printf(
+        "{\"maps\":%u,\"event\":%u,"
+        "\"candidates\":%u,\"candidate\":%u,"
+        "\"acknowledgements\":%u,\"acknowledgement\":%u,"
+        "\"modal_acknowledgements\":%u,"
+        "\"modal_acknowledgement\":%u,"
+        "\"matrix_reads\":%" G_GUINT64_FORMAT ","
+        "\"matrix_rearmed\":%s,\"application_state\":%u,"
+        "\"primary_action_selector_calls\":%u,"
+        "\"primary_action_selector_returns\":%u,"
+        "\"primary_action_selector_result\":%u,"
+        "\"primary_action_late_paths\":%u,"
+        "\"primary_action_object_guard_checks\":%u,"
+        "\"primary_action_object_guard_value\":%u,"
+        "\"primary_action_object_guard_passes\":%u,"
+        "\"primary_action_object_guard_rejects\":%u,"
+        "\"primary_action_object_commits\":%u,"
+        "\"primary_action_object_commit_flag\":%u,"
+        "\"direction_up_paths\":%u,"
+        "\"direction_down_paths\":%u,"
+        "\"direction_left_paths\":%u,"
+        "\"direction_right_paths\":%u,"
+        "\"direction_helper_active\":%s,"
+        "\"direction_helper_calls\":%u,"
+        "\"direction_helper_returns\":%u,"
+        "\"direction_helper_result\":%u,"
+        "\"direction_code\":%u,"
+        "\"direction_before_x\":%u,\"direction_before_y\":%u,"
+        "\"direction_before_offset_x\":%u,"
+        "\"direction_before_offset_y\":%u,"
+        "\"direction_after_x\":%u,\"direction_after_y\":%u,"
+        "\"direction_after_offset_x\":%u,"
+        "\"direction_after_offset_y\":%u,"
+        "\"direction_before_map_index\":%u,"
+        "\"direction_before_scroll\":%u,"
+        "\"direction_after_map_index\":%u,"
+        "\"direction_after_scroll\":%u,"
+        "\"current_direction\":%u,"
+        "\"current_x\":%u,\"current_y\":%u,"
+        "\"current_offset_x\":%u,\"current_offset_y\":%u,"
+        "\"current_map_index\":%u,"
+        "\"current_scroll\":%u,"
+        "\"current_move_state\":%u,"
+        "\"render_calls\":%u,"
+        "\"render_callback_dispatches\":%u,"
+        "\"render_object_valid\":%s,"
+        "\"render_object_hi\":%u,\"render_object_lo\":%u,"
+        "\"render_stack_object_hi\":%u,"
+        "\"render_stack_object_lo\":%u,"
+        "\"render_entry_callback_r0\":%u,"
+        "\"render_entry_callback_r1\":%u,"
+        "\"render_callback_object_valid\":%s,"
+        "\"render_callback_object_hi\":%u,"
+        "\"render_callback_object_lo\":%u,"
+        "\"render_callback_r0\":%u,\"render_callback_r1\":%u,"
+        "\"render_callback_target_segment\":%u,"
+        "\"render_callback_target_pc\":%u,"
+        "\"render_callback_field_r0\":%u,"
+        "\"render_callback_field_r1\":%u,"
+        "\"faulted\":%s}",
+        env->matrix_event_maps,
+        env->matrix_event_last & 0xffffu,
+        env->matrix_candidate_writes,
+        env->matrix_candidate_last & 0xffffu,
+        env->application_trace_calls[
+            DMCU_APPLICATION_KEYMAP_RETURN_TRACE_INDEX],
+        env->application_trace_r0[
+            DMCU_APPLICATION_KEYMAP_RETURN_TRACE_INDEX] & 0xffffu,
+        env->matrix_modal_dispatches,
+        env->matrix_modal_event_last & 0xffffu,
+        s->keyboard.matrix_reads,
+        matrix_rearmed ? "true" : "false",
+        application_state,
+        env->npe_game_primary_action_selector_calls,
+        env->npe_game_primary_action_selector_returns,
+        env->npe_game_primary_action_selector_result,
+        env->npe_game_primary_action_late_paths,
+        env->npe_game_primary_action_object_guard_checks,
+        env->npe_game_primary_action_object_guard_value,
+        env->npe_game_primary_action_object_guard_passes,
+        env->npe_game_primary_action_object_guard_rejects,
+        env->npe_game_primary_action_object_commits,
+        env->npe_game_primary_action_object_commit_flag,
+        env->npe_game_direction_up_paths,
+        env->npe_game_direction_down_paths,
+        env->npe_game_direction_left_paths,
+        env->npe_game_direction_right_paths,
+        env->npe_game_direction_helper_active ? "true" : "false",
+        env->npe_game_direction_helper_calls,
+        env->npe_game_direction_helper_returns,
+        env->npe_game_direction_helper_result,
+        env->npe_game_direction_code,
+        env->npe_game_direction_before_x,
+        env->npe_game_direction_before_y,
+        env->npe_game_direction_before_offset_x,
+        env->npe_game_direction_before_offset_y,
+        env->npe_game_direction_after_x,
+        env->npe_game_direction_after_y,
+        env->npe_game_direction_after_offset_x,
+        env->npe_game_direction_after_offset_y,
+        env->npe_game_direction_before_map_index,
+        env->npe_game_direction_before_scroll,
+        env->npe_game_direction_after_map_index,
+        env->npe_game_direction_after_scroll,
+        game_current_direction,
+        game_current_x,
+        game_current_y,
+        game_current_offset_x,
+        game_current_offset_y,
+        game_current_map_index,
+        game_current_scroll,
+        game_current_move_state,
+        env->npe_game_render_calls,
+        env->npe_game_render_callback_dispatches,
+        env->npe_game_render_object_valid ? "true" : "false",
+        env->npe_game_render_object_hi,
+        env->npe_game_render_object_lo,
+        env->npe_game_render_stack_object_hi,
+        env->npe_game_render_stack_object_lo,
+        env->npe_game_render_entry_words[0x1e / 2],
+        env->npe_game_render_entry_words[0x20 / 2],
+        env->npe_game_render_callback_object_valid ? "true" : "false",
+        env->npe_game_render_callback_object_hi,
+        env->npe_game_render_callback_object_lo,
+        env->npe_game_render_callback_r0,
+        env->npe_game_render_callback_r1,
+        env->npe_game_render_callback_target_segment,
+        env->npe_game_render_callback_target_pc,
+        env->npe_game_render_callback_words[0x1e / 2],
+        env->npe_game_render_callback_words[0x20 / 2],
+        faulted ? "true" : "false");
+}
+
+static void np560_get_key_matrix_pulse_index(Object *obj, Visitor *v,
+                                              const char *name, void *opaque,
+                                              Error **errp)
+{
+    NP560MachineState *s = NP560_MACHINE(obj);
+    uint32_t value = qatomic_read(&s->keyboard.matrix_pulse_index);
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void np560_set_key_matrix_pulse_index(Object *obj, Visitor *v,
+                                              const char *name, void *opaque,
+                                              Error **errp)
+{
+    NP560MachineState *s = NP560_MACHINE(obj);
+    CPUDMCUState *env = &s->cpu->env;
+    uint32_t value;
+
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    if (value > 64) {
+        error_setg(errp, "matrix pulse index must be in 0..64");
+        return;
+    }
+    if (value == 64) {
+        qatomic_set(&s->keyboard.matrix_pulse_index, 64);
+        return;
+    }
+    if (env->web_key_state || env->web_matrix_state_low ||
+        env->web_matrix_state_high) {
+        error_setg(errp, "matrix pulse requires an all-released Web matrix");
+        return;
+    }
+    if (qatomic_cmpxchg(&s->keyboard.matrix_pulse_index, 64, value) != 64) {
+        error_setg(errp, "a matrix pulse is already pending");
+    }
+}
+
+static void np560_machine_reset(MachineState *machine, ShutdownCause reason)
+{
+    NP560MachineState *s = NP560_MACHINE(machine);
+    bool guest_reset = reason == SHUTDOWN_CAUSE_GUEST_RESET;
+    uint32_t key_state = s->cpu ? s->cpu->env.web_key_state : 0;
+    uint32_t key_code = s->cpu ? s->cpu->env.web_key_code : 0;
+    uint32_t matrix_low = s->cpu ? s->cpu->env.web_matrix_state_low : 0;
+    uint32_t matrix_high = s->cpu ? s->cpu->env.web_matrix_state_high : 0;
+
+    /* QEMU normally preserves RAM across system_reset.  The NP560 Web reset
+     * represents a board reset from the same immutable PRG/SoC ROM inputs,
+     * and the shipped startup assumes external RAM and writable program RAM
+     * have their power-on contents.  Restore the exact post-realize images
+     * before resetting the CPU and devices.  NAND is nonvolatile: both raw
+     * images and checkpoints seed the medium only at machine creation.
+     * Reset the NAND controller, not the live data/OOB; reloading the seed
+     * here silently rolls back settings and files saved by the guest. */
+    /* The RESET instruction is not the Web cold-restart operation above.
+     * CN1916884A p115 explicitly preserves memory across software reset. */
+    if (!guest_reset && s->reset_data_snapshot) {
+        memcpy(memory_region_get_ram_ptr(&s->data),
+               s->reset_data_snapshot, DMCU_DATA_SIZE);
+        memory_region_set_dirty(&s->data, 0, DMCU_DATA_SIZE);
+    }
+    if (!guest_reset && s->reset_action_ui_snapshot) {
+        memcpy(memory_region_get_ram_ptr(
+                   &s->application_operation_action_ui_ram),
+               s->reset_action_ui_snapshot,
+               NP560_APPLICATION_OPERATION_ACTION_UI_OVERLAY_SIZE);
+        memory_region_set_dirty(
+            &s->application_operation_action_ui_ram, 0,
+            NP560_APPLICATION_OPERATION_ACTION_UI_OVERLAY_SIZE);
+    }
+    if (!guest_reset && s->reset_action_code_page_snapshot) {
+        memcpy(memory_region_get_ram_ptr(
+                   &s->application_operation_action_code_page_ram),
+               s->reset_action_code_page_snapshot,
+               NP560_APPLICATION_OPERATION_ACTION_CODE_PAGE_SIZE);
+        memory_region_set_dirty(
+            &s->application_operation_action_code_page_ram, 0,
+            NP560_APPLICATION_OPERATION_ACTION_CODE_PAGE_SIZE);
+    }
+    if (s->cpu) {
+        /* The standalone DMCU CPU is realized without a qbus parent, so it
+         * is not reached by the board's legacy device-reset traversal.  A
+         * RAM restore with the old PC/SP still live resumes in an unrelated
+         * stack frame (observed as 31:7822 -> e8:0000).
+         * Reset the shared SFR backing before devices derive their reset
+         * state from it. Otherwise DAC latches retain pre-reset samples and
+         * periodic timers retain the old PLL/CLKCON-derived frequency. */
+        cpu_reset(CPU(s->cpu));
+        tb_flush(CPU(s->cpu));
+        tlb_flush(CPU(s->cpu));
+    }
+    if (guest_reset) {
+        /* Reset integrated devices, not external chips or physical input.
+         * In particular, do not erase ST7529 GRAM or synthesize key releases.
+         * The NAND controller reset leaves the live flash data/OOB intact.
+         * Board-level coupling of a CPU reset to external reset pins is not
+         * established; guest LCD commands still own the external panel.
+         */
+        if (s->cpu) {
+            s->cpu->env.web_key_state = key_state;
+            s->cpu->env.web_key_code = key_code;
+            s->cpu->env.web_matrix_state_low = matrix_low;
+            s->cpu->env.web_matrix_state_high = matrix_high;
+        }
+        s->keyboard.matrix_drive = 0xffff;
+        np560_ecc_reset(s);
+        np560_adc_reset(s);
+        np560_nand_reset(s);
+        np560_timers_reset(&s->periodic_timers);
+        np560_audio_reset(&s->audio);
+    } else {
+        qemu_devices_reset(reason);
+    }
+}
+
 static bool np560_get_hle_ui(Object *obj, Error **errp)
 {
     return NP560_MACHINE(obj)->hle_ui;
@@ -8193,6 +10387,11 @@ static bool np560_get_hle_ui(Object *obj, Error **errp)
 static bool np560_get_rom_hle(Object *obj, Error **errp)
 {
     return NP560_MACHINE(obj)->rom_hle;
+}
+
+static char *np560_get_mp3_hle_state(Object *obj, Error **errp)
+{
+    return np560_mp3_hle_state(NP560_MACHINE(obj)->mp3_hle);
 }
 
 static void np560_set_rom_hle(Object *obj, bool value, Error **errp)
@@ -8302,8 +10501,50 @@ static void np560_set_nand_image(Object *obj, const char *value, Error **errp)
 {
     NP560MachineState *s = NP560_MACHINE(obj);
 
+    if (s->nand.journal) {
+        error_setg(errp, "Cannot change the active NAND journal base");
+        return;
+    }
     g_free(s->nand_image);
     s->nand_image = g_strdup(value);
+}
+
+static char *np560_get_nand_journal(Object *obj, Error **errp)
+{
+    NP560MachineState *s = NP560_MACHINE(obj);
+
+    return g_strdup(s->nand_journal ? s->nand_journal : "");
+}
+
+static void np560_set_nand_journal(Object *obj, const char *value, Error **errp)
+{
+    NP560MachineState *s = NP560_MACHINE(obj);
+
+    if (s->nand.data) {
+        error_setg(errp, "NP560 NAND journal must be configured before startup");
+        return;
+    }
+    g_free(s->nand_journal);
+    s->nand_journal = g_strdup(value);
+}
+
+static char *np560_get_nand_journal_state(Object *obj, Error **errp)
+{
+    return np560_nand_journal_state(NP560_MACHINE(obj)->nand.journal);
+}
+
+static char *np560_get_nand_journal_maintenance(Object *obj, Error **errp)
+{
+    return np560_nand_journal_maintenance(NP560_MACHINE(obj)->nand.journal);
+}
+
+static void np560_set_nand_journal_compact(Object *obj, bool value, Error **errp)
+{
+    if (value) {
+        /* QOM and NAND commands serialize under the BQL. This is host medium
+         * maintenance, not a guest erase, reset or application save. */
+        np560_nand_journal_compact(NP560_MACHINE(obj)->nand.journal, errp);
+    }
 }
 
 static char *np560_get_nand_checkpoint(Object *obj, Error **errp)
@@ -8318,6 +10559,10 @@ static void np560_set_nand_checkpoint(Object *obj, const char *value,
 {
     NP560MachineState *s = NP560_MACHINE(obj);
 
+    if (s->nand.journal) {
+        error_setg(errp, "Cannot change the active NAND journal base");
+        return;
+    }
     g_free(s->nand_checkpoint);
     s->nand_checkpoint = g_strdup(value);
 }
@@ -8340,6 +10585,41 @@ static void np560_save_nand_checkpoint(NP560MachineState *s,
     if (!nand->data || !nand->oob) {
         error_setg(errp, "NP560+ NAND is not initialized");
         return;
+    }
+    if (nand->journal) {
+        const char *protected[] = { s->nand_journal, s->nand_checkpoint,
+                                    s->nand_image };
+        struct stat output_st;
+        bool output_exists = stat(path, &output_st) == 0;
+        unsigned i;
+
+        if (np560_nand_journal_protects(nand->journal, path)) {
+            error_setg(errp, "NAND export must not overwrite the journal "
+                       "or its active sidecar lock");
+            return;
+        }
+
+        for (i = 0; i < G_N_ELEMENTS(protected); i++) {
+            g_autofree char *input_path = NULL;
+            struct stat input_st;
+
+            if (!protected[i] || !*protected[i]) {
+                continue;
+            }
+            input_path = i == 0 ? g_strdup(protected[i]) :
+                qemu_find_file(QEMU_FILE_TYPE_BIOS, protected[i]);
+            if (!input_path) {
+                continue;
+            }
+            if (!strcmp(path, input_path) ||
+                (output_exists && stat(input_path, &input_st) == 0 &&
+                 input_st.st_dev == output_st.st_dev &&
+                 input_st.st_ino == output_st.st_ino)) {
+                error_setg(errp, "NAND export must not overwrite the active "
+                           "journal or its immutable base");
+                return;
+            }
+        }
     }
 
     checkpoint = g_malloc0(checkpoint_size);
@@ -8587,6 +10867,81 @@ static void np560_set_debug_data_save(Object *obj, const char *value,
     s->debug_data_save = g_strdup(value);
 }
 
+static char *np560_get_debug_code_save(Object *obj, Error **errp)
+{
+    NP560MachineState *s = NP560_MACHINE(obj);
+
+    return g_strdup(s->debug_code_save ? s->debug_code_save : "");
+}
+
+static void np560_set_debug_code_save(Object *obj, const char *value,
+                                      Error **errp)
+{
+    NP560MachineState *s = NP560_MACHINE(obj);
+    const char *separator;
+    const char *range_separator;
+    const char *path;
+    g_autofree char *address_text = NULL;
+    g_autofree char *size_text = NULL;
+    g_autofree uint8_t *bytes = NULL;
+    char *end = NULL;
+    uint64_t address;
+    uint64_t size;
+    MemTxResult result;
+    g_autoptr(GError) gerror = NULL;
+
+    if (!value || !*value) {
+        g_clear_pointer(&s->debug_code_save, g_free);
+        return;
+    }
+    separator = strchr(value, '@');
+    range_separator = strchr(value, ':');
+    if (!separator || !range_separator || range_separator >= separator ||
+        range_separator == value || range_separator + 1 == separator ||
+        !separator[1]) {
+        error_setg(errp, "NP560+ debug code save must use ADDRESS:SIZE@FILE");
+        return;
+    }
+    address_text = g_strndup(value, range_separator - value);
+    size_text = g_strndup(range_separator + 1,
+                          separator - range_separator - 1);
+    address = g_ascii_strtoull(address_text, &end, 0);
+    if (!end || *end) {
+        error_setg(errp, "Invalid NP560+ debug code address '%s'", address_text);
+        return;
+    }
+    size = g_ascii_strtoull(size_text, &end, 0);
+    if (!end || *end || !size || size > DMCU_DATA_SIZE ||
+        address > DMCU_DATA_SIZE - size) {
+        error_setg(errp, "Invalid NP560+ debug code size/range '%s:%s'",
+                   address_text, size_text);
+        return;
+    }
+    if (!s->cpu || memory_region_size(&s->code) != DMCU_DATA_SIZE) {
+        error_setg(errp, "NP560+ code bus is not initialized");
+        return;
+    }
+
+    bytes = g_malloc(size);
+    result = address_space_read(
+        cpu_get_address_space(CPU(s->cpu), DMCU_AS_CODE), address,
+        MEMTXATTRS_UNSPECIFIED, bytes, size);
+    if (result != MEMTX_OK) {
+        error_setg(errp, "Unable to read NP560+ code bus 0x%" PRIx64
+                   "..0x%" PRIx64 " (MemTxResult 0x%x)",
+                   address, address + size, result);
+        return;
+    }
+    path = separator + 1;
+    if (!g_file_set_contents(path, (const char *)bytes, size, &gerror)) {
+        error_setg(errp, "Unable to save NP560+ debug code '%s': %s",
+                   path, gerror->message);
+        return;
+    }
+    g_free(s->debug_code_save);
+    s->debug_code_save = g_strdup(value);
+}
+
 static char *np560_get_debug_program_load(Object *obj, Error **errp)
 {
     NP560MachineState *s = NP560_MACHINE(obj);
@@ -8767,8 +11122,12 @@ static void np560_load_nand_image(NP560MachineState *s)
     const uint8_t *payload;
     gsize payload_size;
 
-    nand->data = g_malloc(NP560_NAND_DATA_SIZE);
-    nand->oob = g_malloc(NP560_NAND_OOB_SIZE);
+    if (!nand->data) {
+        nand->data = g_malloc(NP560_NAND_DATA_SIZE);
+    }
+    if (!nand->oob) {
+        nand->oob = g_malloc(NP560_NAND_OOB_SIZE);
+    }
     memset(nand->data, 0xff, NP560_NAND_DATA_SIZE);
     memset(nand->oob, 0xff, NP560_NAND_OOB_SIZE);
     nand->image_bytes = 0;
@@ -8894,6 +11253,153 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
                                (i & 3) == 3 ? "\n" : "  ");
     }
     {
+        uint64_t count = MIN(
+            env->unbanked_sfr_unknown_write_count,
+            (uint64_t)DMCU_UNBANKED_SFR_WRITE_TRACE_SLOTS);
+        uint64_t first = env->unbanked_sfr_unknown_write_count - count;
+        uint64_t trace;
+
+        g_string_append_printf(
+            text,
+            "UNBANKED_SFR_WRITE=TOTAL:%" G_GUINT64_FORMAT
+            " UNKNOWN:%" G_GUINT64_FORMAT " BUCKETS:",
+            env->unbanked_sfr_write_count,
+            env->unbanked_sfr_unknown_write_count);
+        for (i = 0; i < DMCU_UNBANKED_SFR_WRITE_BUCKETS; i++) {
+            g_string_append_printf(
+                text, "%sF%x=%" G_GUINT64_FORMAT,
+                i ? "," : "", i,
+                env->unbanked_sfr_write_bucket[i]);
+        }
+        g_string_append(text, " TRACE:");
+        for (trace = first;
+             trace < env->unbanked_sfr_unknown_write_count; trace++) {
+            uint32_t slot = trace %
+                            DMCU_UNBANKED_SFR_WRITE_TRACE_SLOTS;
+            uint32_t pc = env->unbanked_sfr_unknown_pc[slot];
+
+            g_string_append_printf(
+                text,
+                "%s#%" G_GUINT64_FORMAT "/g%" G_GUINT64_FORMAT
+                "/%02x:%04x/a%04x=%04x/b%u/sp%04x/fp%04x/"
+                "ds%03x,%03x/i%u",
+                trace == first ? "" : ";", trace,
+                env->unbanked_sfr_unknown_sequence[slot],
+                dmcu_code_segment(pc), dmcu_code_pc(pc),
+                env->unbanked_sfr_unknown_logical[slot],
+                env->unbanked_sfr_unknown_value[slot],
+                env->unbanked_sfr_unknown_bits[slot],
+                env->unbanked_sfr_unknown_sp[slot],
+                env->unbanked_sfr_unknown_fp[slot],
+                env->unbanked_sfr_unknown_ds0[slot],
+                env->unbanked_sfr_unknown_ds1[slot],
+                env->unbanked_sfr_unknown_in_interrupt[slot]);
+        }
+        if (!count) {
+            g_string_append(text, "none");
+        }
+        g_string_append_c(text, '\n');
+    }
+    {
+        uint64_t count = MIN(
+            env->banked_fxxx_unknown_write_count,
+            (uint64_t)DMCU_BANKED_FXXX_WRITE_TRACE_SLOTS);
+        uint64_t first = env->banked_fxxx_unknown_write_count - count;
+        uint64_t trace;
+
+        g_string_append_printf(
+            text,
+            "BANKED_FXXX_WRITE=TOTAL:%" G_GUINT64_FORMAT
+            " UNKNOWN:%" G_GUINT64_FORMAT " BUCKETS:",
+            env->banked_fxxx_write_count,
+            env->banked_fxxx_unknown_write_count);
+        for (i = 0; i < DMCU_BANKED_FXXX_WRITE_BUCKETS; i++) {
+            g_string_append_printf(
+                text, "%sF%x=%" G_GUINT64_FORMAT,
+                i ? "," : "", i,
+                env->banked_fxxx_write_bucket[i]);
+        }
+        g_string_append(text, " TRACE:");
+        for (trace = first;
+             trace < env->banked_fxxx_unknown_write_count; trace++) {
+            uint32_t slot = trace % DMCU_BANKED_FXXX_WRITE_TRACE_SLOTS;
+            uint32_t pc = env->banked_fxxx_unknown_pc[slot];
+
+            g_string_append_printf(
+                text,
+                "%s#%" G_GUINT64_FORMAT "/g%" G_GUINT64_FORMAT
+                "/%02x:%04x/l%04x/p%04x=%04x/b%u/sp%04x/fp%04x/"
+                "ds%03x,%03x/i%u",
+                trace == first ? "" : ";", trace,
+                env->banked_fxxx_unknown_sequence[slot],
+                dmcu_code_segment(pc), dmcu_code_pc(pc),
+                env->banked_fxxx_unknown_logical[slot],
+                env->banked_fxxx_unknown_physical[slot],
+                env->banked_fxxx_unknown_value[slot],
+                env->banked_fxxx_unknown_bits[slot],
+                env->banked_fxxx_unknown_sp[slot],
+                env->banked_fxxx_unknown_fp[slot],
+                env->banked_fxxx_unknown_ds0[slot],
+                env->banked_fxxx_unknown_ds1[slot],
+                env->banked_fxxx_unknown_in_interrupt[slot]);
+        }
+        if (!count) {
+            g_string_append(text, "none");
+        }
+        g_string_append_c(text, '\n');
+    }
+    {
+        uint64_t count = MIN(
+            env->direct_sfr_write_count,
+            (uint64_t)DMCU_DIRECT_SFR_WRITE_TRACE_SLOTS);
+        uint64_t first = env->direct_sfr_write_count - count;
+        uint64_t trace;
+        bool any = false;
+
+        g_string_append_printf(
+            text, "DIRECT_SFR_WRITE=TOTAL:%" G_GUINT64_FORMAT " COUNTS:",
+            env->direct_sfr_write_count);
+        for (i = 0; i < DMCU_DIRECT_SFR_WRITE_REGS; i++) {
+            if (!env->direct_sfr_write_reg_count[i]) {
+                continue;
+            }
+            g_string_append_printf(
+                text, "%s%02x=%" G_GUINT64_FORMAT,
+                any ? "," : "", i, env->direct_sfr_write_reg_count[i]);
+            any = true;
+        }
+        if (!any) {
+            g_string_append(text, "none");
+        }
+        g_string_append(text, " TRACE:");
+        for (trace = first; trace < env->direct_sfr_write_count; trace++) {
+            uint32_t slot = trace % DMCU_DIRECT_SFR_WRITE_TRACE_SLOTS;
+            uint32_t pc = env->direct_sfr_write_pc[slot];
+
+            g_string_append_printf(
+                text,
+                "%s#%" G_GUINT64_FORMAT "/g%" G_GUINT64_FORMAT
+                "/%02x:%04x/r%02x=%04x>%04x/b%u/sp%04x/fp%04x/"
+                "ds%03x,%03x/i%u",
+                trace == first ? "" : ";", trace,
+                env->direct_sfr_write_sequence[slot],
+                dmcu_code_segment(pc), dmcu_code_pc(pc),
+                env->direct_sfr_write_reg[slot],
+                env->direct_sfr_write_old_value[slot],
+                env->direct_sfr_write_new_value[slot],
+                env->direct_sfr_write_bits[slot],
+                env->direct_sfr_write_sp[slot],
+                env->direct_sfr_write_fp[slot],
+                env->direct_sfr_write_ds0[slot],
+                env->direct_sfr_write_ds1[slot],
+                env->direct_sfr_write_in_interrupt[slot]);
+        }
+        if (!count) {
+            g_string_append(text, "none");
+        }
+        g_string_append_c(text, '\n');
+    }
+    {
         uint16_t fp = env->gpr[DMCU_FP] & 0xffff;
         unsigned frame;
 
@@ -8937,17 +11443,9 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
         env->web_key_state, env->web_key_code,
         env->web_matrix_state_high, env->web_matrix_state_low);
     g_string_append_printf(text,
-        "  KEY_GPIO=%04x KEYBOARD_EVENTS=%" G_GUINT64_FORMAT " LAST=%04x",
-        np560_keyboard_gpio_state(env->web_key_state),
+        "  DPRAM_F010=%04x KEYBOARD_EVENTS=%" G_GUINT64_FORMAT " LAST=%04x",
+        lduw_le_p(s->cpu->internal_data + 0xf010),
         s->keyboard.events_read, s->keyboard.last_event);
-    g_string_append_printf(
-        text,
-        " F010_READS=%" G_GUINT64_FORMAT
-        " WRITES=%" G_GUINT64_FORMAT " LAST_WRITE=%04x@%02x:%04x",
-        s->keyboard.gpio_reads, s->keyboard.gpio_writes,
-        s->keyboard.gpio_last_write,
-        dmcu_code_segment(s->keyboard.gpio_last_write_pc),
-        dmcu_code_pc(s->keyboard.gpio_last_write_pc));
     g_string_append_printf(
         text,
         " F340_READS=%" G_GUINT64_FORMAT " EVENTS=%" G_GUINT64_FORMAT
@@ -8955,25 +11453,6 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
         s->keyboard.latch_reads, s->keyboard.latch_events,
         dmcu_code_segment(s->keyboard.latch_last_pc),
         dmcu_code_pc(s->keyboard.latch_last_pc));
-    if (s->keyboard.trace_index) {
-        uint32_t count = MIN(s->keyboard.trace_index,
-                             (uint32_t)NP560_KEYBOARD_TRACE);
-        uint32_t start = s->keyboard.trace_index - count;
-        uint32_t trace;
-
-        g_string_append(text, "\nF010_TRACE=");
-        for (trace = start; trace < s->keyboard.trace_index; trace++) {
-            uint32_t slot = trace % NP560_KEYBOARD_TRACE;
-            uint32_t pc = s->keyboard.trace_pc[slot];
-
-            g_string_append_printf(
-                text, "%s%02x:%04x/%04x", trace == start ? "" : ",",
-                dmcu_code_segment(pc), dmcu_code_pc(pc),
-                s->keyboard.trace_value[slot]);
-        }
-    } else {
-        g_string_append(text, "\nF010_TRACE=none");
-    }
     g_string_append_printf(
         text,
         "\nIRQ64=ENABLED:%u TICKS:%" G_GUINT64_FORMAT
@@ -8984,7 +11463,11 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
         " F100:%04x F160:%04x F164:%04x MATRIX_READS:%" G_GUINT64_FORMAT
         " MATRIX_WRITES:%" G_GUINT64_FORMAT
         " ACTIVE:%" G_GUINT64_FORMAT "@%02x:%04x/%04x>%04x",
-        s->timer.irq_enabled, s->timer.irq_ticks, s->timer.irq_requests,
+        !!(dmcu_sfr_read_word(env, DMCU_SFR_SOCR) & DMCU_SOCR_IE),
+        /* Keep the legacy diagnostic spelling for existing readers. These
+         * now count real TB expirations, at the guest-selected frequency. */
+        s->periodic_timers.timebase.expirations,
+        s->periodic_timers.timebase.expirations,
         env->interrupt_entries, env->interrupt_returns,
         env->interrupt_frame_overlap_deferrals,
         dmcu_code_segment(env->interrupt_last_entry_pc),
@@ -9006,8 +11489,10 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
         dmcu_code_pc(env->interrupt_first_bad_return_pc),
         env->interrupt_first_bad_frame_sp & 0xffff,
         env->interrupt_first_bad_frame_base & 0xffff,
-        s->keyboard.system_control,
-        np560_key_matrix_input(s, s->keyboard.matrix_drive),
+        dmcu_sfr_read_word(env, DMCU_SFR_SOCR),
+        np560_key_matrix_input(
+            s, s->keyboard.matrix_drive,
+            qatomic_read(&s->keyboard.matrix_pulse_index)),
         s->keyboard.matrix_drive, s->keyboard.matrix_reads,
         s->keyboard.matrix_writes, s->keyboard.matrix_active_reads,
         dmcu_code_segment(s->keyboard.matrix_last_active_pc),
@@ -9106,9 +11591,12 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
         dmcu_code_pc(env->completed_instruction_next_pc));
     g_string_append_printf(
         text,
+        "\nIRQ_NESTING=DEPTH:%u MAX:%u ICR:%u TRAPS:%u"
         "\nIRQ_REPEAT=SAVES:%u RESTORES:%u CONFLICTS:%u SAVED:%u "
         "FOREGROUND:%02x:%04x-%02x:%04x/%u/%u LIVE:%02x:%04x-"
-        "%02x:%04x/%u/%u",
+        "%02x:%04x/%u/%u SRC:%02x:%04x/%u SAVED_SRC:%02x:%04x/%u",
+        env->in_interrupt ? s->cpu->interrupt_contexts->len + 1 : 0,
+        env->interrupt_max_depth, env->interrupt_from_icr, env->software_traps,
         env->interrupt_repeat_saves, env->interrupt_repeat_restores,
         env->interrupt_repeat_conflicts, env->interrupt_repeat_saved,
         dmcu_code_segment(env->interrupt_repeat_pc),
@@ -9118,7 +11606,12 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
         env->interrupt_repeat_count, env->interrupt_repeat_block,
         dmcu_code_segment(env->repeat_pc), dmcu_code_pc(env->repeat_pc),
         dmcu_code_segment(env->repeat_end), dmcu_code_pc(env->repeat_end),
-        env->repeat_count, env->repeat_block);
+        env->repeat_count, env->repeat_block,
+        dmcu_code_segment(env->single_repeat_pc),
+        dmcu_code_pc(env->single_repeat_pc), env->single_repeat_count,
+        dmcu_code_segment(env->interrupt_single_repeat_pc),
+        dmcu_code_pc(env->interrupt_single_repeat_pc),
+        env->interrupt_single_repeat_count);
     g_string_append_printf(
         text,
         "\nFAR_COPY_IRQ=SAVES:%" G_GUINT64_FORMAT
@@ -9172,7 +11665,7 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
     g_string_append_printf(
         text,
         "\nIRQ_SAVE_FP=SAVES:%u ENTRY:%u WRITE:%02x:%04x NEXT:%02x:%04x "
-        "%04x>%04x L:%04x P:%06x/%u BUS:%u DS:%03x,%03x "
+        "%04x>%04x EXPECT:%04x L:%04x P:%06x/%u BUS:%u DS:%03x,%03x "
         "RESTORES:%u ENTRY:%u AT:%02x:%04x EXPECT:%04x SLOT:%04x FP:%04x",
         env->irq_save_fp_saves, env->irq_save_fp_save_entry,
         dmcu_code_segment(env->irq_save_fp_save_pc),
@@ -9181,6 +11674,7 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
         dmcu_code_pc(env->irq_save_fp_save_next_pc),
         env->irq_save_fp_save_old & 0xffff,
         env->irq_save_fp_saved_value & 0xffff,
+        env->irq_save_fp_save_expected & 0xffff,
         env->irq_save_fp_save_logical & 0xffff,
         env->irq_save_fp_save_physical & 0xffffff,
         env->irq_save_fp_save_bits, env->irq_save_fp_save_bus,
@@ -9238,7 +11732,9 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
     g_string_append_printf(
         text,
         "\nKEY_GUEST=2A4C:%04x 2A5C:%04x 2A6E:%04x 2A76:%04x "
-        "2A8A:%04x 2A8C:%04x 2A94:%04x 2AA6:%04x",
+        "2A8A:%04x 2A8C:%04x 2A94:%04x 2AA6:%04x 2A44:%04x "
+        "2A7A:%04x 2ABE:%04x 28D2:%04x 28D3:%02x 28D6:%04x "
+        "28D8:%04x 28DA:%04x A4_7A32:%02x A4_7AC4:%02x A4_7A76:%04x",
         address_space_lduw_le(&address_space_memory, 0x512a4c,
                               MEMTXATTRS_UNSPECIFIED, NULL),
         address_space_lduw_le(&address_space_memory, 0x512a5c,
@@ -9254,7 +11750,96 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
         address_space_lduw_le(&address_space_memory, 0x512a94,
                               MEMTXATTRS_UNSPECIFIED, NULL),
         address_space_lduw_le(&address_space_memory, 0x512aa6,
+                              MEMTXATTRS_UNSPECIFIED, NULL),
+        address_space_lduw_le(&address_space_memory, 0x512a44,
+                              MEMTXATTRS_UNSPECIFIED, NULL),
+        address_space_lduw_le(&address_space_memory, 0x512a7a,
+                              MEMTXATTRS_UNSPECIFIED, NULL),
+        address_space_lduw_le(&address_space_memory, 0x512abe,
+                              MEMTXATTRS_UNSPECIFIED, NULL),
+        address_space_lduw_le(&address_space_memory, 0x5128d2,
+                              MEMTXATTRS_UNSPECIFIED, NULL),
+        address_space_ldub(&address_space_memory, 0x5128d3,
+                           MEMTXATTRS_UNSPECIFIED, NULL),
+        address_space_lduw_le(&address_space_memory, 0x5128d6,
+                              MEMTXATTRS_UNSPECIFIED, NULL),
+        address_space_lduw_le(&address_space_memory, 0x5128d8,
+                              MEMTXATTRS_UNSPECIFIED, NULL),
+        address_space_lduw_le(&address_space_memory, 0x5128da,
+                              MEMTXATTRS_UNSPECIFIED, NULL),
+        address_space_ldub(&address_space_memory, 0x527a32 ^ 1u,
+                           MEMTXATTRS_UNSPECIFIED, NULL),
+        address_space_ldub(&address_space_memory, 0x527ac4 ^ 1u,
+                           MEMTXATTRS_UNSPECIFIED, NULL),
+        address_space_lduw_le(&address_space_memory, 0x527a76,
                               MEMTXATTRS_UNSPECIFIED, NULL));
+    g_string_append_printf(
+        text,
+        "\nKEY_PIPELINE=SCAN:%u/%u QUEUE:%u/%u WRAP:%u WORK:%u "
+        "TIMER:%u NPECALL:%u VENEER:%u HELPER:%u "
+        "LASTSP:%04x,%04x,%04x,%04x,%04x,%04x,%04x,%04x,%04x,%04x "
+        "LASTFP:%04x,%04x,%04x,%04x,%04x,%04x,%04x,%04x,%04x,%04x",
+        env->matrix_pipeline_stage_count[0],
+        env->matrix_pipeline_stage_count[1],
+        env->matrix_pipeline_stage_count[2],
+        env->matrix_pipeline_stage_count[3],
+        env->matrix_pipeline_stage_count[4],
+        env->matrix_pipeline_stage_count[5],
+        env->matrix_pipeline_stage_count[6],
+        env->matrix_pipeline_stage_count[7],
+        env->matrix_pipeline_stage_count[8],
+        env->matrix_pipeline_stage_count[9],
+        env->matrix_pipeline_stage_sp[0], env->matrix_pipeline_stage_sp[1],
+        env->matrix_pipeline_stage_sp[2], env->matrix_pipeline_stage_sp[3],
+        env->matrix_pipeline_stage_sp[4], env->matrix_pipeline_stage_sp[5],
+        env->matrix_pipeline_stage_sp[6], env->matrix_pipeline_stage_sp[7],
+        env->matrix_pipeline_stage_sp[8], env->matrix_pipeline_stage_sp[9],
+        env->matrix_pipeline_stage_fp[0], env->matrix_pipeline_stage_fp[1],
+        env->matrix_pipeline_stage_fp[2], env->matrix_pipeline_stage_fp[3],
+        env->matrix_pipeline_stage_fp[4], env->matrix_pipeline_stage_fp[5],
+        env->matrix_pipeline_stage_fp[6], env->matrix_pipeline_stage_fp[7],
+        env->matrix_pipeline_stage_fp[8], env->matrix_pipeline_stage_fp[9]);
+    {
+        uint32_t available = MIN(env->matrix_completion_trace_count,
+                                 DMCU_MATRIX_COMPLETION_TRACE_SLOTS);
+        uint32_t first = env->matrix_completion_trace_count - available;
+        uint32_t sequence;
+
+        g_string_append_printf(
+            text, "\nKEY_COMPLETION_TRACE=COUNT:%u TRACE:",
+            env->matrix_completion_trace_count);
+        for (sequence = first;
+             sequence < env->matrix_completion_trace_count; sequence++) {
+            unsigned slot = sequence % DMCU_MATRIX_COMPLETION_TRACE_SLOTS;
+
+            g_string_append_printf(
+                text,
+                "%s#%u/%02x:%04x<%02x:%04x/sp%04x/fp%04x/"
+                "ds%03x,%03x/g%04x/i%04x/c%04x/m%04x/crit%u/"
+                "sfr%04x,%04x,%04x/stk%04x,%04x,%04x,%04x",
+                sequence == first ? "" : ",", sequence + 1,
+                (env->matrix_completion_trace_pc[slot] >> 16) & 0xff,
+                env->matrix_completion_trace_pc[slot] & 0xffff,
+                (env->matrix_completion_trace_previous_pc[slot] >> 16) & 0xff,
+                env->matrix_completion_trace_previous_pc[slot] & 0xffff,
+                env->matrix_completion_trace_sp[slot],
+                env->matrix_completion_trace_fp[slot],
+                env->matrix_completion_trace_ds0[slot],
+                env->matrix_completion_trace_ds1[slot],
+                env->matrix_completion_trace_gate[slot],
+                env->matrix_completion_trace_index[slot],
+                env->matrix_completion_trace_candidate[slot],
+                env->matrix_completion_trace_mapped[slot],
+                env->matrix_completion_trace_critical[slot],
+                env->matrix_completion_trace_sfr[slot][0],
+                env->matrix_completion_trace_sfr[slot][1],
+                env->matrix_completion_trace_sfr[slot][2],
+                env->matrix_completion_trace_stack[slot][0],
+                env->matrix_completion_trace_stack[slot][1],
+                env->matrix_completion_trace_stack[slot][2],
+                env->matrix_completion_trace_stack[slot][3]);
+        }
+    }
     g_string_append_printf(
         text,
         "\nADC=LEVEL:%u CONTROL:%04x VALUE:%04x READS:%" G_GUINT64_FORMAT
@@ -9393,7 +11978,10 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
     g_string_append_printf(
         text,
         "\nPROVISION=CALLS:%u FROM:%02x:%04x SP:%04x STAGE:%u "
-        "OPEN:%04x:%04x RESULT:%04x:%04x",
+        "OPEN:%04x:%04x RESULT:%04x:%04x FOPEN_STAGE:%u "
+        "CHILD_MASK:%05x/%05x PATH:%04x/%04x/FAIL:%04x "
+        "ERRWRITE:%u FIRST:%02x:%04x/%04x>%04x "
+        "LAST:%02x:%04x/%04x>%04x CHILD_RESULT:",
         env->provision_calls,
         dmcu_code_segment(env->provision_caller),
         dmcu_code_pc(env->provision_caller),
@@ -9402,7 +11990,104 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
         env->provision_open_hi,
         env->provision_open_lo,
         env->provision_result_hi,
-        env->provision_result_lo);
+        env->provision_result_lo,
+        env->provision_open_stage,
+        env->provision_child_call_mask,
+        env->provision_child_return_mask,
+        env->provision_path_result,
+        env->provision_path_final_result,
+        env->provision_path_failure_pc,
+        env->provision_error_writes,
+        dmcu_code_segment(env->provision_error_first_pc),
+        dmcu_code_pc(env->provision_error_first_pc),
+        env->provision_error_first_old,
+        env->provision_error_first_value,
+        dmcu_code_segment(env->provision_error_last_pc),
+        dmcu_code_pc(env->provision_error_last_pc),
+        env->provision_error_last_old,
+        env->provision_error_last_value);
+    for (unsigned index = 0;
+         index < ARRAY_SIZE(env->provision_child_result_hi); index++) {
+        g_string_append_printf(
+            text, "%s%04x:%04x/%04x", index ? "," : "",
+            env->provision_child_result_hi[index],
+            env->provision_child_result_lo[index],
+            env->provision_child_error[index]);
+    }
+    g_string_append_printf(
+        text,
+        " PATH_DETAIL:IN:%04x:%04x REMAIN:%04x:%04x CHAR:%02x "
+        "SELECTOR:%04x ATTR:%02x CHILD:%04x:%04x DATA:",
+        env->provision_path_input_hi,
+        env->provision_path_input_lo,
+        env->provision_path_remaining_hi,
+        env->provision_path_remaining_lo,
+        env->provision_path_remaining_char,
+        env->provision_path_selector,
+        env->provision_path_attribute,
+        env->provision_path_child_hi,
+        env->provision_path_child_lo);
+    for (unsigned index = 0;
+         index < ARRAY_SIZE(env->provision_path_remaining); index++) {
+        g_string_append_printf(text, "%02x",
+                               env->provision_path_remaining[index]);
+    }
+    g_string_append(text, " OBJECT:");
+    for (unsigned index = 0;
+         index < ARRAY_SIZE(env->provision_path_object); index++) {
+        g_string_append_printf(text, "%02x",
+                               env->provision_path_object[index]);
+    }
+    g_string_append_printf(
+        text,
+        " LOOKUP_VENEER:%u SELECTOR:%04x BRANCH:%02x:%04x "
+        "OBJECT:%06x MODE:%02x RESULT:%04x",
+        env->provision_lookup_veneer_calls,
+        env->provision_lookup_selector,
+        dmcu_code_segment(env->provision_lookup_branch_target),
+        dmcu_code_pc(env->provision_lookup_branch_target),
+        env->provision_lookup_object,
+        env->provision_lookup_mode_at_call,
+        env->provision_lookup_result);
+    g_string_append_printf(
+        text,
+        "\nPIM_HEADER=COUNT:%u FP:%04x CATEGORY:%02x MODE:%02x HEADER:",
+        env->pim_header_snapshots,
+        env->pim_header_fp,
+        env->pim_header_category,
+        env->pim_header_mode);
+    for (unsigned index = 0; index < sizeof(env->pim_header); index++) {
+        g_string_append_printf(text, "%02x", env->pim_header[index]);
+    }
+    g_string_append(text, " PATH:");
+    for (unsigned index = 0; index < sizeof(env->pim_header_path); index++) {
+        g_string_append_printf(text, "%02x", env->pim_header_path[index]);
+    }
+    g_string_append(text, "\nPIM_TRACE=");
+    {
+        uint32_t count = MIN(env->pim_header_snapshots,
+                             (uint32_t)DMCU_PIM_TRACE_SLOTS);
+        uint32_t first = env->pim_header_snapshots - count;
+
+        for (uint32_t index = 0; index < count; index++) {
+            uint32_t sequence = first + index;
+            uint32_t slot = sequence % DMCU_PIM_TRACE_SLOTS;
+
+            g_string_append_printf(
+                text, "%s#%u/%02x:%04x/fp%04x/c%02x/m%02x/p",
+                index ? "," : "", sequence + 1u,
+                dmcu_code_segment(env->pim_trace_caller[slot]),
+                dmcu_code_pc(env->pim_trace_caller[slot]),
+                env->pim_trace_fp[slot],
+                env->pim_trace_category[slot],
+                env->pim_trace_mode[slot]);
+            for (unsigned byte = 0;
+                 byte < ARRAY_SIZE(env->pim_trace_path[slot]); byte++) {
+                g_string_append_printf(text, "%02x",
+                                       env->pim_trace_path[slot][byte]);
+            }
+        }
+    }
     g_string_append_printf(
         text,
         "\nFILE_OPEN=CALLS:%u SELECTED:%u ACTIVE:%u "
@@ -9847,6 +12532,20 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
         g_string_append_printf(text, "%s%04x", index ? ":" : "",
                                env->file_component_frame_exit[index]);
     }
+    g_string_append_printf(
+        text, " OUTPUT:%04x:%04x FILL:",
+        env->file_component_output_hi, env->file_component_output_lo);
+    for (unsigned index = 0; index < DMCU_FILE_RECORD_SELECTOR_BYTES;
+         index++) {
+        g_string_append_printf(text, "%02x",
+                               env->file_component_output_after_fill[index]);
+    }
+    g_string_append(text, " RETURN:");
+    for (unsigned index = 0; index < DMCU_FILE_RECORD_SELECTOR_BYTES;
+         index++) {
+        g_string_append_printf(text, "%02x",
+                               env->file_component_output_after_return[index]);
+    }
     g_string_append(text, " TRACE:");
     {
         uint32_t count = MIN(env->file_component_write_count,
@@ -10158,6 +12857,1133 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
         env->file_entry_build_returns);
     g_string_append_printf(
         text,
+        "\nNPE_BROWSER_LAYOUT=TRIGGER:%u CALLS:%u DEPTH:%u TRACE:",
+        env->npe_directory_trace_triggered,
+        env->npe_browser_layout_calls,
+        env->npe_browser_layout_depth);
+    for (unsigned trace = 0;
+         trace < MIN(env->npe_browser_layout_calls,
+                     DMCU_NPE_BROWSER_LAYOUT_TRACE_SLOTS);
+         trace++) {
+        g_string_append_printf(
+            text,
+            "%s#%u/%02x:%04x>1c:d462/obj%06x/"
+            "in-sp%04x/fp%04x/r%04x:%04x:%04x:%04x/"
+            "out-%s%02x:%04x/sp%04x/fp%04x/r%04x:%04x:%04x:%04x/"
+            "before:",
+            trace ? "," : "",
+            trace + 1u,
+            dmcu_code_segment(env->npe_browser_layout_caller[trace]),
+            dmcu_code_pc(env->npe_browser_layout_caller[trace]),
+            env->npe_browser_layout_object[trace] & 0xffffffu,
+            env->npe_browser_layout_entry_sp[trace],
+            env->npe_browser_layout_entry_fp[trace],
+            env->npe_browser_layout_entry_gpr[trace][0],
+            env->npe_browser_layout_entry_gpr[trace][1],
+            env->npe_browser_layout_entry_gpr[trace][2],
+            env->npe_browser_layout_entry_gpr[trace][3],
+            env->npe_browser_layout_returned[trace] ? "" : "pending@",
+            dmcu_code_segment(env->npe_browser_layout_return_target[trace]),
+            dmcu_code_pc(env->npe_browser_layout_return_target[trace]),
+            env->npe_browser_layout_return_sp[trace],
+            env->npe_browser_layout_return_fp[trace],
+            env->npe_browser_layout_return_gpr[trace][0],
+            env->npe_browser_layout_return_gpr[trace][1],
+            env->npe_browser_layout_return_gpr[trace][2],
+            env->npe_browser_layout_return_gpr[trace][3]);
+        if (!env->npe_browser_layout_object_valid[trace]) {
+            g_string_append(text, "invalid");
+        } else {
+            for (unsigned word = 0;
+                 word < DMCU_NPE_BROWSER_LAYOUT_OBJECT_WORDS; word++) {
+                g_string_append_printf(
+                    text, "%04x",
+                    env->npe_browser_layout_before[trace][word]);
+            }
+        }
+        g_string_append(text, "/after:");
+        if (!env->npe_browser_layout_object_valid[trace] ||
+            !env->npe_browser_layout_returned[trace]) {
+            g_string_append(text, "pending");
+        } else {
+            for (unsigned word = 0;
+                 word < DMCU_NPE_BROWSER_LAYOUT_OBJECT_WORDS; word++) {
+                g_string_append_printf(
+                    text, "%04x",
+                    env->npe_browser_layout_after[trace][word]);
+            }
+        }
+    }
+    g_string_append_printf(
+        text,
+        "\nNPE_OBJECT_MASK=WATCH:%u CALLS:%u/%u "
+        "ENTRY:%02x:%04x/sp%04x>%04x/fp%04x/arg%04x:%04x/"
+        "f08,%04x/f10,%04x/f12,%04x/f54,%04x/f56,%04x "
+        "RETURN:%02x:%04x>%02x:%04x/sp%04x>%04x/fp%04x/"
+        "r%04x:%04x/f08,%04x/f10,%04x/f12,%04x/f54,%04x/f56,%04x "
+        "TYPE:%u@%02x:%04x>%02x:%04x/psw%04x/r%04x "
+        "STATE:%u@%02x:%04x>%02x:%04x/psw%04x/r%04x "
+        "MASK:%u@%02x:%04x>%02x:%04x/psw%04x/r%04x "
+        "ATTACH:%u/%u",
+        env->npe_object_mask_watch_active,
+        env->npe_object_mask_calls,
+        env->npe_object_mask_returns,
+        dmcu_code_segment(env->npe_object_mask_caller),
+        dmcu_code_pc(env->npe_object_mask_caller),
+        env->npe_object_mask_entry_sp,
+        env->npe_object_mask_entry_post_sp,
+        env->npe_object_mask_entry_fp,
+        env->npe_object_mask_arg_hi,
+        env->npe_object_mask_arg_lo,
+        env->npe_object_mask_entry_fields[0],
+        env->npe_object_mask_entry_fields[1],
+        env->npe_object_mask_entry_fields[2],
+        env->npe_object_mask_entry_fields[3],
+        env->npe_object_mask_entry_fields[4],
+        dmcu_code_segment(env->npe_object_mask_return_from),
+        dmcu_code_pc(env->npe_object_mask_return_from),
+        dmcu_code_segment(env->npe_object_mask_return_target),
+        dmcu_code_pc(env->npe_object_mask_return_target),
+        env->npe_object_mask_return_sp,
+        env->npe_object_mask_return_post_sp,
+        env->npe_object_mask_return_fp,
+        env->npe_object_mask_return_r0,
+        env->npe_object_mask_return_r1,
+        env->npe_object_mask_return_fields[0],
+        env->npe_object_mask_return_fields[1],
+        env->npe_object_mask_return_fields[2],
+        env->npe_object_mask_return_fields[3],
+        env->npe_object_mask_return_fields[4],
+        env->npe_object_mask_branch_count[0],
+        dmcu_code_segment(env->npe_object_mask_branch_from[0]),
+        dmcu_code_pc(env->npe_object_mask_branch_from[0]),
+        dmcu_code_segment(env->npe_object_mask_branch_target[0]),
+        dmcu_code_pc(env->npe_object_mask_branch_target[0]),
+        env->npe_object_mask_branch_psw[0],
+        env->npe_object_mask_branch_r0[0],
+        env->npe_object_mask_branch_count[1],
+        dmcu_code_segment(env->npe_object_mask_branch_from[1]),
+        dmcu_code_pc(env->npe_object_mask_branch_from[1]),
+        dmcu_code_segment(env->npe_object_mask_branch_target[1]),
+        dmcu_code_pc(env->npe_object_mask_branch_target[1]),
+        env->npe_object_mask_branch_psw[1],
+        env->npe_object_mask_branch_r0[1],
+        env->npe_object_mask_branch_count[2],
+        dmcu_code_segment(env->npe_object_mask_branch_from[2]),
+        dmcu_code_pc(env->npe_object_mask_branch_from[2]),
+        dmcu_code_segment(env->npe_object_mask_branch_target[2]),
+        dmcu_code_pc(env->npe_object_mask_branch_target[2]),
+        env->npe_object_mask_branch_psw[2],
+        env->npe_object_mask_branch_r0[2],
+        env->npe_object_mask_attach_calls[0],
+        env->npe_object_mask_attach_calls[1]);
+    g_string_append_printf(
+        text,
+        "\nNPE_RENDER_OBJECT=ACTIVE:%u BASE:%04x CALLS:%u RETURNS:%u "
+        "ENTRY:%02x:%04x/sp%04x/fp%04x/arg%04x:%04x "
+        "RETURN:%02x:%04x>%02x:%04x/sp%04x/fp%04x "
+        "CONTEXT:%u/%u@%02x:%04x/w%04x/sp%04x/fp%04x/result%04x/"
+        "init%u/branch%u>%02x:%04x/"
+        "psw%04x/r%04x:%04x/fail%u@%02x:%04x/"
+        "tramp%u@%02x:%04x/w%04x/sp%04x/fp%04x/r%04x "
+        "COMP:%u@%02x:%04x/w%04x/sp%04x/fp%04x/"
+        "child%u@%02x:%04x/w%04x/sp%04x/fp%04x/"
+        "ret13%u@%02x:%04x/w%04x/sp%04x/fp%04x/"
+        "src%u@%02x:%04x>%02x:%04x/w%04x/sp%04x/fp%04x/r%04x/stack"
+        "%04x,%04x,%04x,%04x,%04x,%04x,%04x,%04x "
+        "BRANCH0:%u/%02x:%04x>%02x:%04x/psw%04x/r0%04x "
+        "BRANCH1:%u/%02x:%04x>%02x:%04x/psw%04x/r0%04x "
+        "LAYOUT:%u HELPER:%u INITIAL:",
+        env->npe_render_object_watch_active,
+        env->npe_render_object_base,
+        env->npe_render_object_calls,
+        env->npe_render_object_returns,
+        dmcu_code_segment(env->npe_render_object_caller),
+        dmcu_code_pc(env->npe_render_object_caller),
+        env->npe_render_object_entry_sp,
+        env->npe_render_object_entry_fp,
+        env->npe_render_object_arg_hi,
+        env->npe_render_object_arg_lo,
+        dmcu_code_segment(env->npe_render_object_return_from),
+        dmcu_code_pc(env->npe_render_object_return_from),
+        dmcu_code_segment(env->npe_render_object_return_target),
+        dmcu_code_pc(env->npe_render_object_return_target),
+        env->npe_render_object_return_sp,
+        env->npe_render_object_return_fp,
+        env->npe_render_object_context_calls,
+        env->npe_render_object_context_returns,
+        dmcu_code_segment(env->npe_render_object_context_return_from),
+        dmcu_code_pc(env->npe_render_object_context_return_from),
+        env->npe_render_object_context_return_word,
+        env->npe_render_object_context_return_sp,
+        env->npe_render_object_context_return_fp,
+        env->npe_render_object_context_result,
+        env->npe_render_object_context_init_entries,
+        env->npe_render_object_context_branch_count,
+        dmcu_code_segment(env->npe_render_object_context_branch_target),
+        dmcu_code_pc(env->npe_render_object_context_branch_target),
+        env->npe_render_object_context_branch_psw,
+        env->npe_render_object_context_branch_r0,
+        env->npe_render_object_context_branch_r1,
+        env->npe_render_object_context_failure_count,
+        dmcu_code_segment(env->npe_render_object_context_failure_from),
+        dmcu_code_pc(env->npe_render_object_context_failure_from),
+        env->npe_render_object_context_trampoline_entries,
+        dmcu_code_segment(env->npe_render_object_context_trampoline_from),
+        dmcu_code_pc(env->npe_render_object_context_trampoline_from),
+        env->npe_render_object_context_trampoline_word,
+        env->npe_render_object_context_trampoline_sp,
+        env->npe_render_object_context_trampoline_fp,
+        env->npe_render_object_context_trampoline_r0,
+        env->npe_render_object_compositor_entries,
+        dmcu_code_segment(env->npe_render_object_compositor_entry_from),
+        dmcu_code_pc(env->npe_render_object_compositor_entry_from),
+        env->npe_render_object_compositor_entry_word,
+        env->npe_render_object_compositor_entry_sp,
+        env->npe_render_object_compositor_entry_fp,
+        env->npe_render_object_compositor_child_calls,
+        dmcu_code_segment(env->npe_render_object_compositor_child_from),
+        dmcu_code_pc(env->npe_render_object_compositor_child_from),
+        env->npe_render_object_compositor_child_word,
+        env->npe_render_object_compositor_child_sp,
+        env->npe_render_object_compositor_child_fp,
+        env->npe_render_object_compositor_resident_returns,
+        dmcu_code_segment(
+            env->npe_render_object_compositor_resident_return_from),
+        dmcu_code_pc(
+            env->npe_render_object_compositor_resident_return_from),
+        env->npe_render_object_compositor_resident_return_word,
+        env->npe_render_object_compositor_resident_return_sp,
+        env->npe_render_object_compositor_resident_return_fp,
+        env->npe_render_object_compositor_source_entries,
+        dmcu_code_segment(
+            env->npe_render_object_compositor_source_entry_from),
+        dmcu_code_pc(
+            env->npe_render_object_compositor_source_entry_from),
+        dmcu_code_segment(
+            env->npe_render_object_compositor_source_entry_target),
+        dmcu_code_pc(
+            env->npe_render_object_compositor_source_entry_target),
+        env->npe_render_object_compositor_source_entry_word,
+        env->npe_render_object_compositor_source_entry_sp,
+        env->npe_render_object_compositor_source_entry_fp,
+        env->npe_render_object_compositor_source_entry_r0,
+        env->npe_render_object_compositor_source_entry_stack[0],
+        env->npe_render_object_compositor_source_entry_stack[1],
+        env->npe_render_object_compositor_source_entry_stack[2],
+        env->npe_render_object_compositor_source_entry_stack[3],
+        env->npe_render_object_compositor_source_entry_stack[4],
+        env->npe_render_object_compositor_source_entry_stack[5],
+        env->npe_render_object_compositor_source_entry_stack[6],
+        env->npe_render_object_compositor_source_entry_stack[7],
+        env->npe_render_object_branch_count[0],
+        dmcu_code_segment(env->npe_render_object_branch_from[0]),
+        dmcu_code_pc(env->npe_render_object_branch_from[0]),
+        dmcu_code_segment(env->npe_render_object_branch_target[0]),
+        dmcu_code_pc(env->npe_render_object_branch_target[0]),
+        env->npe_render_object_branch_psw[0],
+        env->npe_render_object_branch_r0[0],
+        env->npe_render_object_branch_count[1],
+        dmcu_code_segment(env->npe_render_object_branch_from[1]),
+        dmcu_code_pc(env->npe_render_object_branch_from[1]),
+        dmcu_code_segment(env->npe_render_object_branch_target[1]),
+        dmcu_code_pc(env->npe_render_object_branch_target[1]),
+        env->npe_render_object_branch_psw[1],
+        env->npe_render_object_branch_r0[1],
+        env->npe_render_object_layout_calls,
+        env->npe_render_object_helper_tail_calls);
+    if (!env->npe_render_object_initial_valid) {
+        g_string_append(text, "pending");
+    } else {
+        for (unsigned byte = 0;
+             byte < DMCU_NPE_RENDER_OBJECT_BYTES; byte++) {
+            g_string_append_printf(
+                text, "%02x", env->npe_render_object_initial[byte]);
+        }
+    }
+    g_string_append(text, " BEFORE:");
+    if (!env->npe_render_object_before_valid) {
+        g_string_append(text, "pending");
+    } else {
+        for (unsigned byte = 0;
+             byte < DMCU_NPE_RENDER_OBJECT_BYTES; byte++) {
+            g_string_append_printf(
+                text, "%02x", env->npe_render_object_before[byte]);
+        }
+    }
+    g_string_append(text, " AFTER:");
+    if (!env->npe_render_object_after_valid) {
+        g_string_append(text, "pending");
+    } else {
+        for (unsigned byte = 0;
+             byte < DMCU_NPE_RENDER_OBJECT_BYTES; byte++) {
+            g_string_append_printf(
+                text, "%02x", env->npe_render_object_after[byte]);
+        }
+    }
+    g_string_append_printf(
+        text, " WRITES:%" G_GUINT64_FORMAT "/%u TRACE:",
+        env->npe_render_object_write_sequence,
+        (unsigned)MIN(
+            env->npe_render_object_write_sequence,
+            (uint64_t)DMCU_NPE_RENDER_OBJECT_WRITE_TRACE_SLOTS));
+    if (env->npe_render_object_write_sequence) {
+        uint64_t count = MIN(
+            env->npe_render_object_write_sequence,
+            (uint64_t)DMCU_NPE_RENDER_OBJECT_WRITE_TRACE_SLOTS);
+        uint64_t first = env->npe_render_object_write_sequence - count;
+        bool printed = false;
+
+        for (uint64_t event = first;
+             event < env->npe_render_object_write_sequence; event++) {
+            uint32_t slot = event %
+                DMCU_NPE_RENDER_OBJECT_WRITE_TRACE_SLOTS;
+
+            if (env->npe_render_object_write_event[slot] != event) {
+                continue;
+            }
+            g_string_append_printf(
+                text,
+                "%s#%" G_GUINT64_FORMAT "/%c/%02x:%04x/"
+                "%04x(+%02x)/%04x>%04x/%u/sp%04x/fp%04x/irq%u",
+                printed ? "," : "", event + 1u,
+                env->npe_render_object_write_bus[slot] ? 'T' : 'I',
+                dmcu_code_segment(env->npe_render_object_write_pc[slot]),
+                dmcu_code_pc(env->npe_render_object_write_pc[slot]),
+                env->npe_render_object_write_address[slot],
+                (env->npe_render_object_write_address[slot] -
+                 env->npe_render_object_base) & 0xffu,
+                env->npe_render_object_write_old[slot],
+                env->npe_render_object_write_new[slot],
+                env->npe_render_object_write_bits[slot],
+                env->npe_render_object_write_sp[slot],
+                env->npe_render_object_write_fp[slot],
+                env->npe_render_object_write_in_interrupt[slot]);
+            printed = true;
+        }
+    }
+    g_string_append_printf(
+        text,
+        "\nNPE_MATERIALIZE=ACTIVE:%u CALLS:%u/%u "
+        "ENTRY:sp%04x/fp%04x/path%04x:%04x/mode%04x "
+        "FRAME:%04x RETURN:%04x:%04x INPUTS:%s%04x,%04x,%04x "
+        "TOTAL:%s%04x:%04x PATH:",
+        env->npe_materialize_watch_active,
+        env->npe_materialize_calls,
+        env->npe_materialize_returns,
+        env->npe_materialize_entry_sp,
+        env->npe_materialize_entry_fp,
+        env->npe_materialize_arg_path_hi,
+        env->npe_materialize_arg_path_lo,
+        env->npe_materialize_arg_mode,
+        env->npe_materialize_frame_fp,
+        env->npe_materialize_return_r0,
+        env->npe_materialize_return_r1,
+        env->npe_materialize_count_inputs_valid ? "" : "pending/",
+        env->npe_materialize_count_inputs[0],
+        env->npe_materialize_count_inputs[1],
+        env->npe_materialize_count_inputs[2],
+        env->npe_materialize_total_valid ? "" : "pending/",
+        env->npe_materialize_total_hi,
+        env->npe_materialize_total_lo);
+    for (unsigned byte = 0; byte < DMCU_NPE_MATERIALIZE_PATH_BYTES; byte++) {
+        g_string_append_printf(text, "%02x", env->npe_materialize_path[byte]);
+    }
+    g_string_append(text, " PATTERN:");
+    for (unsigned byte = 0; byte < DMCU_NPE_MATERIALIZE_PATH_BYTES; byte++) {
+        g_string_append_printf(
+            text, "%02x", env->npe_materialize_local_pattern[byte]);
+    }
+    g_string_append_printf(
+        text, " EVENTS:%u/%u TRACE:", env->npe_materialize_trace_count,
+        MIN(env->npe_materialize_trace_count,
+            (uint32_t)DMCU_NPE_MATERIALIZE_TRACE_SLOTS));
+    {
+        static const char *const stage_name[] = {
+            "invalid", "entry", "strlen-call", "strlen-return",
+            "copy-call", "copy-return", "findfirst-call",
+            "findfirst-return", "filter-call", "filter-return",
+            "contribute-call", "contribute-return", "findnext-call",
+            "findnext-return", "return", "filter-bypass",
+        };
+        uint32_t count = MIN(
+            env->npe_materialize_trace_count,
+            (uint32_t)DMCU_NPE_MATERIALIZE_TRACE_SLOTS);
+
+        for (uint32_t event = 0; event < count; event++) {
+            uint8_t stage = env->npe_materialize_trace_stage[event];
+
+            g_string_append_printf(
+                text,
+                "%s#%u/%s/%02x:%04x>%02x:%04x/sp%04x/fp%04x/"
+                "r%04x:%04x/status%04x:%04x/acc%04x:%04x/record",
+                event ? "," : "", event + 1u,
+                stage < ARRAY_SIZE(stage_name) ? stage_name[stage] : "unknown",
+                dmcu_code_segment(env->npe_materialize_trace_from[event]),
+                dmcu_code_pc(env->npe_materialize_trace_from[event]),
+                dmcu_code_segment(env->npe_materialize_trace_target[event]),
+                dmcu_code_pc(env->npe_materialize_trace_target[event]),
+                env->npe_materialize_trace_sp[event],
+                env->npe_materialize_trace_fp[event],
+                env->npe_materialize_trace_r0[event],
+                env->npe_materialize_trace_r1[event],
+                env->npe_materialize_trace_first_status[event],
+                env->npe_materialize_trace_next_status[event],
+                env->npe_materialize_trace_accumulator_hi[event],
+                env->npe_materialize_trace_accumulator_lo[event]);
+            for (unsigned byte = 0;
+                 byte < DMCU_NPE_MATERIALIZE_RECORD_BYTES; byte++) {
+                g_string_append_printf(
+                    text, "%02x",
+                    env->npe_materialize_trace_record[event][byte]);
+            }
+        }
+    }
+    g_string_append_printf(
+        text,
+        "\nNPE_OPERATION_CALLBACKS=ACTIVE:%u TEST:%u/%u/"
+        "entry:sp%04x>%04x/fp%04x/arg%04x:%04x/"
+        "return:%02x:%04x/w%04x/sp%04x>%04x/fp%04x/r%04x "
+        "INSTALLED:%u/object%04x:%04x/fields%04x:%04x,%04x:%04x "
+        "LAYOUT:%u/%u/object%04x:%04x/"
+        "before%04x:%04x,%04x:%04x/"
+        "after%04x:%04x,%04x:%04x "
+        "EVENT:%u/%u/entry-sp%04x/fp%04x/"
+        "return:%02x:%04x/sp%04x/fp%04x TARGETS:",
+        env->npe_operation_callback_watch_active,
+        env->npe_operation_context_test_calls,
+        env->npe_operation_context_test_returns,
+        env->npe_operation_context_test_entry_sp,
+        env->npe_operation_context_test_entry_post_sp,
+        env->npe_operation_context_test_entry_fp,
+        env->npe_operation_context_test_arg_hi,
+        env->npe_operation_context_test_arg_lo,
+        dmcu_code_segment(env->npe_operation_context_test_return_from),
+        dmcu_code_pc(env->npe_operation_context_test_return_from),
+        env->npe_operation_context_test_return_word,
+        env->npe_operation_context_test_return_sp,
+        env->npe_operation_context_test_return_post_sp,
+        env->npe_operation_context_test_return_fp,
+        env->npe_operation_context_test_result,
+        env->npe_operation_callbacks_installed_valid,
+        env->npe_operation_callbacks_object_hi,
+        env->npe_operation_callbacks_object_lo,
+        env->npe_operation_callbacks_installed[0],
+        env->npe_operation_callbacks_installed[1],
+        env->npe_operation_callbacks_installed[2],
+        env->npe_operation_callbacks_installed[3],
+        env->npe_operation_layout_calls,
+        env->npe_operation_layout_returns,
+        env->npe_operation_layout_object_hi,
+        env->npe_operation_layout_object_lo,
+        env->npe_operation_layout_before[0],
+        env->npe_operation_layout_before[1],
+        env->npe_operation_layout_before[2],
+        env->npe_operation_layout_before[3],
+        env->npe_operation_layout_after[0],
+        env->npe_operation_layout_after[1],
+        env->npe_operation_layout_after[2],
+        env->npe_operation_layout_after[3],
+        env->npe_operation_event_loop_calls,
+        env->npe_operation_event_loop_returns,
+        env->npe_operation_event_loop_entry_sp,
+        env->npe_operation_event_loop_entry_fp,
+        dmcu_code_segment(env->npe_operation_event_loop_return_from),
+        dmcu_code_pc(env->npe_operation_event_loop_return_from),
+        env->npe_operation_event_loop_return_sp,
+        env->npe_operation_event_loop_return_fp);
+    {
+        static const uint32_t callback_target[
+            DMCU_NPE_OPERATION_CALLBACK_SLOTS] = {
+            0x22147au, 0x23147au, 0x28dda6u,
+        };
+
+        for (unsigned callback = 0;
+             callback < DMCU_NPE_OPERATION_CALLBACK_SLOTS; callback++) {
+            g_string_append_printf(
+                text,
+                "%s%02x:%04x=%u/from%02x:%04x/w%04x/sp%04x/fp%04x/"
+                "stack%04x,%04x,%04x,%04x",
+                callback ? ";" : "",
+                dmcu_code_segment(callback_target[callback]),
+                dmcu_code_pc(callback_target[callback]),
+                env->npe_operation_callback_calls[callback],
+                dmcu_code_segment(env->npe_operation_callback_from[callback]),
+                dmcu_code_pc(env->npe_operation_callback_from[callback]),
+                env->npe_operation_callback_word[callback],
+                env->npe_operation_callback_sp[callback],
+                env->npe_operation_callback_fp[callback],
+                env->npe_operation_callback_stack[callback][0],
+                env->npe_operation_callback_stack[callback][1],
+                env->npe_operation_callback_stack[callback][2],
+                env->npe_operation_callback_stack[callback][3]);
+        }
+    }
+    g_string_append_printf(
+        text,
+        "\nNPE_FORMAT_DISPATCH=ACTIVE:%u FOLLOW:%u/%u ENTRY:%u "
+        "LITERAL_WRAP:%u/%u/%u/%u "
+        "FIELD_7AA2_380A_7AA6:%u/%u/r%04x "
+        "MEMCMP:7B2A=%u/r%04x,7B56=%u/r%04x,7B82=%u/r%04x "
+        "STATUS_7BAE:%u/is2:%u/r%04x "
+        "RETURN_8294:%u/r%04x/to%02x:%04x "
+        "B6DE:%u/r%04x B726_D1A6:%u "
+        "LEGACY_53:%u/%u/%u LEGACY_1B:%u/%u",
+        env->npe_format_dispatch_active,
+        env->npe_format_dispatch_followup_active,
+        env->npe_format_dispatch_followup_steps,
+        env->npe_format_dispatch_entries,
+        env->npe_format_literal_wrapper_calls,
+        env->npe_format_literal_copy_calls,
+        env->npe_format_literal_copy_returns,
+        env->npe_format_literal_tail_calls,
+        env->npe_format_field_calls,
+        env->npe_format_field_returns,
+        env->npe_format_field_return_r0,
+        env->npe_format_memcmp_returns[0],
+        env->npe_format_memcmp_result[0],
+        env->npe_format_memcmp_returns[1],
+        env->npe_format_memcmp_result[1],
+        env->npe_format_memcmp_returns[2],
+        env->npe_format_memcmp_result[2],
+        env->npe_format_status_site_hits,
+        env->npe_format_status2_hits,
+        env->npe_format_status_value,
+        env->npe_format_dispatch_returns,
+        env->npe_format_dispatch_return_r0,
+        dmcu_code_segment(env->npe_format_dispatch_return_target),
+        dmcu_code_pc(env->npe_format_dispatch_return_target),
+        env->npe_format_router_b6de_hits,
+        env->npe_format_router_b6de_r0,
+        env->npe_format_mode2_calls,
+        env->npe_format_legacy_service_calls[0],
+        env->npe_format_legacy_service_calls[1],
+        env->npe_format_legacy_service_calls[2],
+        env->npe_format_legacy_path_calls[0],
+        env->npe_format_legacy_path_calls[1]);
+    g_string_append(text, " NPE_FORMAT_ARGS=");
+    for (i = 0; i < DMCU_NPE_FORMAT_MEMCMP_SLOTS; i++) {
+        unsigned pointer;
+        unsigned byte;
+
+        g_string_append_printf(
+            text, "%s#%u/a%04x:%04x,%04x:%04x,n%04x:%04x/v%u%u",
+            i ? "," : "", i + 1u,
+            env->npe_format_memcmp_args[i][0],
+            env->npe_format_memcmp_args[i][1],
+            env->npe_format_memcmp_args[i][2],
+            env->npe_format_memcmp_args[i][3],
+            env->npe_format_memcmp_args[i][4],
+            env->npe_format_memcmp_args[i][5],
+            env->npe_format_memcmp_pointer_valid[i][0],
+            env->npe_format_memcmp_pointer_valid[i][1]);
+        for (pointer = 0; pointer < 2; pointer++) {
+            g_string_append_printf(text, "/%c", pointer ? 'R' : 'L');
+            for (byte = 0; byte < DMCU_NPE_FORMAT_SAMPLE_BYTES; byte++) {
+                g_string_append_printf(
+                    text, "%02x",
+                    env->npe_format_memcmp_sample[i][pointer][byte]);
+            }
+        }
+    }
+    g_string_append_printf(
+        text,
+        "\nNPE_TRANSFORM=ACTIVE:%u CALLS:%u/%u/%u/%u "
+        "ENTRY:%02x:%04x/sp%04x>%04x/fp%04x/"
+        "args%04x:%04x,%04x:%04x,n%04x "
+        "VALID:%u/%u TYPE:%04x TABLE:%04x:%04x "
+        "RECORD:%04x:%04x CHILD:%04x:%04x "
+        "RESIDENT:sp%04x>%04x/fp%04x/"
+        "args%04x:%04x,%04x:%04x,n%04x:%04x "
+        "EXIT:%02x:%04x>%02x:%04x/r%04x:%04x/f%04x "
+        "RETURN:%02x:%04x>%02x:%04x/r%04x:%04x/f%04x "
+        "ERRPAGE:%u OBJ:",
+        env->npe_transform_active,
+        env->npe_transform_calls,
+        env->npe_transform_resident_calls,
+        env->npe_transform_resident_returns,
+        env->npe_transform_returns,
+        dmcu_code_segment(env->npe_transform_call_from),
+        dmcu_code_pc(env->npe_transform_call_from),
+        env->npe_transform_call_sp,
+        env->npe_transform_call_post_sp,
+        env->npe_transform_call_fp,
+        env->npe_transform_args[0],
+        env->npe_transform_args[1],
+        env->npe_transform_args[2],
+        env->npe_transform_args[3],
+        env->npe_transform_args[4],
+        env->npe_transform_object_valid,
+        env->npe_transform_buffer_valid,
+        env->npe_transform_object_type,
+        env->npe_transform_table_base_hi,
+        env->npe_transform_table_base_lo,
+        env->npe_transform_record_hi,
+        env->npe_transform_record_lo,
+        env->npe_transform_child_hi,
+        env->npe_transform_child_lo,
+        env->npe_transform_resident_sp,
+        env->npe_transform_resident_post_sp,
+        env->npe_transform_resident_fp,
+        env->npe_transform_resident_args[0],
+        env->npe_transform_resident_args[1],
+        env->npe_transform_resident_args[2],
+        env->npe_transform_resident_args[3],
+        env->npe_transform_resident_args[4],
+        env->npe_transform_resident_args[5],
+        dmcu_code_segment(env->npe_transform_exit_from),
+        dmcu_code_pc(env->npe_transform_exit_from),
+        dmcu_code_segment(env->npe_transform_exit_target),
+        dmcu_code_pc(env->npe_transform_exit_target),
+        env->npe_transform_exit_r0,
+        env->npe_transform_exit_r1,
+        env->npe_transform_exit_file_error,
+        dmcu_code_segment(env->npe_transform_return_from),
+        dmcu_code_pc(env->npe_transform_return_from),
+        dmcu_code_segment(env->npe_transform_return_target),
+        dmcu_code_pc(env->npe_transform_return_target),
+        env->npe_transform_return_r0,
+        env->npe_transform_return_r1,
+        env->npe_transform_return_file_error,
+        env->npe_transform_error_page_calls);
+    for (i = 0; i < DMCU_NPE_TRANSFORM_SAMPLE_BYTES; i++) {
+        g_string_append_printf(text, "%02x",
+                               env->npe_transform_object_sample[i]);
+    }
+    g_string_append(text, " BUF:");
+    for (i = 0; i < DMCU_NPE_TRANSFORM_SAMPLE_BYTES; i++) {
+        g_string_append_printf(text, "%02x",
+                               env->npe_transform_buffer_sample[i]);
+    }
+    g_string_append_printf(
+        text,
+        "\nNPE_STREAM_GLOBAL=AT_TRANSFORM:%04x:%04x WRITES:%u "
+        "INIT:%u/%u/from%02x:%04x/sp%04x/fp%04x/arg%04x:%04x/"
+        "to%02x:%04x/r%04x:%04x "
+        "OPEN:%u/%u/from%02x:%04x/sp%04x/fp%04x/"
+        "args%04x,%04x,%04x,%04x,%04x/to%02x:%04x/r%04x:%04x "
+        "CHILD:%u/%u/from%02x:%04x/sp%04x/fp%04x/"
+        "to%02x:%04x/r%04x:%04x TRACE:",
+        env->npe_stream_global_at_transform_hi,
+        env->npe_stream_global_at_transform_lo,
+        env->npe_stream_global_writes,
+        env->npe_stream_initializer_calls,
+        env->npe_stream_initializer_returns,
+        dmcu_code_segment(env->npe_stream_initializer_caller),
+        dmcu_code_pc(env->npe_stream_initializer_caller),
+        env->npe_stream_initializer_sp,
+        env->npe_stream_initializer_fp,
+        env->npe_stream_initializer_arg_hi,
+        env->npe_stream_initializer_arg_lo,
+        dmcu_code_segment(env->npe_stream_initializer_return_target),
+        dmcu_code_pc(env->npe_stream_initializer_return_target),
+        env->npe_stream_initializer_return_r0,
+        env->npe_stream_initializer_return_r1,
+        env->npe_stream_open_calls,
+        env->npe_stream_open_returns,
+        dmcu_code_segment(env->npe_stream_open_caller),
+        dmcu_code_pc(env->npe_stream_open_caller),
+        env->npe_stream_open_sp,
+        env->npe_stream_open_fp,
+        env->npe_stream_open_args[0],
+        env->npe_stream_open_args[1],
+        env->npe_stream_open_args[2],
+        env->npe_stream_open_args[3],
+        env->npe_stream_open_args[4],
+        dmcu_code_segment(env->npe_stream_open_return_target),
+        dmcu_code_pc(env->npe_stream_open_return_target),
+        env->npe_stream_open_return_r0,
+        env->npe_stream_open_return_r1,
+        env->npe_stream_open_child_calls,
+        env->npe_stream_open_child_returns,
+        dmcu_code_segment(env->npe_stream_open_child_caller),
+        dmcu_code_pc(env->npe_stream_open_child_caller),
+        env->npe_stream_open_child_sp,
+        env->npe_stream_open_child_fp,
+        dmcu_code_segment(env->npe_stream_open_child_return_target),
+        dmcu_code_pc(env->npe_stream_open_child_return_target),
+        env->npe_stream_open_child_return_r0,
+        env->npe_stream_open_child_return_r1);
+    for (i = 0;
+         i < MIN(env->npe_stream_global_writes,
+                 DMCU_NPE_STREAM_GLOBAL_WRITE_TRACE_SLOTS);
+         i++) {
+        uint32_t first = env->npe_stream_global_writes >
+                         DMCU_NPE_STREAM_GLOBAL_WRITE_TRACE_SLOTS ?
+                         env->npe_stream_global_writes -
+                         DMCU_NPE_STREAM_GLOBAL_WRITE_TRACE_SLOTS : 0u;
+        uint32_t slot = (first + i) %
+                        DMCU_NPE_STREAM_GLOBAL_WRITE_TRACE_SLOTS;
+
+        g_string_append_printf(
+            text,
+            "%s#%u/%02x:%04x/p%06x/%04x>%04x/b%u/"
+            "sp%04x/fp%04x/ds%03x:%03x",
+            i ? "," : "",
+            first + i + 1u,
+            dmcu_code_segment(env->npe_stream_global_write_pc[slot]),
+            dmcu_code_pc(env->npe_stream_global_write_pc[slot]),
+            env->npe_stream_global_write_address[slot],
+            env->npe_stream_global_write_old[slot],
+            env->npe_stream_global_write_new[slot],
+            env->npe_stream_global_write_bits[slot],
+            env->npe_stream_global_write_sp[slot],
+            env->npe_stream_global_write_fp[slot],
+            env->npe_stream_global_write_ds0[slot],
+            env->npe_stream_global_write_ds1[slot]);
+    }
+    g_string_append_printf(
+        text,
+        "\nNPE_DF06_ENTRY=COUNT:%u FROM:%02x:%04x>TO:%02x:%04x "
+        "WORD:%04x EXT:%04x "
+        "SEQ:%02x:%04x PREV:%02x:%04x>%02x:%04x/w%04x "
+        "SP:%04x>%04x FP:%04x>%04x STATE:%04x "
+        "OBJECT:%04x:%04x STREAM:%04x:%04x "
+        "GPR:%04x,%04x,%04x,%04x PRESTACK:",
+        env->npe_df06_entry_count,
+        dmcu_code_segment(env->npe_df06_entry_from),
+        dmcu_code_pc(env->npe_df06_entry_from),
+        dmcu_code_segment(env->npe_df06_entry_target),
+        dmcu_code_pc(env->npe_df06_entry_target),
+        env->npe_df06_entry_word,
+        env->npe_df06_entry_ext,
+        dmcu_code_segment(env->npe_df06_entry_sequential),
+        dmcu_code_pc(env->npe_df06_entry_sequential),
+        dmcu_code_segment(env->npe_df06_entry_prior_from),
+        dmcu_code_pc(env->npe_df06_entry_prior_from),
+        dmcu_code_segment(env->npe_df06_entry_prior_target),
+        dmcu_code_pc(env->npe_df06_entry_prior_target),
+        env->npe_df06_entry_prior_word,
+        env->npe_df06_entry_pre_sp,
+        env->npe_df06_entry_post_sp,
+        env->npe_df06_entry_pre_fp,
+        env->npe_df06_entry_post_fp,
+        env->npe_df06_entry_application_state,
+        env->npe_df06_entry_object_hi,
+        env->npe_df06_entry_object_lo,
+        env->npe_df06_entry_stream_hi,
+        env->npe_df06_entry_stream_lo,
+        env->npe_df06_entry_gpr[0],
+        env->npe_df06_entry_gpr[1],
+        env->npe_df06_entry_gpr[2],
+        env->npe_df06_entry_gpr[3]);
+    for (i = 0; i < DMCU_NPE_DF06_STACK_WORDS; i++) {
+        g_string_append_printf(text, "%s%04x", i ? "," : "",
+                               env->npe_df06_entry_pre_stack[i]);
+    }
+    g_string_append(text, " POSTSTACK:");
+    for (i = 0; i < DMCU_NPE_DF06_STACK_WORDS; i++) {
+        g_string_append_printf(text, "%s%04x", i ? "," : "",
+                               env->npe_df06_entry_post_stack[i]);
+    }
+    g_string_append_printf(
+        text,
+        "\nNPE_LITERAL_DATA=READS:%u WRITES:%u DISPATCH_DELTA:%u/%u R:",
+        env->npe_literal_data_reads, env->npe_literal_data_writes,
+        env->npe_literal_data_reads -
+            env->npe_literal_data_dispatch_read_base,
+        env->npe_literal_data_writes -
+            env->npe_literal_data_dispatch_write_base);
+    for (i = 0;
+         i < MIN(env->npe_literal_data_reads,
+                 DMCU_NPE_LITERAL_DATA_TRACE_SLOTS);
+         i++) {
+        g_string_append_printf(
+            text,
+            "%s#%u/%02x:%04x/p%06x/l%04x/v%04x/b%u/"
+            "ds%03x:%03x/d%u",
+            i ? ";" : "", i + 1u,
+            dmcu_code_segment(env->npe_literal_data_read_pc[i]),
+            dmcu_code_pc(env->npe_literal_data_read_pc[i]),
+            env->npe_literal_data_read_physical[i],
+            env->npe_literal_data_read_logical[i],
+            env->npe_literal_data_read_value[i],
+            env->npe_literal_data_read_bits[i],
+            env->npe_literal_data_read_ds0[i],
+            env->npe_literal_data_read_ds1[i],
+            env->npe_literal_data_read_dispatch[i]);
+    }
+    g_string_append(text, " W:");
+    for (i = 0;
+         i < MIN(env->npe_literal_data_writes,
+                 DMCU_NPE_LITERAL_DATA_TRACE_SLOTS);
+         i++) {
+        g_string_append_printf(
+            text,
+            "%s#%u/%02x:%04x/p%06x/l%04x/v%04x/b%u/"
+            "ds%03x:%03x/d%u",
+            i ? ";" : "", i + 1u,
+            dmcu_code_segment(env->npe_literal_data_write_pc[i]),
+            dmcu_code_pc(env->npe_literal_data_write_pc[i]),
+            env->npe_literal_data_write_physical[i],
+            env->npe_literal_data_write_logical[i],
+            env->npe_literal_data_write_value[i],
+            env->npe_literal_data_write_bits[i],
+            env->npe_literal_data_write_ds0[i],
+            env->npe_literal_data_write_ds1[i],
+            env->npe_literal_data_write_dispatch[i]);
+    }
+    g_string_append_printf(
+        text,
+        "\nNPE_RESOURCE_CHECK=ACTIVE:%u CALLS:%u/%u "
+        "ENTRY:%02x:%04x/sp%04x>%04x/fp%04x/error%04x "
+        "RETURN:%02x:%04x>%02x:%04x/sp%04x>%04x/fp%04x/"
+        "r%04x:%04x/error%04x CHILDREN:",
+        env->npe_resource_check_watch_active,
+        env->npe_resource_check_calls,
+        env->npe_resource_check_returns,
+        dmcu_code_segment(env->npe_resource_check_caller),
+        dmcu_code_pc(env->npe_resource_check_caller),
+        env->npe_resource_check_entry_sp,
+        env->npe_resource_check_entry_post_sp,
+        env->npe_resource_check_entry_fp,
+        env->npe_resource_check_entry_error,
+        dmcu_code_segment(env->npe_resource_check_return_from),
+        dmcu_code_pc(env->npe_resource_check_return_from),
+        dmcu_code_segment(env->npe_resource_check_return_target),
+        dmcu_code_pc(env->npe_resource_check_return_target),
+        env->npe_resource_check_return_sp,
+        env->npe_resource_check_return_post_sp,
+        env->npe_resource_check_return_fp,
+        env->npe_resource_check_return_r0,
+        env->npe_resource_check_return_r1,
+        env->npe_resource_check_return_error);
+    {
+        static const uint32_t child_target[
+            DMCU_NPE_RESOURCE_CHECK_CHILD_SLOTS] = {
+            0x31e022u, 0x3307b0u, 0x2916b0u,
+            0x30fe0eu, 0x278ed6u, 0x2e4572u,
+        };
+
+        for (unsigned child = 0;
+             child < DMCU_NPE_RESOURCE_CHECK_CHILD_SLOTS; child++) {
+            g_string_append_printf(
+                text,
+                "%s#%u/%02x:%04x/c%u@%02x:%04x>%02x:%04x/"
+                "w%04x/sp%04x>%04x/fp%04x/"
+                "r%u@%02x:%04x>%02x:%04x/w%04x/"
+                "sp%04x>%04x/fp%04x/v%04x:%04x/error%04x",
+                child ? ";" : "", child + 1u,
+                dmcu_code_segment(child_target[child]),
+                dmcu_code_pc(child_target[child]),
+                env->npe_resource_check_child_calls[child],
+                dmcu_code_segment(
+                    env->npe_resource_check_child_call_from[child]),
+                dmcu_code_pc(
+                    env->npe_resource_check_child_call_from[child]),
+                dmcu_code_segment(
+                    env->npe_resource_check_child_call_target[child]),
+                dmcu_code_pc(
+                    env->npe_resource_check_child_call_target[child]),
+                env->npe_resource_check_child_call_word[child],
+                env->npe_resource_check_child_call_sp[child],
+                env->npe_resource_check_child_call_post_sp[child],
+                env->npe_resource_check_child_call_fp[child],
+                env->npe_resource_check_child_returns[child],
+                dmcu_code_segment(
+                    env->npe_resource_check_child_return_from[child]),
+                dmcu_code_pc(
+                    env->npe_resource_check_child_return_from[child]),
+                dmcu_code_segment(
+                    env->npe_resource_check_child_return_target[child]),
+                dmcu_code_pc(
+                    env->npe_resource_check_child_return_target[child]),
+                env->npe_resource_check_child_return_word[child],
+                env->npe_resource_check_child_return_sp[child],
+                env->npe_resource_check_child_return_post_sp[child],
+                env->npe_resource_check_child_return_fp[child],
+                env->npe_resource_check_child_return_r0[child],
+                env->npe_resource_check_child_return_r1[child],
+                env->npe_resource_check_child_return_error[child]);
+        }
+    }
+    g_string_append_printf(
+        text,
+        " ERROR_WRITE:FIRST:%u@%02x:%04x/addr%06x/"
+        "v%04x>%04x/word%04x>%04x/bits%u/stage%u/sp%04x/fp%04x "
+        "NONZERO:%u@%02x:%04x/addr%06x/"
+        "v%04x>%04x/word%04x>%04x/bits%u/stage%u/sp%04x/fp%04x",
+        env->npe_resource_check_error_first_write_valid,
+        dmcu_code_segment(env->npe_resource_check_error_first_write_pc),
+        dmcu_code_pc(env->npe_resource_check_error_first_write_pc),
+        env->npe_resource_check_error_first_write_address,
+        env->npe_resource_check_error_first_write_old,
+        env->npe_resource_check_error_first_write_new,
+        env->npe_resource_check_error_first_write_word_old,
+        env->npe_resource_check_error_first_write_word_new,
+        env->npe_resource_check_error_first_write_bits,
+        env->npe_resource_check_error_first_write_stage,
+        env->npe_resource_check_error_first_write_sp,
+        env->npe_resource_check_error_first_write_fp,
+        env->npe_resource_check_error_first_nonzero_valid,
+        dmcu_code_segment(env->npe_resource_check_error_first_nonzero_pc),
+        dmcu_code_pc(env->npe_resource_check_error_first_nonzero_pc),
+        env->npe_resource_check_error_first_nonzero_address,
+        env->npe_resource_check_error_first_nonzero_old,
+        env->npe_resource_check_error_first_nonzero_new,
+        env->npe_resource_check_error_first_nonzero_word_old,
+        env->npe_resource_check_error_first_nonzero_word_new,
+        env->npe_resource_check_error_first_nonzero_bits,
+        env->npe_resource_check_error_first_nonzero_stage,
+        env->npe_resource_check_error_first_nonzero_sp,
+        env->npe_resource_check_error_first_nonzero_fp);
+    g_string_append_printf(
+        text, " TRACE:%" G_GUINT64_FORMAT "/%u:",
+        env->npe_resource_check_error_write_sequence,
+        (unsigned)MIN(
+            env->npe_resource_check_error_write_sequence,
+            (uint64_t)DMCU_NPE_RESOURCE_ERROR_WRITE_TRACE_SLOTS));
+    if (env->npe_resource_check_error_write_sequence) {
+        uint64_t count = MIN(
+            env->npe_resource_check_error_write_sequence,
+            (uint64_t)DMCU_NPE_RESOURCE_ERROR_WRITE_TRACE_SLOTS);
+        uint64_t first =
+            env->npe_resource_check_error_write_sequence - count;
+        bool printed = false;
+
+        for (uint64_t event = first;
+             event < env->npe_resource_check_error_write_sequence; event++) {
+            uint32_t slot = event %
+                DMCU_NPE_RESOURCE_ERROR_WRITE_TRACE_SLOTS;
+
+            if (env->npe_resource_check_error_write_event[slot] != event) {
+                continue;
+            }
+            g_string_append_printf(
+                text,
+                "%s#%" G_GUINT64_FORMAT "/%02x:%04x/addr%06x/"
+                "word%04x>%04x/bits%u/stage%u/"
+                "r%04x:%04x/sp%04x/fp%04x",
+                printed ? "," : "", event + 1u,
+                dmcu_code_segment(
+                    env->npe_resource_check_error_write_pc[slot]),
+                dmcu_code_pc(
+                    env->npe_resource_check_error_write_pc[slot]),
+                env->npe_resource_check_error_write_address[slot],
+                env->npe_resource_check_error_write_word_old[slot],
+                env->npe_resource_check_error_write_word_new[slot],
+                env->npe_resource_check_error_write_bits[slot],
+                env->npe_resource_check_error_write_stage[slot],
+                env->npe_resource_check_error_write_r0[slot],
+                env->npe_resource_check_error_write_r1[slot],
+                env->npe_resource_check_error_write_sp[slot],
+                env->npe_resource_check_error_write_fp[slot]);
+            printed = true;
+        }
+    }
+    g_string_append_printf(
+        text,
+        "\nAPPLICATION_COMPARE_RET=ZERO:%u/FIRST:%02x:%04x>"
+        "%02x:%04x/sp%04x>%04x/fp%04x SITES:",
+        env->application_compare_ret_zero_target_count,
+        dmcu_code_segment(env->application_compare_ret_first_zero_from),
+        dmcu_code_pc(env->application_compare_ret_first_zero_from),
+        dmcu_code_segment(env->application_compare_ret_first_zero_target),
+        dmcu_code_pc(env->application_compare_ret_first_zero_target),
+        env->application_compare_ret_first_zero_sp,
+        env->application_compare_ret_first_zero_post_sp,
+        env->application_compare_ret_first_zero_fp);
+    {
+        static const uint32_t compare_ret_from[
+            DMCU_APPLICATION_COMPARE_RET_SITES] = {
+            0x1ae110u, 0x1ae30au, 0x1ae504u,
+            0x1ae560u, 0x1ae5bcu, 0x1ae61eu,
+        };
+
+        for (unsigned site = 0;
+             site < DMCU_APPLICATION_COMPARE_RET_SITES; site++) {
+            g_string_append_printf(
+                text,
+                "%s%02x:%04x=%u>%02x:%04x/w%04x/"
+                "sp%04x>%04x/fp%04x",
+                site ? ";" : "",
+                dmcu_code_segment(compare_ret_from[site]),
+                dmcu_code_pc(compare_ret_from[site]),
+                env->application_compare_ret_count[site],
+                dmcu_code_segment(env->application_compare_ret_target[site]),
+                dmcu_code_pc(env->application_compare_ret_target[site]),
+                env->application_compare_ret_word[site],
+                env->application_compare_ret_sp[site],
+                env->application_compare_ret_post_sp[site],
+                env->application_compare_ret_fp[site]);
+        }
+    }
+    g_string_append_printf(
+        text,
+        "\nRESULT_SCANNER=CALLS:%u RETURNS:%u ACTIVE:%u FRAME:%04x "
+        "EVENTS:%u TRACE:",
+        env->result_scanner_calls,
+        env->result_scanner_returns,
+        env->result_scanner_trace_active,
+        env->result_scanner_frame_fp,
+        env->result_scanner_trace_count);
+    for (unsigned trace = 0;
+         trace < MIN(env->result_scanner_trace_count,
+                     (uint32_t)DMCU_RESULT_SCANNER_TRACE_SLOTS);
+         trace++) {
+        g_string_append_printf(
+            text,
+            "%s#%u/%02x:%04x/%04x>%02x:%04x/"
+            "sp%04x>%04x/fp%04x/r%04x:%04x/l%s",
+            trace ? "," : "",
+            trace + 1u,
+            dmcu_code_segment(env->result_scanner_trace_from[trace]),
+            dmcu_code_pc(env->result_scanner_trace_from[trace]),
+            env->result_scanner_trace_word[trace],
+            dmcu_code_segment(env->result_scanner_trace_target[trace]),
+            dmcu_code_pc(env->result_scanner_trace_target[trace]),
+            env->result_scanner_trace_pre_sp[trace],
+            env->result_scanner_trace_post_sp[trace],
+            env->result_scanner_trace_fp[trace],
+            env->result_scanner_trace_r0[trace],
+            env->result_scanner_trace_r1[trace],
+            env->result_scanner_trace_locals_valid[trace] ? "" : "invalid:");
+        for (unsigned local = 0;
+             local < DMCU_RESULT_SCANNER_LOCAL_WORDS; local++) {
+            g_string_append_printf(
+                text, "%s%04x", local ? "." : "",
+                env->result_scanner_trace_locals[trace][local]);
+        }
+    }
+    g_string_append_printf(
+        text,
+        "\nRESULT_LIST_CREATE=CALLS:%u ACTIVE:%u FROM:%02x:%04x "
+        "ENTRY:sp%04x>%04x/fp%04x/arg%04x "
+        "LINK:sp%04x/fp%04x>%04x "
+        "COMPARE:arg%04x/%02x/r%04x/psw%04x>%02x:%04x "
+        "ALLOCATOR:%u RETURNS:%u>%02x:%04x/"
+        "sp%04x>%04x/fp%04x/r%04x:%04x",
+        env->result_list_create_calls,
+        env->result_list_create_trace_active,
+        dmcu_code_segment(env->result_list_create_caller),
+        dmcu_code_pc(env->result_list_create_caller),
+        env->result_list_create_entry_sp,
+        env->result_list_create_entry_post_sp,
+        env->result_list_create_entry_fp,
+        env->result_list_create_entry_arg,
+        env->result_list_create_link_sp,
+        env->result_list_create_link_old_fp,
+        env->result_list_create_frame_fp,
+        env->result_list_create_frame_arg_word,
+        env->result_list_create_frame_arg_byte & 0xffu,
+        env->result_list_create_compare_r0,
+        env->result_list_create_compare_psw,
+        dmcu_code_segment(env->result_list_create_compare_target),
+        dmcu_code_pc(env->result_list_create_compare_target),
+        env->result_list_create_allocator_calls,
+        env->result_list_create_returns,
+        dmcu_code_segment(env->result_list_create_return_target),
+        dmcu_code_pc(env->result_list_create_return_target),
+        env->result_list_create_return_sp,
+        env->result_list_create_return_post_sp,
+        env->result_list_create_return_fp,
+        env->result_list_create_return_r0,
+        env->result_list_create_return_r1);
+    g_string_append_printf(
+        text,
+        "\nOPERATION_BROWSER_ALLOC=RETURNS:%u DECISIONS:%u TRACE:",
+        env->operation_browser_alloc_returns,
+        env->operation_browser_alloc_decisions);
+    for (unsigned slot = 0;
+         slot < DMCU_OPERATION_BROWSER_ALLOC_SLOTS; slot++) {
+        g_string_append_printf(
+            text,
+            "%s#%u/ret:%02x:%04x>%02x:%04x/"
+            "sp%04x>%04x/fp%04x/r%04x:%04x/psw%04x/irq%u/"
+            "decision:%02x:%04x/seq%02x:%04x>%02x:%04x/"
+            "sp%04x>%04x/fp%04x/r%04x:%04x/psw%04x/irq%u",
+            slot ? "," : "",
+            slot + 1u,
+            dmcu_code_segment(
+                env->operation_browser_alloc_return_from[slot]),
+            dmcu_code_pc(
+                env->operation_browser_alloc_return_from[slot]),
+            dmcu_code_segment(
+                env->operation_browser_alloc_return_target[slot]),
+            dmcu_code_pc(
+                env->operation_browser_alloc_return_target[slot]),
+            env->operation_browser_alloc_return_sp[slot],
+            env->operation_browser_alloc_return_post_sp[slot],
+            env->operation_browser_alloc_return_fp[slot],
+            env->operation_browser_alloc_return_r0[slot],
+            env->operation_browser_alloc_return_r1[slot],
+            env->operation_browser_alloc_return_psw[slot],
+            env->operation_browser_alloc_return_in_interrupt[slot],
+            dmcu_code_segment(
+                env->operation_browser_alloc_decision_from[slot]),
+            dmcu_code_pc(
+                env->operation_browser_alloc_decision_from[slot]),
+            dmcu_code_segment(
+                env->operation_browser_alloc_decision_sequential[slot]),
+            dmcu_code_pc(
+                env->operation_browser_alloc_decision_sequential[slot]),
+            dmcu_code_segment(
+                env->operation_browser_alloc_decision_target[slot]),
+            dmcu_code_pc(
+                env->operation_browser_alloc_decision_target[slot]),
+            env->operation_browser_alloc_decision_sp[slot],
+            env->operation_browser_alloc_decision_post_sp[slot],
+            env->operation_browser_alloc_decision_fp[slot],
+            env->operation_browser_alloc_decision_r0[slot],
+            env->operation_browser_alloc_decision_r1[slot],
+            env->operation_browser_alloc_decision_psw[slot],
+            env->operation_browser_alloc_decision_in_interrupt[slot]);
+    }
+    g_string_append_printf(
+        text,
+        "\nOPERATION_UI_DATA_WRITES="
+        "RECORDS:%" G_GUINT64_FORMAT "/%" G_GUINT64_FORMAT " "
+        "CONFIG:%" G_GUINT64_FORMAT "/%" G_GUINT64_FORMAT " "
+        "OUTPUT:%" G_GUINT64_FORMAT "/%" G_GUINT64_FORMAT " TRACE:",
+        env->operation_ui_data_write_count[0],
+        env->operation_ui_data_change_count[0],
+        env->operation_ui_data_write_count[1],
+        env->operation_ui_data_change_count[1],
+        env->operation_ui_data_write_count[2],
+        env->operation_ui_data_change_count[2]);
+    if (env->operation_ui_data_trace_sequence) {
+        uint64_t count = MIN(
+            env->operation_ui_data_trace_sequence,
+            (uint64_t)DMCU_OPERATION_UI_DATA_WRITE_TRACE_SLOTS);
+        uint64_t first = env->operation_ui_data_trace_sequence - count;
+
+        for (uint64_t event = first;
+             event < env->operation_ui_data_trace_sequence; event++) {
+            uint32_t slot = event %
+                DMCU_OPERATION_UI_DATA_WRITE_TRACE_SLOTS;
+
+            if (env->operation_ui_data_trace_event[slot] != event) {
+                continue;
+            }
+            g_string_append_printf(
+                text,
+                "%s#%" G_GUINT64_FORMAT "/r%u/%02x:%04x/"
+                "%06x(log%04x)/%04x>%04x/%u/"
+                "ds%03x:%03x/sp%04x/fp%04x/"
+                "g%04x,%04x,%04x,%04x/irq%u",
+                event == first ? "" : ",",
+                event + 1u,
+                env->operation_ui_data_trace_range[slot],
+                dmcu_code_segment(env->operation_ui_data_trace_pc[slot]),
+                dmcu_code_pc(env->operation_ui_data_trace_pc[slot]),
+                env->operation_ui_data_trace_address[slot] & 0xffffffu,
+                env->operation_ui_data_trace_logical[slot],
+                env->operation_ui_data_trace_old[slot],
+                env->operation_ui_data_trace_new[slot],
+                env->operation_ui_data_trace_bits[slot],
+                env->operation_ui_data_trace_ds0[slot],
+                env->operation_ui_data_trace_ds1[slot],
+                env->operation_ui_data_trace_sp[slot],
+                env->operation_ui_data_trace_fp[slot],
+                env->operation_ui_data_trace_gpr[slot][0],
+                env->operation_ui_data_trace_gpr[slot][1],
+                env->operation_ui_data_trace_gpr[slot][2],
+                env->operation_ui_data_trace_gpr[slot][3],
+                env->operation_ui_data_trace_in_interrupt[slot]);
+        }
+    }
+    g_string_append_printf(
+        text,
         "\nAPPLICATION_INIT_FRAME=ACTIVE:%u CALLS:%u FROM:%02x:%04x "
         "ENTRY:sp%04x/fp%04x FRAME:%04x INITIAL:%04x,%04x,%04x "
         "WRITES:%u FIRST:%02x:%04x/%06x/%04x>%04x/%u/bus%u/irq%u/"
@@ -10285,7 +14111,7 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
                 text,
                 "%s#%u/call%u/out%06x/sel%06x/p%06x/"
                 "cur%04x/lim%04x/span%04x/act%04x/"
-                "cmp%s%04x/data",
+                "cmp%s%04x/selector",
                 n ? ";" : "", sequence + 1u,
                 env->file_record_candidate_call_trace[trace],
                 env->file_record_candidate_output_trace[trace] & 0xffffff,
@@ -10297,6 +14123,14 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
                 env->file_record_candidate_active_trace[trace],
                 env->file_record_candidate_compare_valid[trace] ? "" : "-",
                 env->file_record_candidate_compare_trace[trace]);
+            for (index = 0; index < DMCU_FILE_RECORD_SELECTOR_BYTES;
+                 index++) {
+                g_string_append_printf(
+                    text, "%02x",
+                    env->file_record_candidate_selector_data_trace[trace]
+                                                                  [index]);
+            }
+            g_string_append(text, "/data");
             for (index = 0; index < 0x40; index++) {
                 g_string_append_printf(
                     text, "%02x",
@@ -10530,22 +14364,133 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
             uint32_t pc = env->selector_state_trace_pc[slot];
 
             g_string_append_printf(
-                text, "%s%02x:%04x/%06x/%04x>%04x/%u",
+                text, "%s%02x:%04x/%06x/%04x>%04x/%u"
+                "/SP:%04x/FP:%04x/DS:%03x,%03x"
+                "/R:%04x,%04x,%04x,%04x"
+                "/L76:%04x,%04x/DC:%04x/E4:%04x,%04x"
+                "/FA:%04x/FC:%04x,%04x"
+                "/SRC:%04x,%04x/W:%04x,%04x,%04x,%04x,%04x,%04x"
+                "/F:%04x,%04x,%04x,%04x,%04x,%04x,%04x,%04x,%04x,%04x,%04x,%04x",
                 trace == first ? "" : ";",
                 dmcu_code_segment(pc), dmcu_code_pc(pc),
                 env->selector_state_trace_address[slot] & 0xffffff,
                 env->selector_state_trace_old[slot] & 0xffff,
                 env->selector_state_trace_new[slot] & 0xffff,
-                env->selector_state_trace_bits[slot]);
+                env->selector_state_trace_bits[slot],
+                env->selector_state_trace_sp[slot],
+                env->selector_state_trace_fp[slot],
+                env->selector_state_trace_ds0[slot],
+                env->selector_state_trace_ds1[slot],
+                env->selector_state_trace_gpr[slot][0],
+                env->selector_state_trace_gpr[slot][1],
+                env->selector_state_trace_gpr[slot][2],
+                env->selector_state_trace_gpr[slot][3],
+                env->selector_state_trace_locals[slot][0],
+                env->selector_state_trace_locals[slot][1],
+                env->selector_state_trace_locals[slot][2],
+                env->selector_state_trace_locals[slot][3],
+                env->selector_state_trace_locals[slot][4],
+                env->selector_state_trace_locals[slot][5],
+                env->selector_state_trace_locals[slot][6],
+                env->selector_state_trace_locals[slot][7],
+                env->selector_state_trace_locals[slot][8],
+                env->selector_state_trace_locals[slot][9],
+                env->selector_state_trace_locals[slot][10],
+                env->selector_state_trace_locals[slot][11],
+                env->selector_state_trace_locals[slot][12],
+                env->selector_state_trace_locals[slot][13],
+                env->selector_state_trace_locals[slot][14],
+                env->selector_state_trace_locals[slot][15],
+                env->selector_state_trace_frame[slot][0],
+                env->selector_state_trace_frame[slot][1],
+                env->selector_state_trace_frame[slot][2],
+                env->selector_state_trace_frame[slot][3],
+                env->selector_state_trace_frame[slot][4],
+                env->selector_state_trace_frame[slot][5],
+                env->selector_state_trace_frame[slot][6],
+                env->selector_state_trace_frame[slot][7],
+                env->selector_state_trace_frame[slot][8],
+                env->selector_state_trace_frame[slot][9],
+                env->selector_state_trace_frame[slot][10],
+                env->selector_state_trace_frame[slot][11]);
         }
         if (!count) {
             g_string_append(text, "none");
         }
         g_string_append_printf(
-            text, " MATRIX_EVENT_MAPS=%u LAST=%04x@%02x:%04x",
+            text, " MATRIX_EVENT_MAPS=%u LAST=%04x@%02x:%04x"
+            " MATRIX_CANDIDATE_WRITES=%u LAST=%04x@%02x:%04x"
+            " MATRIX_FOREGROUND_ACKS=%u LAST=%04x@%02x:%04x"
+            " MATRIX_MODAL_ACKS=%u LAST=%04x@1e:f8e4",
             env->matrix_event_maps, env->matrix_event_last & 0xffff,
             dmcu_code_segment(env->matrix_event_map_pc),
-            dmcu_code_pc(env->matrix_event_map_pc));
+            dmcu_code_pc(env->matrix_event_map_pc),
+            env->matrix_candidate_writes,
+            env->matrix_candidate_last & 0xffff,
+            dmcu_code_segment(env->matrix_candidate_pc),
+            dmcu_code_pc(env->matrix_candidate_pc),
+            env->application_trace_calls[
+                DMCU_APPLICATION_KEYMAP_RETURN_TRACE_INDEX],
+            env->application_trace_r0[
+                DMCU_APPLICATION_KEYMAP_RETURN_TRACE_INDEX] & 0xffff,
+            dmcu_code_segment(env->application_trace_from[
+                DMCU_APPLICATION_KEYMAP_RETURN_TRACE_INDEX]),
+            dmcu_code_pc(env->application_trace_from[
+                DMCU_APPLICATION_KEYMAP_RETURN_TRACE_INDEX]),
+            env->matrix_modal_dispatches,
+            env->matrix_modal_event_last & 0xffff);
+    }
+    {
+        uint32_t count = MIN(env->resource_count_trace_count,
+                             (uint32_t)DMCU_RESOURCE_COUNT_TRACE_SLOTS);
+        uint32_t first = env->resource_count_trace_count - count;
+        uint32_t trace;
+
+        g_string_append_printf(text, "\nRESOURCE_COUNT_WRITES=COUNT:%u TRACE=",
+                               env->resource_count_trace_count);
+        for (trace = first; trace < env->resource_count_trace_count; trace++) {
+            uint32_t slot = trace % DMCU_RESOURCE_COUNT_TRACE_SLOTS;
+            uint32_t pc = env->resource_count_trace_pc[slot];
+            unsigned frame_index;
+
+            g_string_append_printf(
+                text, "%s%02x:%04x/%04x>%04x/%u/sp%04x/fp%04x/"
+                "r%04x,%04x,%04x,%04x/chain",
+                trace == first ? "" : ";",
+                dmcu_code_segment(pc), dmcu_code_pc(pc),
+                env->resource_count_trace_old[slot] & 0xffff,
+                env->resource_count_trace_new[slot] & 0xffff,
+                env->resource_count_trace_bits[slot],
+                env->resource_count_trace_sp[slot],
+                env->resource_count_trace_fp[slot],
+                env->resource_count_trace_gpr[slot][0],
+                env->resource_count_trace_gpr[slot][1],
+                env->resource_count_trace_gpr[slot][2],
+                env->resource_count_trace_gpr[slot][3]);
+            for (frame_index = 0;
+                 frame_index < DMCU_RESOURCE_COUNT_TRACE_FRAMES;
+                 frame_index++) {
+                const uint16_t *frame =
+                    env->resource_count_trace_chain[slot][frame_index];
+
+                if (!frame[0]) {
+                    break;
+                }
+                g_string_append_printf(
+                    text,
+                    "%sfp%04x>%02x:%04x/a%04x,%04x,%04x,%04x,%04x,%04x",
+                    frame_index ? "," : "", frame[0],
+                    frame[2] & 0xff, frame[3],
+                    frame[4], frame[5], frame[6], frame[7],
+                    frame[8], frame[9]);
+            }
+            if (!frame_index) {
+                g_string_append(text, "none");
+            }
+        }
+        if (!count) {
+            g_string_append(text, "none");
+        }
     }
     g_string_append_printf(
         text,
@@ -10716,6 +14661,8 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
                            env->overlay_service_calls);
     g_string_append_printf(text, "  ROM_HLE=%s",
                            env->rom_hle_enabled ? "on" : "off");
+    g_string_append_printf(text, "  CONTROL_OBSERVERS=%s",
+                           env->control_observers_minimal ? "minimal" : "full");
     g_string_append_printf(text, "  ROM_SKELETON=%s",
                            env->soc_rom_skeleton ? "on" : "off");
     if (env->resident_rom_limit > env->resident_rom_base) {
@@ -10763,6 +14710,34 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
     } else {
         g_string_append(text, "\nROM_MISSING=none FETCHES=0");
     }
+    g_string_append_printf(
+        text, "\nVMA03_CLEAR=ENTRIES:%u EXITS:%u MAX:%u",
+        env->vma03_clear_entries, env->vma03_clear_exits,
+        env->vma03_clear_max_counter);
+    g_string_append_printf(
+        text, "\nVMA03_OBJECT_POINTER=WRITES:%u LAST:%02x:%04x "
+              "OLD:%04x:%04x NEW:%04x:%04x",
+        env->vma03_object_pointer_writes,
+        dmcu_code_segment(env->vma03_object_pointer_write_pc),
+        dmcu_code_pc(env->vma03_object_pointer_write_pc),
+        env->vma03_object_pointer_old[0],
+        env->vma03_object_pointer_old[1],
+        env->vma03_object_pointer_new[0],
+        env->vma03_object_pointer_new[1]);
+    g_string_append_printf(
+        text, "\nVMA03_HANDLE=ENTRIES:%u PREV:%02x:%04x/%04x "
+              "SP:%04x FP:%04x CTORS:%u,%u STACK:",
+        env->vma03_handle_entries,
+        dmcu_code_segment(env->vma03_handle_previous_pc),
+        dmcu_code_pc(env->vma03_handle_previous_pc),
+        env->vma03_handle_previous_word,
+        env->vma03_handle_entry_sp, env->vma03_handle_entry_fp,
+        env->vma03_handle_constructor_31_entries,
+        env->vma03_handle_constructor_32_entries);
+    for (i = 0; i < ARRAY_SIZE(env->vma03_handle_entry_stack); i++) {
+        g_string_append_printf(text, "%s%04x", i ? "," : "",
+                               env->vma03_handle_entry_stack[i]);
+    }
     if (env->event_frame_write_valid) {
         g_string_append_printf(
             text,
@@ -10793,8 +14768,207 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
             env->invalid_control_sp & 0xffff,
             env->invalid_control_fp & 0xffff,
             env->invalid_control_in_interrupt != 0);
+        g_string_append_printf(
+            text,
+            "\nINVALID_CONTROL_CONTEXT=SEQ:%02x:%04x EXT:%04x "
+            "POSTSP:%04x POSTFP:%04x DS:%03x,%03x PSW:%04x GPR:",
+            dmcu_code_segment(env->invalid_control_sequential),
+            dmcu_code_pc(env->invalid_control_sequential),
+            env->invalid_control_ext & 0xffff,
+            env->invalid_control_post_sp & 0xffff,
+            env->invalid_control_post_fp & 0xffff,
+            env->invalid_control_ds0 & 0x01ff,
+            env->invalid_control_ds1 & 0x01ff,
+            env->invalid_control_psw & 0xffff);
+        for (unsigned index = 0; index < DMCU_INVALID_CONTROL_GPR_WORDS;
+             index++) {
+            g_string_append_printf(
+                text, "%04x%s", env->invalid_control_gpr[index],
+                index + 1u == DMCU_INVALID_CONTROL_GPR_WORDS ? "" : ",");
+        }
+        g_string_append(text, " STACK:");
+        for (unsigned index = 0; index < DMCU_INVALID_CONTROL_STACK_WORDS;
+             index++) {
+            g_string_append_printf(
+                text, "%04x%s", env->invalid_control_stack[index],
+                index + 1u == DMCU_INVALID_CONTROL_STACK_WORDS ? "" : ",");
+        }
+        g_string_append(text, " FRAME:");
+        for (unsigned index = 0; index < DMCU_INVALID_CONTROL_FRAME_WORDS;
+             index++) {
+            g_string_append_printf(
+                text, "%04x%s", env->invalid_control_frame[index],
+                index + 1u == DMCU_INVALID_CONTROL_FRAME_WORDS ? "" : ",");
+        }
     } else {
         g_string_append(text, "\nINVALID_CONTROL=none");
+        g_string_append(text, "\nINVALID_CONTROL_CONTEXT=none");
+    }
+    g_string_append_printf(
+        text,
+        "\nSETTINGS_EVENT=POLL:%u/%u/A%u EVENT:%04x CALLBACK:%u/%02x:%04x/"
+        "%04x:%04x LAUNCH:%u",
+        env->settings_event_poll_calls,
+        env->settings_event_poll_returns,
+        env->settings_event_poll_active ? 1u : 0u,
+        env->settings_event_last_value,
+        env->settings_event_callback_calls,
+        dmcu_code_segment(env->settings_event_callback_target),
+        dmcu_code_pc(env->settings_event_callback_target),
+        env->settings_event_callback_hi,
+        env->settings_event_callback_lo,
+        env->settings_event_launch_calls);
+    g_string_append_printf(
+        text,
+        "\nSETTINGS_INPUT=ENTRIES:%u RETURNS:%u ACTIVE:%u EDGES:%u ",
+        env->settings_input_dispatch_entries,
+        env->settings_input_dispatch_returns,
+        env->settings_input_dispatch_active ? 1u : 0u,
+        env->settings_input_trace_count);
+    if (env->settings_input_region_valid) {
+        g_string_append_printf(
+            text,
+            "REGION:%02x:%04x/%04x>%02x:%04x SEQ:%02x:%04x EXT:%04x "
+            "SP:%04x>%04x FP:%04x DS:%03x,%03x GPR:",
+            dmcu_code_segment(env->settings_input_region_from),
+            dmcu_code_pc(env->settings_input_region_from),
+            env->settings_input_region_word,
+            dmcu_code_segment(env->settings_input_region_target),
+            dmcu_code_pc(env->settings_input_region_target),
+            dmcu_code_segment(env->settings_input_region_sequential),
+            dmcu_code_pc(env->settings_input_region_sequential),
+            env->settings_input_region_ext,
+            env->settings_input_region_sp,
+            env->settings_input_region_post_sp,
+            env->settings_input_region_fp,
+            env->settings_input_region_ds0,
+            env->settings_input_region_ds1);
+        for (unsigned index = 0; index < DMCU_SETTINGS_INPUT_GPR_WORDS;
+             index++) {
+            g_string_append_printf(
+                text, "%04x%s", env->settings_input_region_gpr[index],
+                index + 1u == DMCU_SETTINGS_INPUT_GPR_WORDS ? "" : ",");
+        }
+        g_string_append(text, " STACK:");
+        for (unsigned index = 0; index < DMCU_SETTINGS_INPUT_STACK_WORDS;
+             index++) {
+            g_string_append_printf(
+                text, "%04x%s", env->settings_input_region_stack[index],
+                index + 1u == DMCU_SETTINGS_INPUT_STACK_WORDS ? "" : ",");
+        }
+        g_string_append(text, " FRAME:");
+        for (unsigned index = 0; index < DMCU_SETTINGS_INPUT_FRAME_WORDS;
+             index++) {
+            g_string_append_printf(
+                text, "%04x%s", env->settings_input_region_frame[index],
+                index + 1u == DMCU_SETTINGS_INPUT_FRAME_WORDS ? "" : ",");
+        }
+    } else {
+        g_string_append(text, "REGION:none");
+    }
+    g_string_append(text, "\nSETTINGS_INPUT_TRACE=");
+    if (env->settings_input_trace_count) {
+        uint32_t count = MIN(env->settings_input_trace_count,
+                             (uint32_t)DMCU_SETTINGS_INPUT_TRACE_SLOTS);
+        uint32_t first = env->settings_input_trace_count - count;
+
+        for (uint32_t trace = first;
+             trace < env->settings_input_trace_count; trace++) {
+            uint32_t trace_slot = trace % DMCU_SETTINGS_INPUT_TRACE_SLOTS;
+            uint32_t trace_from = env->settings_input_trace_from[trace_slot];
+            uint32_t trace_target =
+                env->settings_input_trace_target[trace_slot];
+
+            g_string_append_printf(
+                text, "%s%02x:%04x/%04x>%02x:%04x@%04x/%04x",
+                trace == first ? "" : ",",
+                dmcu_code_segment(trace_from), dmcu_code_pc(trace_from),
+                env->settings_input_trace_word[trace_slot],
+                dmcu_code_segment(trace_target), dmcu_code_pc(trace_target),
+                env->settings_input_trace_sp[trace_slot],
+                env->settings_input_trace_fp[trace_slot]);
+        }
+    } else {
+        g_string_append(text, "none");
+    }
+    {
+        uint32_t count = MIN(env->sound_settings_trace_count,
+                             (uint32_t)DMCU_SOUND_SETTINGS_TRACE_SLOTS);
+        uint32_t first = env->sound_settings_trace_count - count;
+
+        g_string_append_printf(
+            text, "\nSOUND_SETTINGS_TRACE=COUNT:%u TRACE:",
+            env->sound_settings_trace_count);
+        for (uint32_t sequence = first;
+             sequence < env->sound_settings_trace_count; sequence++) {
+            uint32_t sound_slot =
+                sequence % DMCU_SOUND_SETTINGS_TRACE_SLOTS;
+            uint32_t pc = env->sound_settings_trace_pc[sound_slot];
+            uint32_t target = env->sound_settings_trace_target[sound_slot];
+
+            g_string_append_printf(
+                text,
+                "%s#%u/k%u/%02x:%04x>%02x:%04x/e%02x/sel%02x/hi%02x/cur%02x/"
+                "sw%02x/aux%02x/step%02x/r%04x,%04x/sp%04x/fp%04x",
+                sequence == first ? "" : ",", sequence + 1,
+                env->sound_settings_trace_kind[sound_slot],
+                dmcu_code_segment(pc), dmcu_code_pc(pc),
+                dmcu_code_segment(target), dmcu_code_pc(target),
+                env->sound_settings_trace_event[sound_slot] & 0xffu,
+                env->sound_settings_trace_selection[sound_slot] & 0xffu,
+                env->sound_settings_trace_highlight[sound_slot] & 0xffu,
+                env->sound_settings_trace_cursor[sound_slot] & 0xffu,
+                env->sound_settings_trace_switch_state[sound_slot] & 0xffu,
+                env->sound_settings_trace_switch_aux[sound_slot] & 0xffu,
+                env->sound_settings_trace_switch_step[sound_slot] & 0xffu,
+                env->sound_settings_trace_r0[sound_slot],
+                env->sound_settings_trace_r1[sound_slot],
+                env->sound_settings_trace_sp[sound_slot],
+                env->sound_settings_trace_fp[sound_slot]);
+            g_string_append_printf(
+                text, ">sp%04x/ret%04x:%04x",
+                env->sound_settings_trace_post_sp[sound_slot],
+                env->sound_settings_trace_return_cs[sound_slot],
+                env->sound_settings_trace_return_pc[sound_slot]);
+        }
+        if (!count) {
+            g_string_append(text, "none");
+        }
+    }
+    g_string_append_printf(
+        text,
+        "\nAPPLICATION_INIT_F3C6=ENTRIES:%u CHILD:%u RETURNS:%u "
+        "ENTRY:sp%04x/fp%04x/r%04x,%04x,%04x,%04x/stack",
+        env->application_init_f3c6_entries,
+        env->application_init_f3c6_child_entries,
+        env->application_init_f3c6_returns,
+        env->application_init_f3c6_entry_sp & 0xffff,
+        env->application_init_f3c6_entry_fp & 0xffff,
+        env->application_init_f3c6_entry_gpr[0] & 0xffff,
+        env->application_init_f3c6_entry_gpr[1] & 0xffff,
+        env->application_init_f3c6_entry_gpr[2] & 0xffff,
+        env->application_init_f3c6_entry_gpr[3] & 0xffff);
+    for (unsigned f3c6_index = 0;
+         f3c6_index < DMCU_APPLICATION_INIT_F3C6_STACK_WORDS;
+         f3c6_index++) {
+        g_string_append_printf(
+            text, "%s%04x", f3c6_index ? "," : "",
+            env->application_init_f3c6_entry_stack[f3c6_index] & 0xffff);
+    }
+    g_string_append_printf(
+        text, " RETURN:sp%04x/fp%04x/r%04x,%04x,%04x,%04x/stack",
+        env->application_init_f3c6_return_sp & 0xffff,
+        env->application_init_f3c6_return_fp & 0xffff,
+        env->application_init_f3c6_return_gpr[0] & 0xffff,
+        env->application_init_f3c6_return_gpr[1] & 0xffff,
+        env->application_init_f3c6_return_gpr[2] & 0xffff,
+        env->application_init_f3c6_return_gpr[3] & 0xffff);
+    for (unsigned f3c6_index = 0;
+         f3c6_index < DMCU_APPLICATION_INIT_F3C6_STACK_WORDS;
+         f3c6_index++) {
+        g_string_append_printf(
+            text, "%s%04x", f3c6_index ? "," : "",
+            env->application_init_f3c6_return_stack[f3c6_index] & 0xffff);
     }
     g_string_append_printf(
         text,
@@ -11173,6 +15347,12 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
             env->unsupported_predecessor_ext & 0xffff,
             env->unsupported_predecessor_sp & 0xffff,
             env->unsupported_predecessor_fp & 0xffff);
+        if (env->unsupported_repeat_reason) {
+            g_string_append_printf(text,
+                " IREP_DISPATCH=unimplemented REPEAT_REASON=%s",
+                env->unsupported_repeat_reason == 1 ?
+                "target" : "processing-mode");
+        }
     } else {
         g_string_append(text, "\nUNSUPPORTED=none COUNT=0");
     }
@@ -11751,6 +15931,562 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
         }
     }
     {
+        unsigned index;
+
+        g_string_append_printf(
+            text,
+            "\nSTATE_IMPORT=CALLS:%" G_GUINT64_FORMAT
+            " NONEMPTY:%" G_GUINT64_FORMAT
+            " ACTIVE:%u POINTER:%04x:%04x INPUT:",
+            env->state_import_calls,
+            env->state_import_nonempty_calls,
+            env->state_import_active,
+            env->state_import_pointer_hi,
+            env->state_import_pointer_lo);
+        for (index = 0; index < ARRAY_SIZE(env->state_import_input); index++) {
+            g_string_append_printf(
+                text, "%s%04x", index ? "," : "",
+                env->state_import_input[index]);
+        }
+        g_string_append_printf(
+            text,
+            " COMPARES:%u MATCHES:%u MISMATCHES:%u LAST:%04x,%04x@%04x"
+            " RESULT:%04x:%04x RETURN:%02x:%04x GLOBALS:",
+            env->state_import_compare_count,
+            env->state_import_match_count,
+            env->state_import_mismatch_count,
+            env->state_import_last_compare_left,
+            env->state_import_last_compare_right,
+            env->state_import_last_compare_index,
+            env->state_import_result_hi,
+            env->state_import_result_lo,
+            dmcu_code_segment(env->state_import_return_target),
+            dmcu_code_pc(env->state_import_return_target));
+        for (index = 0; index < ARRAY_SIZE(env->state_import_globals); index++) {
+            g_string_append_printf(
+                text, "%s%04x", index ? "," : "",
+                env->state_import_globals[index]);
+        }
+    }
+    {
+        uint32_t count = MIN(env->state_import_history_count,
+                             (uint64_t)DMCU_STATE_IMPORT_HISTORY_SLOTS);
+        uint64_t first = env->state_import_history_count - count;
+        uint32_t n;
+
+        g_string_append_printf(
+            text, "\nSTATE_IMPORT_HISTORY=COUNT:%" G_GUINT64_FORMAT
+            " TRACE=", env->state_import_history_count);
+        for (n = 0; n < count; n++) {
+            uint64_t sequence = first + n;
+            uint32_t slot = sequence % DMCU_STATE_IMPORT_HISTORY_SLOTS;
+            uint32_t index;
+
+            g_string_append_printf(text, "%s#%" G_GUINT64_FORMAT "/in:",
+                                   n ? ";" : "", sequence + 1u);
+            for (index = 0;
+                 index < DMCU_STATE_IMPORT_HISTORY_INPUT_WORDS; index++) {
+                g_string_append_printf(
+                    text, "%s%04x", index ? "," : "",
+                    env->state_import_history_input[slot][index]);
+            }
+            g_string_append_printf(
+                text, "/cmp:%u,%u,%u/result:%04x:%04x/return:%02x:%04x"
+                "/mode:%04x/root:%04x:%04x/dispatch:",
+                env->state_import_history_compare_count[slot],
+                env->state_import_history_match_count[slot],
+                env->state_import_history_mismatch_count[slot],
+                env->state_import_history_result_hi[slot],
+                env->state_import_history_result_lo[slot],
+                dmcu_code_segment(
+                    env->state_import_history_return_target[slot]),
+                dmcu_code_pc(env->state_import_history_return_target[slot]),
+                env->state_import_history_mode[slot],
+                env->state_import_history_root_hi[slot],
+                env->state_import_history_root_lo[slot]);
+            for (index = 0;
+                 index < DMCU_STATE_IMPORT_HISTORY_DISPATCH_WORDS; index++) {
+                g_string_append_printf(
+                    text, "%s%04x", index ? "," : "",
+                    env->state_import_history_dispatch[slot][index]);
+            }
+            g_string_append(text, "/globals:");
+            for (index = 0;
+                 index < DMCU_STATE_IMPORT_HISTORY_GLOBAL_WORDS; index++) {
+                g_string_append_printf(
+                    text, "%s%04x", index ? "," : "",
+                    env->state_import_history_globals[slot][index]);
+            }
+            g_string_append_printf(
+                text, "/menu:%04x/selector:",
+                env->state_import_history_menu_state[slot]);
+            {
+                uint32_t selector_count = MIN(
+                    env->state_import_history_selector_count[slot],
+                    (uint16_t)DMCU_STATE_SELECTOR_TRACE_SLOTS);
+
+                for (index = 0; index < selector_count; index++) {
+                    g_string_append_printf(
+                        text, "%s%04x:%04x=%04x?%04x",
+                        index ? "," : "",
+                        env->state_import_history_selector_node_hi[slot][index],
+                        env->state_import_history_selector_node_lo[slot][index],
+                        env->state_import_history_selector_node_key[slot][index],
+                        env->state_import_history_selector_lookup_key[slot][index]);
+                }
+            }
+        }
+    }
+    {
+        uint32_t count = MIN(env->start_callback_trace_count,
+                             (uint32_t)DMCU_START_CALLBACK_TRACE_SLOTS);
+        uint32_t index;
+
+        g_string_append_printf(
+            text,
+            "\nSTART_CALLBACK=DISPATCH:%" G_GUINT64_FORMAT
+            " F15C:%" G_GUINT64_FORMAT " LAST:%02x:%04x"
+            " ACTIVE:%u RUNNING:%u COMPLETE:%u INSNS:%" G_GUINT64_FORMAT
+            " NOW:%02x:%04x>%02x:%04x COUNT:%u OVERFLOW:%u ENTRY:",
+            env->start_callback_dispatch_count,
+            env->start_callback_f15c_count,
+            dmcu_code_segment(env->start_callback_last_target),
+            dmcu_code_pc(env->start_callback_last_target),
+            env->start_callback_trace_active,
+            env->start_callback_running,
+            env->start_callback_trace_complete,
+            env->start_callback_instruction_count,
+            dmcu_code_segment(env->start_callback_current_pc),
+            dmcu_code_pc(env->start_callback_current_pc),
+            dmcu_code_segment(env->start_callback_current_next),
+            dmcu_code_pc(env->start_callback_current_next),
+            count,
+            env->start_callback_trace_overflow);
+        for (index = 0; index < ARRAY_SIZE(env->start_callback_entry_gpr);
+             index++) {
+            g_string_append_printf(
+                text, "%s%04x", index ? "," : "",
+                env->start_callback_entry_gpr[index]);
+        }
+        g_string_append_printf(text, "/sp%04x/fp%04x/globals:",
+                               env->start_callback_entry_sp,
+                               env->start_callback_entry_fp);
+        for (index = 0; index < ARRAY_SIZE(env->start_callback_entry_globals);
+             index++) {
+            g_string_append_printf(
+                text, "%s%04x", index ? "," : "",
+                env->start_callback_entry_globals[index]);
+        }
+        g_string_append(text, "/trace:");
+        for (index = 0; index < count; index++) {
+            uint32_t pc = env->start_callback_trace_pc[index];
+            uint32_t next = env->start_callback_trace_next[index];
+
+            g_string_append_printf(
+                text,
+                "%s#%u/%02x:%04x>%02x:%04x/w%04x/p%x/"
+                "r%04x,%04x,%04x,%04x/sp%04x/fp%04x",
+                index ? ";" : "", index + 1u,
+                dmcu_code_segment(pc), dmcu_code_pc(pc),
+                dmcu_code_segment(next), dmcu_code_pc(next),
+                env->start_callback_trace_word[index],
+                env->start_callback_trace_psw[index],
+                env->start_callback_trace_gpr[index][0],
+                env->start_callback_trace_gpr[index][1],
+                env->start_callback_trace_gpr[index][2],
+                env->start_callback_trace_gpr[index][3],
+                env->start_callback_trace_sp[index],
+                env->start_callback_trace_fp[index]);
+        }
+    }
+    {
+        uint32_t count = MIN(
+            env->menu_context_release_trace_count,
+            (uint64_t)DMCU_MENU_CONTEXT_RELEASE_TRACE_SLOTS);
+        uint64_t first = env->menu_context_release_trace_count - count;
+        uint32_t n;
+
+        g_string_append_printf(
+            text,
+            "\nMENU_CONTEXT_RELEASE_TRACE=COUNT:%" G_GUINT64_FORMAT
+            " TRACE:", env->menu_context_release_trace_count);
+        for (n = 0; n < count; n++) {
+            uint64_t sequence = first + n;
+            uint32_t slot = sequence %
+                            DMCU_MENU_CONTEXT_RELEASE_TRACE_SLOTS;
+            uint32_t from = env->menu_context_release_trace_from[slot];
+            uint32_t target = env->menu_context_release_trace_return[slot];
+            uint32_t index;
+
+            g_string_append_printf(
+                text,
+                "%s#%" G_GUINT64_FORMAT "/%02x:%04x/sp%04x/fp%04x"
+                ">ret%02x:%04x/sp%04x/fp%04x/stack",
+                n ? ";" : "", sequence + 1u,
+                dmcu_code_segment(from), dmcu_code_pc(from),
+                env->menu_context_release_trace_sp[slot],
+                env->menu_context_release_trace_fp[slot],
+                dmcu_code_segment(target), dmcu_code_pc(target),
+                env->menu_context_release_trace_return_sp[slot],
+                env->menu_context_release_trace_return_fp[slot]);
+            for (index = 0;
+                 index < DMCU_MENU_CONTEXT_RELEASE_STACK_WORDS; index++) {
+                g_string_append_printf(
+                    text, "%s%04x", index ? "," : "",
+                    env->menu_context_release_trace_stack[slot][index]);
+            }
+        }
+    }
+    {
+        uint32_t count = MIN(
+            env->start_late31_entry_trace_count,
+            (uint64_t)DMCU_START_LATE31_ENTRY_TRACE_SLOTS);
+        uint64_t first = env->start_late31_entry_trace_count - count;
+        uint32_t n;
+
+        g_string_append_printf(
+            text,
+            "\nSTART_LATE31_ENTRY_TRACE=COUNT:%" G_GUINT64_FORMAT
+            " TRACE:", env->start_late31_entry_trace_count);
+        for (n = 0; n < count; n++) {
+            uint64_t sequence = first + n;
+            uint32_t slot = sequence % DMCU_START_LATE31_ENTRY_TRACE_SLOTS;
+            uint32_t from = env->start_late31_entry_trace_from[slot];
+            uint32_t target = env->start_late31_entry_trace_target[slot];
+            uint32_t index;
+
+            g_string_append_printf(
+                text,
+                "%s#%" G_GUINT64_FORMAT "/%02x:%04x>%02x:%04x/w%04x/"
+                "sp%04x/fp%04x/r%04x,%04x,%04x,%04x/stack",
+                n ? ";" : "", sequence + 1u,
+                dmcu_code_segment(from), dmcu_code_pc(from),
+                dmcu_code_segment(target), dmcu_code_pc(target),
+                env->start_late31_entry_trace_word[slot],
+                env->start_late31_entry_trace_sp[slot],
+                env->start_late31_entry_trace_fp[slot],
+                env->start_late31_entry_trace_gpr[slot][0],
+                env->start_late31_entry_trace_gpr[slot][1],
+                env->start_late31_entry_trace_gpr[slot][2],
+                env->start_late31_entry_trace_gpr[slot][3]);
+            for (index = 0; index < DMCU_START_LATE31_ENTRY_STACK_WORDS;
+                 index++) {
+                g_string_append_printf(
+                    text, "%s%04x", index ? "," : "",
+                    env->start_late31_entry_trace_stack[slot][index]);
+            }
+        }
+    }
+    {
+        uint32_t count = MIN(
+            env->start_gpio_scan_trace_count,
+            (uint64_t)DMCU_START_BOUNDED_CALL_TRACE_SLOTS);
+        uint64_t first = env->start_gpio_scan_trace_count - count;
+        uint32_t n;
+
+        g_string_append_printf(
+            text,
+            "\nSTART_GPIO_SCAN_CALL_TRACE=COUNT:%" G_GUINT64_FORMAT
+            " TRACE:", env->start_gpio_scan_trace_count);
+        for (n = 0; n < count; n++) {
+            uint64_t sequence = first + n;
+            uint32_t slot = sequence % DMCU_START_BOUNDED_CALL_TRACE_SLOTS;
+            uint32_t from = env->start_gpio_scan_trace_from[slot];
+            uint32_t target = env->start_gpio_scan_trace_return[slot];
+            uint32_t index;
+
+            g_string_append_printf(
+                text,
+                "%s#%" G_GUINT64_FORMAT "/%02x:%04x/sp%04x/fp%04x"
+                ">ret%02x:%04x/sp%04x/fp%04x/stack",
+                n ? ";" : "", sequence + 1u,
+                dmcu_code_segment(from), dmcu_code_pc(from),
+                env->start_gpio_scan_trace_sp[slot],
+                env->start_gpio_scan_trace_fp[slot],
+                dmcu_code_segment(target), dmcu_code_pc(target),
+                env->start_gpio_scan_trace_return_sp[slot],
+                env->start_gpio_scan_trace_return_fp[slot]);
+            for (index = 0; index < DMCU_START_BOUNDED_CALL_STACK_WORDS;
+                 index++) {
+                g_string_append_printf(
+                    text, "%s%04x", index ? "," : "",
+                    env->start_gpio_scan_trace_stack[slot][index]);
+            }
+        }
+    }
+    {
+        uint32_t count = MIN(
+            env->start_menu_dispatch_trace_count,
+            (uint64_t)DMCU_START_MENU_DISPATCH_TRACE_SLOTS);
+        uint64_t first = env->start_menu_dispatch_trace_count - count;
+        uint32_t n;
+
+        g_string_append_printf(
+            text,
+            "\nSTART_MENU_DISPATCH_TRACE=COUNT:%" G_GUINT64_FORMAT
+            " TRACE:", env->start_menu_dispatch_trace_count);
+        for (n = 0; n < count; n++) {
+            uint64_t sequence = first + n;
+            uint32_t slot = sequence % DMCU_START_MENU_DISPATCH_TRACE_SLOTS;
+            uint32_t target = env->start_menu_dispatch_trace_target[slot];
+            uint32_t index;
+
+            g_string_append_printf(
+                text,
+                "%s#%" G_GUINT64_FORMAT "/event%02x/table%03x:%04x/"
+                "value%04x/target%02x:%04x/sp%04x>%04x/fp%04x/"
+                "ds%03x,%03x/r",
+                n ? ";" : "", sequence + 1u,
+                env->start_menu_dispatch_trace_event[slot] & 0xffu,
+                env->start_menu_dispatch_trace_ds0[slot],
+                env->start_menu_dispatch_trace_table_lo[slot],
+                env->start_menu_dispatch_trace_gpr[slot][0],
+                dmcu_code_segment(target), dmcu_code_pc(target),
+                env->start_menu_dispatch_trace_sp[slot],
+                env->start_menu_dispatch_trace_return_sp[slot],
+                env->start_menu_dispatch_trace_fp[slot],
+                env->start_menu_dispatch_trace_ds0[slot],
+                env->start_menu_dispatch_trace_ds1[slot]);
+            for (index = 0; index < ARRAY_SIZE(
+                     env->start_menu_dispatch_trace_gpr[slot]); index++) {
+                g_string_append_printf(
+                    text, "%s%04x", index ? "," : "",
+                    env->start_menu_dispatch_trace_gpr[slot][index]);
+            }
+            g_string_append(text, "/stack");
+            for (index = 0; index < DMCU_START_MENU_DISPATCH_STACK_WORDS;
+                 index++) {
+                g_string_append_printf(
+                    text, "%s%04x", index ? "," : "",
+                    env->start_menu_dispatch_trace_stack[slot][index]);
+            }
+            g_string_append(text, "/locals");
+            for (index = 0; index < DMCU_START_MENU_DISPATCH_LOCAL_BYTES;
+                 index++) {
+                g_string_append_printf(
+                    text, "%02x",
+                    env->start_menu_dispatch_trace_locals[slot][index]);
+            }
+        }
+    }
+    {
+        uint32_t count = MIN(
+            env->start_page_renderer_trace_count,
+            (uint64_t)DMCU_START_BOUNDED_CALL_TRACE_SLOTS);
+        uint64_t first = env->start_page_renderer_trace_count - count;
+        uint32_t n;
+
+        g_string_append_printf(
+            text,
+            "\nSTART_PAGE_RENDER_CALL_TRACE=COUNT:%" G_GUINT64_FORMAT
+            " ACTIVE:%u TRACE:", env->start_page_renderer_trace_count,
+            env->start_page_renderer_trace_active);
+        for (n = 0; n < count; n++) {
+            uint64_t sequence = first + n;
+            uint32_t slot = sequence % DMCU_START_BOUNDED_CALL_TRACE_SLOTS;
+            uint32_t from = env->start_page_renderer_trace_from[slot];
+            uint32_t target = env->start_page_renderer_trace_return[slot];
+            uint32_t index;
+
+            g_string_append_printf(
+                text,
+                "%s#%" G_GUINT64_FORMAT "/%02x:%04x/sp%04x/fp%04x/"
+                "frame%04x,%04x>ret%02x:%04x/sp%04x/fp%04x/"
+                "frame%04x,%04x/stack",
+                n ? ";" : "", sequence + 1u,
+                dmcu_code_segment(from), dmcu_code_pc(from),
+                env->start_page_renderer_trace_sp[slot],
+                env->start_page_renderer_trace_fp[slot],
+                env->start_page_renderer_trace_frame_initial[slot][0],
+                env->start_page_renderer_trace_frame_initial[slot][1],
+                dmcu_code_segment(target), dmcu_code_pc(target),
+                env->start_page_renderer_trace_return_sp[slot],
+                env->start_page_renderer_trace_return_fp[slot],
+                env->start_page_renderer_trace_frame_final[slot][0],
+                env->start_page_renderer_trace_frame_final[slot][1]);
+            for (index = 0; index < DMCU_START_BOUNDED_CALL_STACK_WORDS;
+                 index++) {
+                g_string_append_printf(
+                    text, "%s%04x", index ? "," : "",
+                    env->start_page_renderer_trace_stack[slot][index]);
+            }
+        }
+    }
+    {
+        uint32_t count = MIN(
+            env->start_page_return_write_count,
+            (uint64_t)DMCU_START_PAGE_RETURN_WRITE_TRACE_SLOTS);
+        uint64_t first = env->start_page_return_write_count - count;
+        uint32_t n;
+
+        g_string_append_printf(
+            text,
+            "\nSTART_PAGE_RETURN_WRITES=COUNT:%" G_GUINT64_FORMAT
+            " TRACE:", env->start_page_return_write_count);
+        for (n = 0; n < count; n++) {
+            uint64_t sequence = first + n;
+            uint32_t slot = sequence %
+                            DMCU_START_PAGE_RETURN_WRITE_TRACE_SLOTS;
+            uint32_t pc = env->start_page_return_write_pc[slot];
+            uint32_t caller = env->start_page_return_write_caller[slot];
+            uint32_t repeat_pc =
+                env->start_page_return_write_repeat_pc[slot];
+            uint32_t repeat_end =
+                env->start_page_return_write_repeat_end[slot];
+            uint32_t depth;
+
+            g_string_append_printf(
+                text,
+                "%s#%" G_GUINT64_FORMAT "/call%" G_GUINT64_FORMAT
+                "/%02x:%04x/caller%02x:%04x/a%04x/%04x>%04x/"
+                "b%u/bus%u/sp%04x/fp%04x/ds%03x,%03x/"
+                "r%04x,%04x,%04x,%04x,%04x,%04x,%04x,%04x,"
+                "%04x,%04x,%04x/args%04x,%04x,%04x,%04x,%04x,%04x/"
+                "rep%02x:%04x-%02x:%04x/%u/irq%u",
+                n ? ";" : "", sequence + 1u,
+                env->start_page_return_write_call_sequence[slot],
+                dmcu_code_segment(pc), dmcu_code_pc(pc),
+                dmcu_code_segment(caller), dmcu_code_pc(caller),
+                env->start_page_return_write_address[slot],
+                env->start_page_return_write_old[slot],
+                env->start_page_return_write_new[slot],
+                env->start_page_return_write_bits[slot],
+                env->start_page_return_write_bus[slot],
+                env->start_page_return_write_sp[slot],
+                env->start_page_return_write_fp[slot],
+                env->start_page_return_write_ds0[slot],
+                env->start_page_return_write_ds1[slot],
+                env->start_page_return_write_gpr[slot][0],
+                env->start_page_return_write_gpr[slot][1],
+                env->start_page_return_write_gpr[slot][2],
+                env->start_page_return_write_gpr[slot][3],
+                env->start_page_return_write_gpr[slot][4],
+                env->start_page_return_write_gpr[slot][5],
+                env->start_page_return_write_gpr[slot][6],
+                env->start_page_return_write_gpr[slot][7],
+                env->start_page_return_write_gpr[slot][8],
+                env->start_page_return_write_gpr[slot][9],
+                env->start_page_return_write_gpr[slot][10],
+                env->start_page_return_write_args[slot][0],
+                env->start_page_return_write_args[slot][1],
+                env->start_page_return_write_args[slot][2],
+                env->start_page_return_write_args[slot][3],
+                env->start_page_return_write_args[slot][4],
+                env->start_page_return_write_args[slot][5],
+                dmcu_code_segment(repeat_pc), dmcu_code_pc(repeat_pc),
+                dmcu_code_segment(repeat_end), dmcu_code_pc(repeat_end),
+                env->start_page_return_write_repeat_count[slot],
+                env->start_page_return_write_in_irq[slot]);
+            g_string_append(text, "/chain");
+            for (depth = 0; depth < DMCU_START_PAGE_RETURN_FRAME_DEPTH;
+                 depth++) {
+                uint16_t frame_fp =
+                    env->start_page_return_write_frame_fp[slot][depth];
+                uint32_t frame_caller =
+                    env->start_page_return_write_frame_caller[slot][depth];
+
+                if (!frame_fp) {
+                    break;
+                }
+                g_string_append_printf(
+                    text,
+                    "%sfp%04x>%02x:%04x/a%04x,%04x,%04x,%04x,%04x,%04x",
+                    depth ? "," : "", frame_fp,
+                    dmcu_code_segment(frame_caller),
+                    dmcu_code_pc(frame_caller),
+                    env->start_page_return_write_frame_args[slot][depth][0],
+                    env->start_page_return_write_frame_args[slot][depth][1],
+                    env->start_page_return_write_frame_args[slot][depth][2],
+                    env->start_page_return_write_frame_args[slot][depth][3],
+                    env->start_page_return_write_frame_args[slot][depth][4],
+                    env->start_page_return_write_frame_args[slot][depth][5]);
+            }
+        }
+    }
+    {
+        uint32_t count = MIN(env->start_object_write_count,
+                             (uint64_t)DMCU_START_OBJECT_WRITE_TRACE_SLOTS);
+        uint64_t first = env->start_object_write_count - count;
+        uint32_t n;
+
+        g_string_append_printf(
+            text,
+            "\nSTART_OBJECT_WRITES=ACTIVE:%u BASE:%04x ENTRY:sp%04x/fp%04x "
+            "COUNT:%" G_GUINT64_FORMAT
+            " PATH:cef4=%" G_GUINT64_FORMAT "/1752=%" G_GUINT64_FORMAT
+            "/cfa8=%" G_GUINT64_FORMAT "/fa06=%" G_GUINT64_FORMAT
+            "/b19c=%" G_GUINT64_FORMAT "/5896=%" G_GUINT64_FORMAT
+            " TRACE=",
+            env->start_object_watch_active,
+            env->start_object_watch_base,
+            env->start_object_watch_entry_sp,
+            env->start_object_watch_entry_fp,
+            env->start_object_write_count,
+            env->start_object_renderer_entries,
+            env->start_object_input_entries,
+            env->start_object_context_entries,
+            env->start_object_context_test_entries,
+            env->start_object_callback_b19c_entries,
+            env->start_object_callback_5896_entries);
+        for (n = 0; n < count; n++) {
+            uint32_t slot = (first + n) %
+                            DMCU_START_OBJECT_WRITE_TRACE_SLOTS;
+            uint32_t pc = env->start_object_write_pc[slot];
+
+            g_string_append_printf(
+                text,
+                "%s#%" G_GUINT64_FORMAT "/%02x:%04x/+%02x/"
+                "%04x>%04x/%u/b%u/sp%04x/fp%04x/irq%u",
+                n ? ";" : "", first + n + 1u,
+                dmcu_code_segment(pc), dmcu_code_pc(pc),
+                (env->start_object_write_address[slot] -
+                 env->start_object_watch_base) & 0xff,
+                env->start_object_write_old[slot],
+                env->start_object_write_new[slot],
+                env->start_object_write_bits[slot],
+                env->start_object_write_bus[slot],
+                env->start_object_write_sp[slot],
+                env->start_object_write_fp[slot],
+                env->start_object_write_in_irq[slot]);
+        }
+    }
+    {
+        uint32_t count = MIN(env->start_context_code_write_count,
+                             (uint64_t)DMCU_START_CONTEXT_CODE_WRITE_SLOTS);
+        uint64_t first = env->start_context_code_write_count - count;
+        uint32_t n;
+
+        g_string_append_printf(
+            text,
+            "\nSTART_CONTEXT_CODE_WRITES=COUNT:%" G_GUINT64_FORMAT
+            " FIRST:%02x:%04x/%06x/%04x>%04x/%u TRACE=",
+            env->start_context_code_write_count,
+            dmcu_code_segment(env->start_context_code_first_pc),
+            dmcu_code_pc(env->start_context_code_first_pc),
+            env->start_context_code_first_address & 0xffffff,
+            env->start_context_code_first_old,
+            env->start_context_code_first_new,
+            env->start_context_code_first_bits);
+        for (n = 0; n < count; n++) {
+            uint32_t slot = (first + n) %
+                            DMCU_START_CONTEXT_CODE_WRITE_SLOTS;
+            uint32_t pc = env->start_context_code_write_pc[slot];
+
+            g_string_append_printf(
+                text,
+                "%s#%" G_GUINT64_FORMAT "/%02x:%04x/%06x/"
+                "%04x>%04x/%u/ds%03x,%03x",
+                n ? ";" : "", first + n + 1u,
+                dmcu_code_segment(pc), dmcu_code_pc(pc),
+                env->start_context_code_write_address[slot] & 0xffffff,
+                env->start_context_code_write_old[slot],
+                env->start_context_code_write_new[slot],
+                env->start_context_code_write_bits[slot],
+                env->start_context_code_write_ds0[slot],
+                env->start_context_code_write_ds1[slot]);
+        }
+    }
+    {
         uint32_t count = MIN(env->manager_state_writes,
                              (uint64_t)DMCU_MANAGER_STATE_WRITE_SLOTS);
         uint64_t first = env->manager_state_writes - count;
@@ -11896,6 +16632,9 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
             "STOREUNITRET", "STOREMAINTRET", "STORECOMMITRET",
             "DEFAULT", "DEFAULTRET", "TEXTDISP", "TEXTREC",
             "PERSISTBYTE", "PERSISTRET",
+            "MODDISPATCH", "MODGENERIC", "MODEVGUARD", "MODEVGUARDRET",
+            "MODEVGUARDTRUE", "MODEVGUARDFALSE", "MODAPPRET",
+            "MODAPPFALSE", "MODAPPTRUE", "MODRESULT",
             "FGRAWRET", "FGMAPRET", "ROOTCTRL", "ROOTLOOP", "ROOTSKIP",
             "ROOTRENDER",
             "FGDECODE", "FGCHANGE", "FGEXIT",
@@ -11927,6 +16666,172 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
             first = false;
         }
         if (first) {
+            g_string_append(text, "none");
+        }
+    }
+    g_string_append_printf(
+        text,
+        "\nFOREGROUND_ENTRY=COUNT:%u FROM:%02x:%04x WORD:%04x "
+        "PRE_SP:%04x POST_SP:%04x FP:%04x FRAME:%04x,%04x,%04x",
+        env->foreground_main_entries,
+        dmcu_code_segment(env->foreground_main_entry_from),
+        dmcu_code_pc(env->foreground_main_entry_from),
+        env->foreground_main_entry_word,
+        env->foreground_main_entry_pre_sp,
+        env->foreground_main_entry_post_sp,
+        env->foreground_main_entry_fp,
+        env->foreground_main_entry_frame[0],
+        env->foreground_main_entry_frame[1],
+        env->foreground_main_entry_frame[2]);
+    g_string_append_printf(
+        text,
+        "\nFOREGROUND_MODE=COUNT:%u FROM:%02x:%04x TARGET:%02x:%04x "
+        "WORD:%04x MODE:%04x EVENT:%04x SP:%04x>%04x FP:%04x",
+        env->foreground_mode_selects,
+        dmcu_code_segment(env->foreground_mode_select_from),
+        dmcu_code_pc(env->foreground_mode_select_from),
+        dmcu_code_segment(env->foreground_mode_select_target),
+        dmcu_code_pc(env->foreground_mode_select_target),
+        env->foreground_mode_select_word,
+        env->foreground_mode_select_mode,
+        env->foreground_mode_select_event,
+        env->foreground_mode_select_pre_sp,
+        env->foreground_mode_select_post_sp,
+        env->foreground_mode_select_fp);
+    g_string_append_printf(
+        text,
+        "\nFOREGROUND_RETURN=COUNT:%u FROM:%02x:%04x TARGET:%02x:%04x "
+        "WORD:%04x RESULT:%04x SP:%04x>%04x FP:%04x",
+        env->foreground_main_returns,
+        dmcu_code_segment(env->foreground_main_return_from),
+        dmcu_code_pc(env->foreground_main_return_from),
+        dmcu_code_segment(env->foreground_main_return_target),
+        dmcu_code_pc(env->foreground_main_return_target),
+        env->foreground_main_return_word,
+        env->foreground_main_return_result,
+        env->foreground_main_return_pre_sp,
+        env->foreground_main_return_post_sp,
+        env->foreground_main_return_fp);
+    g_string_append_printf(
+        text,
+        "\nFOREGROUND_CONTEXT_RETURN=COUNT:%u FROM:%02x:%04x "
+        "TARGET:%02x:%04x WORD:%04x RESULT:%04x SELECTOR:%04x "
+        "STATE:%04x RESOURCE:%04x PENDING:%04x STAGE:%04x "
+        "SP:%04x>%04x FP:%04x",
+        env->foreground_context_returns,
+        dmcu_code_segment(env->foreground_context_return_from),
+        dmcu_code_pc(env->foreground_context_return_from),
+        dmcu_code_segment(env->foreground_context_return_target),
+        dmcu_code_pc(env->foreground_context_return_target),
+        env->foreground_context_return_word,
+        env->foreground_context_return_result,
+        env->foreground_context_return_selector,
+        env->foreground_context_return_state,
+        env->foreground_context_return_resource,
+        env->foreground_context_return_pending,
+        env->foreground_context_return_stage,
+        env->foreground_context_return_pre_sp,
+        env->foreground_context_return_post_sp,
+        env->foreground_context_return_fp);
+    g_string_append_printf(
+        text,
+        "\nFOREGROUND_OWNER_RETURN=COUNT:%u FROM:%02x:%04x "
+        "TARGET:%02x:%04x WORD:%04x RESULT:%04x SELECTOR:%04x "
+        "STATE:%04x RESOURCE:%04x PENDING:%04x STAGE:%04x "
+        "SP:%04x>%04x FP:%04x",
+        env->foreground_owner_returns,
+        dmcu_code_segment(env->foreground_owner_return_from),
+        dmcu_code_pc(env->foreground_owner_return_from),
+        dmcu_code_segment(env->foreground_owner_return_target),
+        dmcu_code_pc(env->foreground_owner_return_target),
+        env->foreground_owner_return_word,
+        env->foreground_owner_return_result,
+        env->foreground_owner_return_selector,
+        env->foreground_owner_return_state,
+        env->foreground_owner_return_resource,
+        env->foreground_owner_return_pending,
+        env->foreground_owner_return_stage,
+        env->foreground_owner_return_pre_sp,
+        env->foreground_owner_return_post_sp,
+        env->foreground_owner_return_fp);
+    g_string_append_printf(
+        text, "\nROOT_EXIT_STATE=VALUE:%04x COUNT:%u TRACE:",
+        address_space_lduw_le(&address_space_memory, 0x512250u,
+                              MEMTXATTRS_UNSPECIFIED, NULL),
+        env->root_exit_state_trace_count);
+    {
+        uint32_t count = MIN(env->root_exit_state_trace_count,
+                             (uint32_t)DMCU_ROOT_EXIT_STATE_TRACE_SLOTS);
+        uint32_t first = env->root_exit_state_trace_count - count;
+        uint32_t n;
+
+        for (n = 0; n < count; n++) {
+            uint32_t slot =
+                (first + n) % DMCU_ROOT_EXIT_STATE_TRACE_SLOTS;
+
+            g_string_append_printf(
+                text, "%s%02x:%04x/%04x>%04x/%u",
+                n ? "," : "",
+                dmcu_code_segment(env->root_exit_state_trace_pc[slot]),
+                dmcu_code_pc(env->root_exit_state_trace_pc[slot]),
+                env->root_exit_state_trace_old[slot],
+                env->root_exit_state_trace_new[slot],
+                env->root_exit_state_trace_bits[slot]);
+        }
+        if (!count) {
+            g_string_append(text, "none");
+        }
+    }
+    g_string_append_printf(
+        text,
+        "\nRESIDENT16_PREFIX=ENTRIES:%u FROM:%02x:%04x "
+        "TARGET:%02x:%04x WORD:%04x SP:%04x>%04x FP:%04x "
+        "EXITS:%u FROM:%02x:%04x TARGET:%02x:%04x WORD:%04x "
+        "SP:%04x>%04x FP:%04x",
+        env->resident16_prefix_entries,
+        dmcu_code_segment(env->resident16_prefix_entry_from),
+        dmcu_code_pc(env->resident16_prefix_entry_from),
+        dmcu_code_segment(env->resident16_prefix_entry_target),
+        dmcu_code_pc(env->resident16_prefix_entry_target),
+        env->resident16_prefix_entry_word,
+        env->resident16_prefix_entry_pre_sp,
+        env->resident16_prefix_entry_post_sp,
+        env->resident16_prefix_entry_fp,
+        env->resident16_prefix_exits,
+        dmcu_code_segment(env->resident16_prefix_exit_from),
+        dmcu_code_pc(env->resident16_prefix_exit_from),
+        dmcu_code_segment(env->resident16_prefix_exit_target),
+        dmcu_code_pc(env->resident16_prefix_exit_target),
+        env->resident16_prefix_exit_word,
+        env->resident16_prefix_exit_pre_sp,
+        env->resident16_prefix_exit_post_sp,
+        env->resident16_prefix_exit_fp);
+    g_string_append_printf(text, "\nRESIDENT16_RETURN_WRITES=COUNT:%u TRACE:",
+                           env->resident16_return_trace_count);
+    {
+        uint32_t count = MIN(env->resident16_return_trace_count,
+                             (uint32_t)DMCU_RESIDENT16_RETURN_TRACE_SLOTS);
+        uint32_t first = env->resident16_return_trace_count - count;
+        uint32_t n;
+
+        for (n = 0; n < count; n++) {
+            uint32_t slot =
+                (first + n) % DMCU_RESIDENT16_RETURN_TRACE_SLOTS;
+
+            g_string_append_printf(
+                text, "%s%02x:%04x/%04x/%04x>%04x/%u/sp%04x/fp%04x/i%u",
+                n ? "," : "",
+                dmcu_code_segment(env->resident16_return_trace_pc[slot]),
+                dmcu_code_pc(env->resident16_return_trace_pc[slot]),
+                env->resident16_return_trace_address[slot],
+                env->resident16_return_trace_old[slot],
+                env->resident16_return_trace_new[slot],
+                env->resident16_return_trace_bits[slot],
+                env->resident16_return_trace_sp[slot],
+                env->resident16_return_trace_fp[slot],
+                env->resident16_return_trace_in_irq[slot]);
+        }
+        if (!count) {
             g_string_append(text, "none");
         }
     }
@@ -12260,6 +17165,85 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
                            env->overlay_code_syncs);
     g_string_append_printf(
         text,
+        "\nFAR_COMPARE_OVERLAY=WRITES:%u "
+        "FIRST:%02x:%04x/%06x:%04x>%04x/%u "
+        "LAST:%02x:%04x/%06x:%04x>%04x/%u "
+        "LIVE:%04x,%04x,%04x,%04x,...,%04x,%04x",
+        env->far_compare_overlay_writes,
+        dmcu_code_segment(env->far_compare_overlay_first_pc),
+        dmcu_code_pc(env->far_compare_overlay_first_pc),
+        env->far_compare_overlay_first_address & 0xffffff,
+        env->far_compare_overlay_first_old,
+        env->far_compare_overlay_first_value,
+        env->far_compare_overlay_first_bits,
+        dmcu_code_segment(env->far_compare_overlay_last_pc),
+        dmcu_code_pc(env->far_compare_overlay_last_pc),
+        env->far_compare_overlay_last_address & 0xffffff,
+        env->far_compare_overlay_last_old,
+        env->far_compare_overlay_last_value,
+        env->far_compare_overlay_last_bits,
+        address_space_lduw_le(&address_space_memory, 0x32a922u,
+                              MEMTXATTRS_UNSPECIFIED, NULL),
+        address_space_lduw_le(&address_space_memory, 0x32a924u,
+                              MEMTXATTRS_UNSPECIFIED, NULL),
+        address_space_lduw_le(&address_space_memory, 0x32a926u,
+                              MEMTXATTRS_UNSPECIFIED, NULL),
+        address_space_lduw_le(&address_space_memory, 0x32a928u,
+                              MEMTXATTRS_UNSPECIFIED, NULL),
+        address_space_lduw_le(&address_space_memory, 0x32a976u,
+                              MEMTXATTRS_UNSPECIFIED, NULL),
+        address_space_lduw_le(&address_space_memory, 0x32a978u,
+                              MEMTXATTRS_UNSPECIFIED, NULL));
+    g_string_append(text, "\nRESOURCE_OPEN_CONTINUATION_TRACE=");
+    if (env->resource_open_continuation_trace_count) {
+        uint32_t start = env->resource_open_continuation_trace_count >
+                         DMCU_RESOURCE_OPEN_CONTINUATION_TRACE_SLOTS ?
+                         env->resource_open_continuation_trace_count -
+                         DMCU_RESOURCE_OPEN_CONTINUATION_TRACE_SLOTS : 0;
+        uint32_t trace;
+
+        for (trace = start;
+             trace < env->resource_open_continuation_trace_count; trace++) {
+            uint32_t slot = trace %
+                            DMCU_RESOURCE_OPEN_CONTINUATION_TRACE_SLOTS;
+            uint32_t from =
+                env->resource_open_continuation_trace_from[slot];
+            uint32_t sequential =
+                env->resource_open_continuation_trace_sequential[slot];
+            unsigned index;
+
+            g_string_append_printf(
+                text,
+                "%s#%u/%s/%02x:%04x>32:b63c/seq%02x:%04x/"
+                "w%04x:%04x/sp%04x>%04x/fp%04x/"
+                "r%04x,%04x,%04x,%04x/st",
+                trace == start ? "" : ",", trace + 1,
+                sequential == dmcu_code_address(0x32, 0xb63c) ?
+                "fall" : "jump",
+                dmcu_code_segment(from), dmcu_code_pc(from),
+                dmcu_code_segment(sequential), dmcu_code_pc(sequential),
+                env->resource_open_continuation_trace_word[slot],
+                env->resource_open_continuation_trace_ext[slot],
+                env->resource_open_continuation_trace_sp[slot],
+                env->resource_open_continuation_trace_post_sp[slot],
+                env->resource_open_continuation_trace_fp[slot],
+                env->resource_open_continuation_trace_regs[slot][0],
+                env->resource_open_continuation_trace_regs[slot][1],
+                env->resource_open_continuation_trace_regs[slot][2],
+                env->resource_open_continuation_trace_regs[slot][3]);
+            for (index = 0;
+                 index < DMCU_RESOURCE_OPEN_CONTINUATION_STACK_WORDS;
+                 index++) {
+                g_string_append_printf(
+                    text, "%s%04x", index ? "." : "",
+                    env->resource_open_continuation_trace_stack[slot][index]);
+            }
+        }
+    } else {
+        g_string_append(text, "none");
+    }
+    g_string_append_printf(
+        text,
         "\nFILE_RECORD_OVERLAY=WRITES:%u "
         "FIRST:%02x:%04x/%06x=%04x@%u "
         "LAST:%02x:%04x/%06x=%04x@%u "
@@ -12300,6 +17284,29 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
         env->resource_recovery_word_last_value,
         env->resource_recovery_word_last_bits,
         address_space_lduw_le(&address_space_memory, 0x2781e4,
+                              MEMTXATTRS_UNSPECIFIED, NULL));
+    g_string_append_printf(
+        text,
+        "\nEVENT_STATE_OVERLAY=WRITES:%u FIRST:%02x:%04x/%06x:%04x>%04x/%u "
+        "LAST:%02x:%04x/%06x:%04x>%04x/%u LIVE:%04x,%04x,%04x",
+        env->event_state_overlay_writes,
+        dmcu_code_segment(env->event_state_overlay_first_pc),
+        dmcu_code_pc(env->event_state_overlay_first_pc),
+        env->event_state_overlay_first_address & 0xffffff,
+        env->event_state_overlay_first_old,
+        env->event_state_overlay_first_value,
+        env->event_state_overlay_first_bits,
+        dmcu_code_segment(env->event_state_overlay_last_pc),
+        dmcu_code_pc(env->event_state_overlay_last_pc),
+        env->event_state_overlay_last_address & 0xffffff,
+        env->event_state_overlay_last_old,
+        env->event_state_overlay_last_value,
+        env->event_state_overlay_last_bits,
+        address_space_lduw_le(&address_space_memory, 0x2cd350u,
+                              MEMTXATTRS_UNSPECIFIED, NULL),
+        address_space_lduw_le(&address_space_memory, 0x2cd38eu,
+                              MEMTXATTRS_UNSPECIFIED, NULL),
+        address_space_lduw_le(&address_space_memory, 0x2cd52eu,
                               MEMTXATTRS_UNSPECIFIED, NULL));
     g_string_append_printf(
         text,
@@ -12350,9 +17357,9 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
         env->resource_init_last_r0 & 0xffff,
         env->resource_init_last_r1 & 0xffff);
     g_string_append_printf(text, "\nTIMER64=%04x,%04x,%04x",
-        np560_timer_remaining(&s->timer, 0),
-        np560_timer_remaining(&s->timer, 1),
-        np560_timer_remaining(&s->timer, 2));
+        np560_timer_remaining(s, 0),
+        np560_timer_remaining(s, 1),
+        np560_timer_remaining(s, 2));
     g_string_append_printf(text,
         "\nST7529=%s SLEEP=%s INV=%s COM=%u CMD=%02x "
         "WINDOW=C%u-%u,L%u-%u "
@@ -12679,6 +17686,255 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
     } else {
         g_string_append(text, "none");
     }
+    {
+        static const char *const stage_names[
+            DMCU_CLOCK_RESOURCE_RELEASE_STAGES] = {
+            "PRE8", "CALL8", "ENTRY8", "RET8",
+            "CALL3", "ENTRY3", "RET3", "EXIT",
+        };
+        uint32_t count = MIN(
+            env->clock_resource_release_calls,
+            (uint32_t)DMCU_CLOCK_RESOURCE_RELEASE_TRACE_SLOTS);
+        uint32_t trace;
+
+        g_string_append_printf(
+            text, "\nRESOURCE_PAIR_RELEASE=CALLS:%u ACTIVE:%u TRACE:",
+            env->clock_resource_release_calls,
+            env->clock_resource_release_active);
+        if (!count) {
+            g_string_append(text, "none");
+        }
+        for (trace = 0; trace < count; trace++) {
+            uint32_t caller = env->clock_resource_release_caller[trace];
+            unsigned stage;
+
+            g_string_append_printf(
+                text,
+                "%s#%u/c%02x:%04x/csp%04x>%04x/cfp%04x/"
+                "rsp%04x/rfp%04x/mask%u:%u",
+                trace ? ";" : "", trace + 1,
+                dmcu_code_segment(caller), dmcu_code_pc(caller),
+                env->clock_resource_release_call_sp[trace],
+                env->clock_resource_release_call_post_sp[trace],
+                env->clock_resource_release_call_fp[trace],
+                env->clock_resource_release_resource_sp[trace],
+                env->clock_resource_release_resource_fp[trace],
+                env->clock_resource_release_mask_calls[trace],
+                env->clock_resource_release_mask_returns[trace]);
+            if (env->clock_resource_release_mask_calls[trace]) {
+                uint32_t mask_caller =
+                    env->clock_resource_release_mask_caller[trace];
+
+                g_string_append_printf(
+                    text, "@%02x:%04x/h%04x/b%04x",
+                    dmcu_code_segment(mask_caller),
+                    dmcu_code_pc(mask_caller),
+                    env->clock_resource_release_mask_handle[trace],
+                    env->clock_resource_release_mask_bitmap_before[trace]);
+                if (env->clock_resource_release_mask_returns[trace]) {
+                    uint32_t mask_target =
+                        env->clock_resource_release_mask_return_target[trace];
+
+                    g_string_append_printf(
+                        text, ">%04x@%02x:%04x",
+                        env->clock_resource_release_mask_bitmap_after[trace],
+                        dmcu_code_segment(mask_target),
+                        dmcu_code_pc(mask_target));
+                }
+            }
+            g_string_append(text, "/st[");
+            for (stage = 0;
+                 stage < DMCU_CLOCK_RESOURCE_RELEASE_STAGES; stage++) {
+                uint8_t bit = 1u << stage;
+                uint32_t pc;
+                uint32_t target;
+
+                if (!(env->clock_resource_release_stage_valid[trace] & bit)) {
+                    g_string_append_printf(
+                        text, "%s%s:-", stage ? "," : "", stage_names[stage]);
+                    continue;
+                }
+                pc = env->clock_resource_release_stage_pc[trace][stage];
+                target =
+                    env->clock_resource_release_stage_target[trace][stage];
+                g_string_append_printf(
+                    text,
+                    "%s%s:%02x:%04x/%04x.%04x>%02x:%04x/"
+                    "sp%04x>%04x/fp%04x>%04x/h%04x",
+                    stage ? "," : "", stage_names[stage],
+                    dmcu_code_segment(pc), dmcu_code_pc(pc),
+                    env->clock_resource_release_stage_word[trace][stage],
+                    env->clock_resource_release_stage_ext[trace][stage],
+                    dmcu_code_segment(target), dmcu_code_pc(target),
+                    env->clock_resource_release_stage_pre_sp[trace][stage],
+                    env->clock_resource_release_stage_post_sp[trace][stage],
+                    env->clock_resource_release_stage_pre_fp[trace][stage],
+                    env->clock_resource_release_stage_post_fp[trace][stage],
+                    env->clock_resource_release_stage_handle[trace][stage]);
+                if (env->clock_resource_release_stage_argument_valid[trace] &
+                    bit) {
+                    g_string_append_printf(
+                        text, "/a%04x",
+                        env->clock_resource_release_stage_argument[trace]
+                                                                    [stage]);
+                } else {
+                    g_string_append(text, "/a----");
+                }
+                if (env->clock_resource_release_stage_node_matches[trace]
+                                                                    [stage]) {
+                    uint32_t node =
+                        env->clock_resource_release_stage_node[trace][stage];
+                    uint32_t next =
+                        env->clock_resource_release_stage_next[trace][stage];
+
+                    g_string_append_printf(
+                        text,
+                        "/n%02x:%04x/w%04x/k%04x/next%02x:%04x/m%u",
+                        dmcu_code_segment(node), dmcu_code_pc(node),
+                        env->clock_resource_release_stage_node_word[trace]
+                                                                      [stage],
+                        env->clock_resource_release_stage_node_key[trace]
+                                                                     [stage],
+                        dmcu_code_segment(next), dmcu_code_pc(next),
+                        env->clock_resource_release_stage_node_matches[trace]
+                                                                      [stage]);
+                } else {
+                    g_string_append(text, "/nnone/m0");
+                }
+                if (env->clock_resource_release_stage_bitmap_valid[trace] &
+                    bit) {
+                    g_string_append_printf(
+                        text, "/b%04x&%04x=%u",
+                        env->clock_resource_release_stage_bitmap_word[trace]
+                                                                        [stage],
+                        env->clock_resource_release_stage_bitmap_mask[trace]
+                                                                        [stage],
+                        !!(env->clock_resource_release_stage_bitmap_set[trace]
+                           & bit));
+                } else {
+                    g_string_append(text, "/b----");
+                }
+                g_string_append_printf(
+                    text, "/irq%u@%u",
+                    !!(env->clock_resource_release_stage_in_irq[trace] & bit),
+                    env->clock_resource_release_stage_interrupts[trace]
+                                                                  [stage]);
+            }
+            g_string_append_c(text, ']');
+        }
+    }
+    {
+        static const char *const stage_names[
+            DMCU_NPE_RESOURCE_RETURN_TRACE_STAGES] = {
+            "ENTRY", "LINK", "MEM1", "GEOM", "ALLOC", "PTR",
+            "MEM2", "BLIT", "FREE1", "FREE2", "UNLINK", "RETS",
+        };
+        uint64_t total = env->npe_resource_return_trace_count;
+        uint64_t count = MIN(total, (uint64_t)4u);
+        uint64_t first = total - count;
+        uint64_t sequence;
+
+        g_string_append_printf(
+            text,
+            "\nNPE_RESOURCE_RETURN=CALLS:%" G_GUINT64_FORMAT
+            " ACTIVE:%" G_GUINT64_FORMAT " TRACE:",
+            total, env->npe_resource_return_active_sequence);
+        if (!count) {
+            g_string_append(text, "none");
+        }
+        for (sequence = first; sequence < total; sequence++) {
+            uint32_t slot = sequence % DMCU_NPE_RESOURCE_RETURN_TRACE_SLOTS;
+            uint32_t caller = env->npe_resource_return_caller[slot];
+            unsigned stage;
+
+            if (env->npe_resource_return_trace_sequence[slot] !=
+                sequence + 1u) {
+                continue;
+            }
+            g_string_append_printf(
+                text,
+                "%s#%" G_GUINT64_FORMAT "/c%02x:%04x/"
+                "sp%04x>%04x/fp%04x/base%04x/f%04x:%04x>%04x:%04x/st[",
+                sequence == first ? "" : ";", sequence + 1u,
+                dmcu_code_segment(caller), dmcu_code_pc(caller),
+                env->npe_resource_return_call_sp[slot],
+                env->npe_resource_return_call_post_sp[slot],
+                env->npe_resource_return_call_fp[slot],
+                env->npe_resource_return_frame_base[slot],
+                env->npe_resource_return_initial_frame[slot][0],
+                env->npe_resource_return_initial_frame[slot][1],
+                env->npe_resource_return_final_frame[slot][0],
+                env->npe_resource_return_final_frame[slot][1]);
+            for (stage = 0;
+                 stage < DMCU_NPE_RESOURCE_RETURN_TRACE_STAGES; stage++) {
+                uint16_t bit = 1u << stage;
+                uint32_t pc;
+                uint32_t target;
+
+                if (!(env->npe_resource_return_stage_valid[slot] & bit)) {
+                    continue;
+                }
+                pc = env->npe_resource_return_stage_pc[slot][stage];
+                target = env->npe_resource_return_stage_target[slot][stage];
+                g_string_append_printf(
+                    text,
+                    "%s%s:%02x:%04x>%02x:%04x/"
+                    "sp%04x>%04x/fp%04x/f%04x:%04x",
+                    stage ? "," : "", stage_names[stage],
+                    dmcu_code_segment(pc), dmcu_code_pc(pc),
+                    dmcu_code_segment(target), dmcu_code_pc(target),
+                    env->npe_resource_return_stage_sp[slot][stage],
+                    env->npe_resource_return_stage_post_sp[slot][stage],
+                    env->npe_resource_return_stage_fp[slot][stage],
+                    env->npe_resource_return_stage_frame[slot][stage][0],
+                    env->npe_resource_return_stage_frame[slot][stage][1]);
+            }
+            g_string_append_c(text, ']');
+        }
+        {
+            uint64_t writes = env->npe_resource_return_write_count;
+            uint64_t write_count = MIN(
+                writes,
+                (uint64_t)DMCU_NPE_RESOURCE_RETURN_WRITE_SLOTS);
+            uint64_t write_first = writes - write_count;
+            uint64_t write_sequence;
+
+            g_string_append_printf(
+                text, " WRITES:%" G_GUINT64_FORMAT ":", writes);
+            if (!write_count) {
+                g_string_append(text, "none");
+            }
+            for (write_sequence = write_first;
+                 write_sequence < writes; write_sequence++) {
+                uint32_t slot = write_sequence %
+                    DMCU_NPE_RESOURCE_RETURN_WRITE_SLOTS;
+                uint32_t pc = env->npe_resource_return_write_pc[slot];
+                uint8_t bus = env->npe_resource_return_write_bus[slot];
+                char bus_name = bus == 0 ? 'I' : bus == 1 ? 'D' : 'Q';
+
+                if (env->npe_resource_return_write_sequence[slot] !=
+                    write_sequence + 1u) {
+                    continue;
+                }
+                g_string_append_printf(
+                    text,
+                    "%s#%" G_GUINT64_FORMAT "/c%" G_GUINT64_FORMAT
+                    "/%c/%02x:%04x/a%04x/%04x>%04x/b%u/"
+                    "sp%04x/fp%04x/irq%u",
+                    write_sequence == write_first ? "" : ";",
+                    write_sequence + 1u,
+                    env->npe_resource_return_write_call_sequence[slot],
+                    bus_name, dmcu_code_segment(pc), dmcu_code_pc(pc),
+                    env->npe_resource_return_write_address[slot],
+                    env->npe_resource_return_write_old[slot],
+                    env->npe_resource_return_write_new[slot],
+                    env->npe_resource_return_write_bits[slot],
+                    env->npe_resource_return_write_sp[slot],
+                    env->npe_resource_return_write_fp[slot],
+                    env->npe_resource_return_write_in_irq[slot]);
+            }
+        }
+    }
     g_string_append_printf(
         text,
         "\nROOT_HEADER_IO_TRACE=CAP:%u PENDING:%u CALL:"
@@ -12843,6 +18099,51 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
                 env->clock_format_output_trace_bits[trace],
                 env->clock_format_output_trace_bus[trace]);
         }
+    }
+    g_string_append_printf(
+        text, "\nCLOCK_RASTER_PIPELINE=COUNT:%u TRACE:",
+        env->clock_raster_cycle_count);
+    if (env->clock_raster_cycle_count) {
+        uint32_t count = MIN(env->clock_raster_cycle_count,
+                             (uint32_t)DMCU_CLOCK_RASTER_TRACE_SLOTS);
+        uint32_t first = env->clock_raster_cycle_count - count;
+
+        for (uint32_t item = 0; item < count; item++) {
+            uint32_t slot = (first + item) % DMCU_CLOCK_RASTER_TRACE_SLOTS;
+            uint8_t valid = env->clock_raster_valid[slot];
+
+            g_string_append_printf(
+                text, "%s#%u/v%01x/text:", item ? ";" : "",
+                env->clock_raster_sequence[slot], valid);
+            for (uint32_t index = 0;
+                 index < DMCU_CLOCK_RASTER_TEXT_BYTES; index++) {
+                g_string_append_printf(
+                    text, "%02x", env->clock_raster_text[slot][index]);
+            }
+            for (uint32_t stage = 0;
+                 stage < DMCU_CLOCK_RASTER_TRACE_STAGES; stage++) {
+                if (!(valid & (1u << stage))) {
+                    continue;
+                }
+                g_string_append_printf(
+                    text,
+                    "/s%u:back%08x/f%u/l%04x,front%08x/f%u/l%04x/"
+                    "p%06x/m%u/a%04x/b%04x",
+                    stage,
+                    env->clock_raster_back_hash[slot][stage],
+                    env->clock_raster_back_foreground[slot][stage],
+                    env->clock_raster_back_levels[slot][stage],
+                    env->clock_raster_front_hash[slot][stage],
+                    env->clock_raster_front_foreground[slot][stage],
+                    env->clock_raster_front_levels[slot][stage],
+                    env->clock_raster_pointer[slot][stage] & 0xffffffu,
+                    env->clock_raster_mode[slot][stage],
+                    env->clock_raster_mask_a[slot][stage],
+                    env->clock_raster_mask_b[slot][stage]);
+            }
+        }
+    } else {
+        g_string_append(text, "none");
     }
     g_string_append_printf(
         text,
@@ -13114,6 +18415,1578 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
     } else {
         g_string_append(text, "none");
     }
+    g_string_append_printf(text, "\nNPE_GLYPH_TRACE=COUNT:%u TRACE:",
+                           env->npe_glyph_trace_count);
+    if (env->npe_glyph_trace_count) {
+        uint32_t start = env->npe_glyph_trace_count >
+                         DMCU_NPE_GLYPH_TRACE_SLOTS ?
+                         env->npe_glyph_trace_count -
+                         DMCU_NPE_GLYPH_TRACE_SLOTS : 0;
+        uint32_t trace;
+
+        for (trace = start; trace < env->npe_glyph_trace_count; trace++) {
+            uint32_t slot = trace % DMCU_NPE_GLYPH_TRACE_SLOTS;
+            uint32_t caller = env->npe_glyph_trace_caller[slot];
+            uint32_t target = env->npe_glyph_trace_target[slot];
+            unsigned depth;
+
+            g_string_append_printf(
+                text,
+                "%s#%u/%02x:%04x>%02x:%04x@%u,%u/%04x/sp%04x/fp%04x/chain",
+                trace == start ? "" : ",", trace + 1,
+                dmcu_code_segment(caller), dmcu_code_pc(caller),
+                dmcu_code_segment(target), dmcu_code_pc(target),
+                env->npe_glyph_trace_x[slot],
+                env->npe_glyph_trace_y[slot],
+                env->npe_glyph_trace_character[slot],
+                env->npe_glyph_trace_sp[slot],
+                env->npe_glyph_trace_fp[slot]);
+            for (depth = 0; depth < DMCU_NPE_GLYPH_TRACE_FRAMES; depth++) {
+                uint32_t frame = env->npe_glyph_trace_chain[slot][depth];
+
+                if (!frame) {
+                    break;
+                }
+                g_string_append_printf(
+                    text, "%s%02x:%04x", depth ? ">" : "",
+                    dmcu_code_segment(frame), dmcu_code_pc(frame));
+            }
+        }
+    } else {
+        g_string_append(text, "none");
+    }
+    g_string_append_printf(text, "\nNPE_TEXT_BOX_TRACE=COUNT:%u TRACE:",
+                           env->npe_text_box_trace_count);
+    if (env->npe_text_box_trace_count) {
+        uint32_t count = MIN(env->npe_text_box_trace_count,
+                             (uint32_t)DMCU_NPE_TEXT_BOX_TRACE_SLOTS);
+        uint32_t trace;
+
+        for (trace = 0; trace < count; trace++) {
+            uint32_t caller = env->npe_text_box_trace_caller[trace];
+            unsigned index;
+
+            g_string_append_printf(
+                text,
+                "%s#%u/%02x:%04x/sp%04x/fp%04x/a%04x,%04x,%04x,%04x/data:",
+                trace ? "," : "", trace + 1,
+                dmcu_code_segment(caller), dmcu_code_pc(caller),
+                env->npe_text_box_trace_sp[trace],
+                env->npe_text_box_trace_fp[trace],
+                env->npe_text_box_trace_args[trace][0],
+                env->npe_text_box_trace_args[trace][1],
+                env->npe_text_box_trace_args[trace][2],
+                env->npe_text_box_trace_args[trace][3]);
+            if (!env->npe_text_box_trace_pointer_valid[trace]) {
+                g_string_append(text, "invalid");
+                continue;
+            }
+            for (index = 0; index < DMCU_NPE_TEXT_BOX_TRACE_SAMPLE_BYTES;
+                 index++) {
+                g_string_append_printf(
+                    text, "%02x", env->npe_text_box_trace_sample[trace][index]);
+            }
+        }
+    } else {
+        g_string_append(text, "none");
+    }
+    g_string_append_printf(
+        text,
+        "\nNPE_LOADER_EVENT=ACTIVE:%u FOLLOW:%u "
+        "CALLS:%u RETURNS:%u/NZ:%u/K86:%u "
+        "CALL:sp%04x/fp%04x RETURN:sp%04x/fp%04x/LAST:%04x "
+        "EVENT:r%04x/t%04x/c%04x "
+        "GLOBAL:m%04x/f%02x/i%02x/s%04x ERR:e%04x/f%04x "
+        "PATH:z%u/t4%u/to%u/m1%u/mo%u/f0%u/fn%u "
+        "PREP:%u INIT:%u/%u PROGRESS:%u SERVICE:%u EXIT:%u",
+        env->npe_loader_event_watch_active,
+        env->npe_loader_event_follow_active,
+        env->npe_loader_event_calls,
+        env->npe_loader_event_returns,
+        env->npe_loader_event_nonzero_returns,
+        env->npe_loader_event_key86_returns,
+        env->npe_loader_event_call_sp,
+        env->npe_loader_event_call_fp,
+        env->npe_loader_event_return_sp,
+        env->npe_loader_event_return_fp,
+        env->npe_loader_event_last_result,
+        env->npe_loader_event_result,
+        env->npe_loader_event_type,
+        env->npe_loader_event_code,
+        env->npe_loader_event_global_mode,
+        env->npe_loader_event_global_flag,
+        env->npe_loader_event_global_iteration,
+        env->npe_loader_event_global_selection,
+        env->npe_loader_event_error,
+        env->npe_loader_event_file_error,
+        env->npe_loader_event_result_zero_paths,
+        env->npe_loader_event_type4_paths,
+        env->npe_loader_event_other_type_paths,
+        env->npe_loader_event_mode1_paths,
+        env->npe_loader_event_other_mode_paths,
+        env->npe_loader_event_flag_zero_paths,
+        env->npe_loader_event_flag_nonzero_paths,
+        env->npe_loader_event_prepare_calls,
+        env->npe_loader_event_initialize_calls,
+        env->npe_loader_event_initialize_returns,
+        env->npe_loader_event_progress_paths,
+        env->npe_loader_event_service_calls,
+        env->npe_loader_event_controller_returns);
+    g_string_append_printf(
+        text,
+        "\nNPE_GAME_SERVICE=ARMED:%u DISPATCH:%u HANDLER:%u/%u "
+        "CODE86:%u FLAGS:%02x,%02x,%02x/ONE:%u,%u "
+        "MEM:%u/%u UIINIT:%u/%u SYNC:%u/%u STATE:%u/%u "
+        "RETURN:%u MODE:%04x PTR:%08x",
+        env->npe_game_trace_armed,
+        env->npe_game_service_dispatch_calls,
+        env->npe_game_ui_handler_calls,
+        env->npe_game_ui_handler_returns,
+        env->npe_game_code86_paths,
+        env->npe_game_flag_7a7a,
+        env->npe_game_flag_7a7c,
+        env->npe_game_flag_7a7e,
+        env->npe_game_flag_7a7e_one_paths,
+        env->npe_game_flag_7a7c_one_paths,
+        env->npe_game_memory_mode_calls,
+        env->npe_game_memory_mode_returns,
+        env->npe_game_ui_init_calls,
+        env->npe_game_ui_init_returns,
+        env->npe_game_buffer_sync_calls,
+        env->npe_game_buffer_sync_returns,
+        env->npe_game_state_publish_calls,
+        env->npe_game_state_publish_returns,
+        env->npe_game_service_returns,
+        env->npe_game_service_mode,
+        env->npe_game_service_pointer);
+    g_string_append_printf(
+        text,
+        "\nNPE_GAME_UI_RETURN=CALL:%u SP:%04x>%04x FP:%04x>%04x "
+        "FRAME:%04x,%04x,%04x,%04x RETS:%u/%06x W:%04x "
+        "SP:%04x>%04x FP:%04x>%04x FRAME:%04x,%04x,%04x,%04x "
+        "CONT:%u/%06x W:%04x SP:%04x>%04x FP:%04x>%04x",
+        env->npe_game_ui_init_calls,
+        env->npe_game_ui_init_call_pre_sp,
+        env->npe_game_ui_init_call_post_sp,
+        env->npe_game_ui_init_call_pre_fp,
+        env->npe_game_ui_init_call_post_fp,
+        env->npe_game_ui_init_call_frame[0],
+        env->npe_game_ui_init_call_frame[1],
+        env->npe_game_ui_init_call_frame[2],
+        env->npe_game_ui_init_call_frame[3],
+        env->npe_game_ui_init_rets_seen,
+        env->npe_game_ui_init_rets_target,
+        env->npe_game_ui_init_rets_word,
+        env->npe_game_ui_init_rets_pre_sp,
+        env->npe_game_ui_init_rets_post_sp,
+        env->npe_game_ui_init_rets_pre_fp,
+        env->npe_game_ui_init_rets_post_fp,
+        env->npe_game_ui_init_rets_frame[0],
+        env->npe_game_ui_init_rets_frame[1],
+        env->npe_game_ui_init_rets_frame[2],
+        env->npe_game_ui_init_rets_frame[3],
+        env->npe_game_ui_init_continuation_entries,
+        env->npe_game_ui_init_continuation_from,
+        env->npe_game_ui_init_continuation_word,
+        env->npe_game_ui_init_continuation_pre_sp,
+        env->npe_game_ui_init_continuation_post_sp,
+        env->npe_game_ui_init_continuation_pre_fp,
+        env->npe_game_ui_init_continuation_post_fp);
+    g_string_append_printf(
+        text,
+        "\nNPE_GAME_UI_REENTRY=%u PC:%02x:%04x W:%04x SP:%04x FP:%04x "
+        "STACK:",
+        env->npe_game_ui_reentry_valid,
+        dmcu_code_segment(env->npe_game_ui_reentry_pc),
+        dmcu_code_pc(env->npe_game_ui_reentry_pc),
+        env->npe_game_ui_reentry_word,
+        env->npe_game_ui_reentry_sp,
+        env->npe_game_ui_reentry_fp);
+    {
+        unsigned index;
+
+        for (index = 0; index < DMCU_NPE_UI_REENTRY_STACK_WORDS; index++) {
+            g_string_append_printf(
+                text, "%s%04x", index ? "," : "",
+                env->npe_game_ui_reentry_stack[index]);
+        }
+        g_string_append(text, " HISTORY:");
+        for (index = 0;
+             index < env->npe_game_ui_reentry_history_count;
+             index++) {
+            uint32_t pc = env->npe_game_ui_reentry_history_pc[index];
+
+            g_string_append_printf(
+                text, "%s%02x:%04x/%04x@%04x", index ? "," : "",
+                dmcu_code_segment(pc), dmcu_code_pc(pc),
+                env->npe_game_ui_reentry_history_word[index],
+                env->npe_game_ui_reentry_history_sp[index]);
+        }
+        if (!env->npe_game_ui_reentry_history_count) {
+            g_string_append(text, "none");
+        }
+    }
+    g_string_append_printf(
+        text,
+        "\nNPE_GAME_LINKED_LOADER=%u PC:%02x:%04x W:%04x SP:%04x FP:%04x "
+        "STACK:",
+        env->npe_game_linked_loader_valid,
+        dmcu_code_segment(env->npe_game_linked_loader_pc),
+        dmcu_code_pc(env->npe_game_linked_loader_pc),
+        env->npe_game_linked_loader_word,
+        env->npe_game_linked_loader_sp,
+        env->npe_game_linked_loader_fp);
+    {
+        unsigned index;
+
+        for (index = 0; index < DMCU_NPE_UI_REENTRY_STACK_WORDS; index++) {
+            g_string_append_printf(
+                text, "%s%04x", index ? "," : "",
+                env->npe_game_linked_loader_stack[index]);
+        }
+        g_string_append(text, " HISTORY:");
+        for (index = 0;
+             index < env->npe_game_linked_loader_history_count;
+             index++) {
+            uint32_t pc = env->npe_game_linked_loader_history_pc[index];
+
+            g_string_append_printf(
+                text, "%s%02x:%04x/%04x@%04x", index ? "," : "",
+                dmcu_code_segment(pc), dmcu_code_pc(pc),
+                env->npe_game_linked_loader_history_word[index],
+                env->npe_game_linked_loader_history_sp[index]);
+        }
+        if (!env->npe_game_linked_loader_history_count) {
+            g_string_append(text, "none");
+        }
+    }
+    g_string_append_printf(
+        text, "\nNPE_OPERATION_ONE_ACTION_WRITES=COUNT:%u TRACE:",
+        env->npe_operation_one_action_write_count);
+    {
+        uint32_t count = env->npe_operation_one_action_write_count;
+        uint32_t stored = MIN(
+            count, (uint32_t)DMCU_NPE_OPERATION_ONE_ACTION_WRITE_SLOTS);
+        uint32_t first_sequence = count - stored;
+        unsigned index;
+
+        for (index = 0; index < stored; index++) {
+            uint32_t sequence = first_sequence + index;
+            uint32_t slot = sequence %
+                            DMCU_NPE_OPERATION_ONE_ACTION_WRITE_SLOTS;
+            uint32_t pc = env->npe_operation_one_action_write_pc[slot];
+            unsigned depth;
+
+            g_string_append_printf(
+                text, "%s#%u/%02x:%04x/a%06x/%04x>%04x/b%u/sp%04x/fp%04x",
+                index ? "," : "", sequence + 1u,
+                dmcu_code_segment(pc), dmcu_code_pc(pc),
+                env->npe_operation_one_action_write_address[slot],
+                env->npe_operation_one_action_write_old[slot],
+                env->npe_operation_one_action_write_new[slot],
+                env->npe_operation_one_action_write_bits[slot],
+                env->npe_operation_one_action_write_sp[slot],
+                env->npe_operation_one_action_write_fp[slot]);
+            for (depth = 0;
+                 depth < DMCU_NPE_OPERATION_ONE_ACTION_WRITE_FRAMES;
+                 depth++) {
+                uint32_t frame =
+                    env->npe_operation_one_action_write_frames[slot][depth];
+
+                if (!frame) {
+                    break;
+                }
+                g_string_append_printf(
+                    text, ">%02x:%04x",
+                    dmcu_code_segment(frame), dmcu_code_pc(frame));
+            }
+        }
+        if (!stored) {
+            g_string_append(text, "none");
+        }
+    }
+    g_string_append_printf(
+        text,
+        "\nNPE_GAME_UI_LIFECYCLE=SEQ:%u "
+        "W8A:%u@%u W91:%u@%u PUB:%u@%u/%u@%u TAIL:%u@%u "
+        "INIT:%u@%u E15A:%u@%u/%u@%u/C%u@%u<%06x "
+        "6AB8:%u@%u/%u@%u/C%u@%u<%06x "
+        "5C22:%u@%u/%u@%u/C%u@%u<%06x",
+        env->npe_game_ui_lifecycle_sequence,
+        env->npe_game_ui_wrapper_8a5c_calls,
+        env->npe_game_ui_wrapper_8a5c_sequence,
+        env->npe_game_ui_wrapper_9140_calls,
+        env->npe_game_ui_wrapper_9140_sequence,
+        env->npe_game_ui_publisher_calls,
+        env->npe_game_ui_publisher_call_sequence,
+        env->npe_game_ui_publisher_returns,
+        env->npe_game_ui_publisher_return_sequence,
+        env->npe_game_ui_wrapper_tail_calls,
+        env->npe_game_ui_wrapper_tail_sequence,
+        env->npe_game_ui_init_calls,
+        env->npe_game_ui_init_call_sequence,
+        env->npe_game_ui_e15a_calls,
+        env->npe_game_ui_e15a_call_sequence,
+        env->npe_game_ui_e15a_returns,
+        env->npe_game_ui_e15a_return_sequence,
+        env->npe_game_ui_e15a_continuation_entries,
+        env->npe_game_ui_e15a_continuation_sequence,
+        env->npe_game_ui_e15a_continuation_from,
+        env->npe_game_ui_6ab8_calls,
+        env->npe_game_ui_6ab8_call_sequence,
+        env->npe_game_ui_6ab8_returns,
+        env->npe_game_ui_6ab8_return_sequence,
+        env->npe_game_ui_6ab8_continuation_entries,
+        env->npe_game_ui_6ab8_continuation_sequence,
+        env->npe_game_ui_6ab8_continuation_from,
+        env->npe_game_ui_5c22_calls,
+        env->npe_game_ui_5c22_call_sequence,
+        env->npe_game_ui_5c22_returns,
+        env->npe_game_ui_5c22_return_sequence,
+        env->npe_game_ui_5c22_continuation_entries,
+        env->npe_game_ui_5c22_continuation_sequence,
+        env->npe_game_ui_5c22_continuation_from);
+    g_string_append(text, "\nNPE_GAME_FRAME_CLEAR=");
+    for (unsigned child = 0; child < 8; child++) {
+        g_string_append_printf(
+            text,
+            "%sC%u:%u>%06x/R%u<%06x",
+            child == 0 ? "" : " ",
+            child,
+            env->npe_game_frame_clear_child_calls[child],
+            env->npe_game_frame_clear_child_targets[child],
+            env->npe_game_frame_clear_child_continuations[child],
+            env->npe_game_frame_clear_child_continuation_from[child]);
+    }
+    g_string_append_printf(
+        text,
+        "\nNPE_GAME_TRANSITION_SERVICE=CALL:%u ENTRY:%u RET:%u "
+        "CONT:%u<%06x CHILD:%u/%u LEAF:%u/%u",
+        env->npe_game_transition_service_calls,
+        env->npe_game_transition_service_entries,
+        env->npe_game_transition_service_returns,
+        env->npe_game_transition_service_continuations,
+        env->npe_game_transition_service_continuation_from,
+        env->npe_game_transition_service_child_calls,
+        env->npe_game_transition_service_child_returns,
+        env->npe_game_transition_service_leaf_calls,
+        env->npe_game_transition_service_leaf_returns);
+    {
+        uint32_t entry_count = MIN(
+            env->npe_transition_gate_entries,
+            (uint32_t)DMCU_NPE_TRANSITION_GATE_SLOTS);
+        uint32_t entry_first = env->npe_transition_gate_entries >
+                               DMCU_NPE_TRANSITION_GATE_SLOTS ?
+                               env->npe_transition_gate_entries -
+                               DMCU_NPE_TRANSITION_GATE_SLOTS : 0u;
+        uint32_t read_count = MIN(
+            env->npe_transition_gate_reads,
+            (uint32_t)DMCU_NPE_TRANSITION_GATE_SLOTS);
+        uint32_t read_first = env->npe_transition_gate_reads >
+                              DMCU_NPE_TRANSITION_GATE_SLOTS ?
+                              env->npe_transition_gate_reads -
+                              DMCU_NPE_TRANSITION_GATE_SLOTS : 0u;
+        uint32_t write_count = MIN(
+            env->npe_transition_gate_writes,
+            (uint32_t)DMCU_NPE_TRANSITION_GATE_SLOTS);
+        uint32_t write_first = env->npe_transition_gate_writes >
+                               DMCU_NPE_TRANSITION_GATE_SLOTS ?
+                               env->npe_transition_gate_writes -
+                               DMCU_NPE_TRANSITION_GATE_SLOTS : 0u;
+        uint32_t index;
+
+        g_string_append_printf(
+            text,
+            "\nNPE_TRANSITION_GATE=ENTRY:%u READ:%u WRITE:%u ENTRYTRACE:",
+            env->npe_transition_gate_entries,
+            env->npe_transition_gate_reads,
+            env->npe_transition_gate_writes);
+        for (index = 0; index < entry_count; index++) {
+            uint32_t sequence = entry_first + index;
+            uint32_t slot = sequence % DMCU_NPE_TRANSITION_GATE_SLOTS;
+
+            g_string_append_printf(
+                text,
+                "#%u/%02x:%04x/sp%04x/fp%04x/g%04x/op%02x/"
+                "a%04x,%04x,%04x,%04x,%04x,%04x/"
+                "c%04x,%04x,%04x,%04x,%04x,%04x,%04x,%04x%s",
+                sequence + 1u,
+                dmcu_code_segment(env->npe_transition_gate_entry_from[slot]),
+                dmcu_code_pc(env->npe_transition_gate_entry_from[slot]),
+                env->npe_transition_gate_entry_sp[slot],
+                env->npe_transition_gate_entry_fp[slot],
+                env->npe_transition_gate_entry_value[slot],
+                env->npe_transition_gate_entry_operation[slot],
+                env->npe_transition_gate_entry_args[slot][0],
+                env->npe_transition_gate_entry_args[slot][1],
+                env->npe_transition_gate_entry_args[slot][2],
+                env->npe_transition_gate_entry_args[slot][3],
+                env->npe_transition_gate_entry_args[slot][4],
+                env->npe_transition_gate_entry_args[slot][5],
+                env->npe_transition_gate_entry_context[slot][0],
+                env->npe_transition_gate_entry_context[slot][1],
+                env->npe_transition_gate_entry_context[slot][2],
+                env->npe_transition_gate_entry_context[slot][3],
+                env->npe_transition_gate_entry_context[slot][4],
+                env->npe_transition_gate_entry_context[slot][5],
+                env->npe_transition_gate_entry_context[slot][6],
+                env->npe_transition_gate_entry_context[slot][7],
+                index + 1u == entry_count ? "" : ",");
+        }
+        if (entry_count == 0u) {
+            g_string_append(text, "none");
+        }
+        g_string_append(text, " READTRACE:");
+        for (index = 0; index < read_count; index++) {
+            uint32_t sequence = read_first + index;
+            uint32_t slot = sequence % DMCU_NPE_TRANSITION_GATE_SLOTS;
+
+            g_string_append_printf(
+                text,
+                "#%u/%02x:%04x/l%04x/p%06x/%u/v%04x/d%03x,%03x%s",
+                sequence + 1u,
+                dmcu_code_segment(env->npe_transition_gate_read_pc[slot]),
+                dmcu_code_pc(env->npe_transition_gate_read_pc[slot]),
+                env->npe_transition_gate_read_logical[slot],
+                env->npe_transition_gate_read_physical[slot],
+                env->npe_transition_gate_read_bits[slot],
+                env->npe_transition_gate_read_value[slot],
+                env->npe_transition_gate_read_ds0[slot],
+                env->npe_transition_gate_read_ds1[slot],
+                index + 1u == read_count ? "" : ",");
+        }
+        if (read_count == 0u) {
+            g_string_append(text, "none");
+        }
+        g_string_append(text, " WRITETRACE:");
+        for (index = 0; index < write_count; index++) {
+            uint32_t sequence = write_first + index;
+            uint32_t slot = sequence % DMCU_NPE_TRANSITION_GATE_SLOTS;
+
+            g_string_append_printf(
+                text,
+                "#%u/%02x:%04x/l%04x/p%06x/%u/v%04x/%04x>%04x/"
+                "d%03x,%03x%s",
+                sequence + 1u,
+                dmcu_code_segment(env->npe_transition_gate_write_pc[slot]),
+                dmcu_code_pc(env->npe_transition_gate_write_pc[slot]),
+                env->npe_transition_gate_write_logical[slot],
+                env->npe_transition_gate_write_physical[slot],
+                env->npe_transition_gate_write_bits[slot],
+                env->npe_transition_gate_write_value[slot],
+                env->npe_transition_gate_write_old[slot],
+                env->npe_transition_gate_write_new[slot],
+                env->npe_transition_gate_write_ds0[slot],
+                env->npe_transition_gate_write_ds1[slot],
+                index + 1u == write_count ? "" : ",");
+        }
+        if (write_count == 0u) {
+            g_string_append(text, "none");
+        }
+    }
+    {
+        uint32_t count = MIN(
+            env->resource_special_calls,
+            (uint32_t)DMCU_RESOURCE_SPECIAL_TRACE_SLOTS);
+        uint32_t first = env->resource_special_calls >
+                         DMCU_RESOURCE_SPECIAL_TRACE_SLOTS ?
+                         env->resource_special_calls -
+                         DMCU_RESOURCE_SPECIAL_TRACE_SLOTS : 0u;
+        uint32_t index;
+
+        g_string_append_printf(
+            text,
+            "\nRESOURCE_SPECIAL=CALL:%u RET:%u ACTIVE:%u SLOT:%u TRACE:",
+            env->resource_special_calls,
+            env->resource_special_returns,
+            env->resource_special_active ? 1u : 0u,
+            env->resource_special_active_slot);
+        for (index = 0; index < count; index++) {
+            uint32_t sequence = first + index;
+            uint32_t slot = sequence % DMCU_RESOURCE_SPECIAL_TRACE_SLOTS;
+
+            g_string_append_printf(
+                text,
+                "#%u/%02x:%04x/sp%04x/fp%04x/src10:%04x/n%04x/"
+                "out%04x:%04x/%02x>%02x>%02x/d%02x:%04x/"
+                "r%04x>%02x:%04x%s",
+                sequence + 1u,
+                dmcu_code_segment(env->resource_special_from[slot]),
+                dmcu_code_pc(env->resource_special_from[slot]),
+                env->resource_special_sp[slot],
+                env->resource_special_fp[slot],
+                env->resource_special_source[slot],
+                env->resource_special_length[slot],
+                env->resource_special_output_segment[slot],
+                env->resource_special_output_offset[slot],
+                env->resource_special_output_before[slot],
+                env->resource_special_output_transferred[slot],
+                env->resource_special_output_after[slot],
+                dmcu_code_segment(
+                    env->resource_special_dispatch_target[slot]),
+                dmcu_code_pc(
+                    env->resource_special_dispatch_target[slot]),
+                env->resource_special_result[slot],
+                dmcu_code_segment(
+                    env->resource_special_return_target[slot]),
+                dmcu_code_pc(
+                    env->resource_special_return_target[slot]),
+                index + 1u == count ? "" : ",");
+        }
+        if (count == 0u) {
+            g_string_append(text, "none");
+        }
+    }
+    {
+        uint32_t count = MIN(
+            env->resource_persist_dispatch_calls,
+            (uint32_t)DMCU_RESOURCE_PERSIST_TRACE_SLOTS);
+        uint32_t first = env->resource_persist_dispatch_calls >
+                         DMCU_RESOURCE_PERSIST_TRACE_SLOTS ?
+                         env->resource_persist_dispatch_calls -
+                         DMCU_RESOURCE_PERSIST_TRACE_SLOTS : 0u;
+        uint32_t index;
+
+        g_string_append_printf(
+            text,
+            "\nRESOURCE_PERSIST_DISPATCH=CALL:%u RET:%u ACTIVE:%u TRACE:",
+            env->resource_persist_dispatch_calls,
+            env->resource_persist_dispatch_returns,
+            env->resource_persist_dispatch_active ? 1u : 0u);
+        for (index = 0; index < count; index++) {
+            uint32_t sequence = first + index;
+            uint32_t slot = sequence % DMCU_RESOURCE_PERSIST_TRACE_SLOTS;
+            uint32_t handler =
+                env->resource_persist_dispatch_handler[slot];
+
+            g_string_append_printf(
+                text,
+                "#%u/%02x:%04x/sp%04x/fp%04x/obj%04x:%04x/"
+                "ev%04x:%04x/m%04x/t[%04x,%04x,%04x,%04x,%04x,%04x,%04x]/"
+                "h%02x:%04x/k%04x/v%04x/p%04x/r%02x:%04x%s",
+                sequence + 1u,
+                dmcu_code_segment(env->resource_persist_dispatch_from[slot]),
+                dmcu_code_pc(env->resource_persist_dispatch_from[slot]),
+                env->resource_persist_dispatch_sp[slot],
+                env->resource_persist_dispatch_fp[slot],
+                env->resource_persist_dispatch_args[slot][0],
+                env->resource_persist_dispatch_args[slot][1],
+                env->resource_persist_dispatch_args[slot][2],
+                env->resource_persist_dispatch_args[slot][3],
+                env->resource_persist_dispatch_args[slot][5],
+                env->resource_persist_dispatch_table[slot][0],
+                env->resource_persist_dispatch_table[slot][1],
+                env->resource_persist_dispatch_table[slot][2],
+                env->resource_persist_dispatch_table[slot][3],
+                env->resource_persist_dispatch_table[slot][4],
+                env->resource_persist_dispatch_table[slot][5],
+                env->resource_persist_dispatch_table[slot][6],
+                dmcu_code_segment(handler), dmcu_code_pc(handler),
+                env->resource_persist_dispatch_key[slot],
+                env->resource_persist_dispatch_value[slot],
+                env->resource_persist_dispatch_previous[slot],
+                dmcu_code_segment(
+                    env->resource_persist_dispatch_return_target[slot]),
+                dmcu_code_pc(
+                    env->resource_persist_dispatch_return_target[slot]),
+                index + 1u == count ? "" : ",");
+        }
+        if (count == 0u) {
+            g_string_append(text, "none");
+        }
+        g_string_append_printf(
+            text,
+            "\nRESOURCE_PERSIST_WRITE=W:%u/%u B:%u/%u P:%u/%u "
+            "LAST:%02x:%04x/sp%04x/fp%04x/"
+            "a%04x,%04x,%04x,%04x,%04x/b%02x/"
+            "bridge%02x:%04x/a%04x,%04x,%04x,%04x,%04x/"
+            "page%02x:%04x/a%04x,%04x,%04x,%04x,%04x/"
+            "res%04x,%04x,%04x",
+            env->resource_persist_wrapper_calls,
+            env->resource_persist_wrapper_returns,
+            env->resource_persist_bridge_calls,
+            env->resource_persist_bridge_returns,
+            env->resource_persist_page_calls,
+            env->resource_persist_page_returns,
+            dmcu_code_segment(env->resource_persist_last_wrapper_from),
+            dmcu_code_pc(env->resource_persist_last_wrapper_from),
+            env->resource_persist_last_wrapper_sp,
+            env->resource_persist_last_wrapper_fp,
+            env->resource_persist_last_wrapper_args[0],
+            env->resource_persist_last_wrapper_args[1],
+            env->resource_persist_last_wrapper_args[2],
+            env->resource_persist_last_wrapper_args[3],
+            env->resource_persist_last_wrapper_args[4],
+            env->resource_persist_last_buffer_value,
+            dmcu_code_segment(env->resource_persist_last_bridge_from),
+            dmcu_code_pc(env->resource_persist_last_bridge_from),
+            env->resource_persist_last_bridge_args[0],
+            env->resource_persist_last_bridge_args[1],
+            env->resource_persist_last_bridge_args[2],
+            env->resource_persist_last_bridge_args[3],
+            env->resource_persist_last_bridge_args[4],
+            dmcu_code_segment(env->resource_persist_last_page_from),
+            dmcu_code_pc(env->resource_persist_last_page_from),
+            env->resource_persist_last_page_args[0],
+            env->resource_persist_last_page_args[1],
+            env->resource_persist_last_page_args[2],
+            env->resource_persist_last_page_args[3],
+            env->resource_persist_last_page_args[4],
+            env->resource_persist_last_page_result,
+            env->resource_persist_last_bridge_result,
+            env->resource_persist_last_wrapper_result);
+    }
+    g_string_append_printf(
+        text,
+        "\nNPE_GAME_LOOP=GRID:%u/%u INIT:%u/%u RANGE:%u RAND:%u "
+        "CMP:%u DRAW:%u/%u ITEM:%u STATEDISP:%u",
+        env->npe_game_grid_calls,
+        env->npe_game_grid_returns,
+        env->npe_game_initialize_calls,
+        env->npe_game_initialize_returns,
+        env->npe_game_range_calls,
+        env->npe_game_randomize_calls,
+        env->npe_game_compare_calls,
+        env->npe_game_draw_calls,
+        env->npe_game_draw_returns,
+        env->npe_game_draw_item_calls,
+        env->npe_game_state_dispatch_calls);
+    g_string_append_printf(
+        text,
+        "\nNPE_GAME_DRAW_TRACE=ACTIVE:%u CALL:%u EDGES:%u CHILD:%u SITES:",
+        env->npe_game_draw_trace_active,
+        env->npe_game_draw_trace_call,
+        env->npe_game_draw_trace_edge_count,
+        env->npe_game_draw_trace_active_child);
+    {
+        unsigned child;
+
+        for (child = 0; child < DMCU_NPE_GAME_DRAW_CHILD_SITES; child++) {
+            g_string_append_printf(
+                text,
+                "%s#%u=%u/%u>%02x:%04x/sp%04x/fp%04x"
+                "<%02x:%04x/sp%04x/fp%04x",
+                child ? "," : "",
+                child + 1u,
+                env->npe_game_draw_child_calls[child],
+                env->npe_game_draw_child_returns[child],
+                dmcu_code_segment(env->npe_game_draw_child_target[child]),
+                dmcu_code_pc(env->npe_game_draw_child_target[child]),
+                env->npe_game_draw_child_call_sp[child],
+                env->npe_game_draw_child_call_fp[child],
+                dmcu_code_segment(
+                    env->npe_game_draw_child_return_from[child]),
+                dmcu_code_pc(env->npe_game_draw_child_return_from[child]),
+                env->npe_game_draw_child_return_sp[child],
+                env->npe_game_draw_child_return_fp[child]);
+        }
+    }
+    g_string_append(text, " TRACE:");
+    {
+        uint32_t count = env->npe_game_draw_trace_edge_count;
+        uint32_t start = count > DMCU_NPE_GAME_DRAW_TRACE_SLOTS ?
+            count - DMCU_NPE_GAME_DRAW_TRACE_SLOTS : 0u;
+        uint32_t sequence;
+
+        for (sequence = start; sequence < count; sequence++) {
+            uint32_t slot = sequence % DMCU_NPE_GAME_DRAW_TRACE_SLOTS;
+
+            g_string_append_printf(
+                text,
+                "%s#%u/%02x:%04x>%02x:%04x/w%04x/c%u/"
+                "sp%04x/fp%04x/r%04x:%04x",
+                sequence == start ? "" : ",",
+                sequence + 1u,
+                dmcu_code_segment(env->npe_game_draw_trace_from[slot]),
+                dmcu_code_pc(env->npe_game_draw_trace_from[slot]),
+                dmcu_code_segment(env->npe_game_draw_trace_target[slot]),
+                dmcu_code_pc(env->npe_game_draw_trace_target[slot]),
+                env->npe_game_draw_trace_word[slot],
+                env->npe_game_draw_trace_child[slot],
+                env->npe_game_draw_trace_sp[slot],
+                env->npe_game_draw_trace_fp[slot],
+                env->npe_game_draw_trace_r0[slot],
+                env->npe_game_draw_trace_r1[slot]);
+        }
+    }
+    g_string_append_printf(
+        text,
+        "\nNPE_GAME_STATE=LIVE:%02x WRITES:%u/C%u/NZ%u "
+        "FIRST:%u@%02x:%04x/l%04x/a%06x/%04x>%04x/b%u/"
+        "sp%04x/fp%04x/ds%03x,%03x "
+        "FIRSTNZ:%u@%02x:%04x/l%04x/a%06x/%04x>%04x/b%u/"
+        "sp%04x/fp%04x/ds%03x,%03x "
+        "LAST:%02x:%04x/l%04x/a%06x/%04x>%04x/b%u/"
+        "sp%04x/fp%04x/ds%03x,%03x "
+        "CALLBACK:%u/Z%u/O%u/X%u/S%02x",
+        address_space_ldub(&address_space_memory, 0x527a3eu ^ 1u,
+                           MEMTXATTRS_UNSPECIFIED, NULL),
+        env->npe_game_state_writes,
+        env->npe_game_state_changing_writes,
+        env->npe_game_state_nonzero_writes,
+        env->npe_game_state_first_write_valid,
+        dmcu_code_segment(env->npe_game_state_first_write_pc),
+        dmcu_code_pc(env->npe_game_state_first_write_pc),
+        env->npe_game_state_first_write_logical,
+        env->npe_game_state_first_write_address,
+        env->npe_game_state_first_write_old,
+        env->npe_game_state_first_write_new,
+        env->npe_game_state_first_write_bits,
+        env->npe_game_state_first_write_sp,
+        env->npe_game_state_first_write_fp,
+        env->npe_game_state_first_write_ds0,
+        env->npe_game_state_first_write_ds1,
+        env->npe_game_state_first_nonzero_valid,
+        dmcu_code_segment(env->npe_game_state_first_nonzero_pc),
+        dmcu_code_pc(env->npe_game_state_first_nonzero_pc),
+        env->npe_game_state_first_nonzero_logical,
+        env->npe_game_state_first_nonzero_address,
+        env->npe_game_state_first_nonzero_old,
+        env->npe_game_state_first_nonzero_new,
+        env->npe_game_state_first_nonzero_bits,
+        env->npe_game_state_first_nonzero_sp,
+        env->npe_game_state_first_nonzero_fp,
+        env->npe_game_state_first_nonzero_ds0,
+        env->npe_game_state_first_nonzero_ds1,
+        dmcu_code_segment(env->npe_game_state_last_write_pc),
+        dmcu_code_pc(env->npe_game_state_last_write_pc),
+        env->npe_game_state_last_write_logical,
+        env->npe_game_state_last_write_address,
+        env->npe_game_state_last_write_old,
+        env->npe_game_state_last_write_new,
+        env->npe_game_state_last_write_bits,
+        env->npe_game_state_last_write_sp,
+        env->npe_game_state_last_write_fp,
+        env->npe_game_state_last_write_ds0,
+        env->npe_game_state_last_write_ds1,
+        env->npe_game_callback_entries,
+        env->npe_game_callback_state_zero_paths,
+        env->npe_game_callback_state_one_paths,
+        env->npe_game_callback_state_other_paths,
+        env->npe_game_callback_state);
+    {
+        uint32_t end = env->npe_game_control_write_count;
+        uint32_t start = end > DMCU_NPE_GAME_CONTROL_WRITE_SLOTS ?
+            end - DMCU_NPE_GAME_CONTROL_WRITE_SLOTS : 0u;
+        uint32_t sequence;
+
+        g_string_append_printf(
+            text,
+            "\nNPE_GAME_ACTION=SELECT:%u/%u/R%04x LATE:%u",
+            env->npe_game_primary_action_selector_calls,
+            env->npe_game_primary_action_selector_returns,
+            env->npe_game_primary_action_selector_result,
+            env->npe_game_primary_action_late_paths);
+        g_string_append_printf(
+            text,
+            "\nNPE_GAME_CONTROL=LIVE:m%04x/g%04x/t%04x "
+            "OP1:%u/%u/F%u/R%u/N%u/I%u/X%u WRITES:%u TRACE:",
+            address_space_lduw_le(&address_space_memory, 0x527934u,
+                                  MEMTXATTRS_UNSPECIFIED, NULL),
+            address_space_lduw_le(&address_space_memory, 0x527a50u,
+                                  MEMTXATTRS_UNSPECIFIED, NULL),
+            address_space_lduw_le(&address_space_memory, 0x527ab4u,
+                                  MEMTXATTRS_UNSPECIFIED, NULL),
+            env->npe_game_operation_one_dispatches,
+            env->npe_game_operation_one_entries,
+            env->npe_game_operation_one_fast_exits,
+            env->npe_game_operation_one_fast_returns,
+            env->npe_game_operation_one_normal_paths,
+            env->npe_game_operation_one_frame_init_calls,
+            env->npe_game_operation_one_normal_returns,
+            env->npe_game_control_write_count);
+        for (sequence = start; sequence < end; sequence++) {
+            uint32_t slot =
+                sequence % DMCU_NPE_GAME_CONTROL_WRITE_SLOTS;
+
+            g_string_append_printf(
+                text,
+                "#%u/%02x:%04x/l%04x/p%06x/%04x>%04x/b%u/"
+                "sp%04x/fp%04x/ds%03x,%03x%s",
+                sequence + 1u,
+                dmcu_code_segment(env->npe_game_control_write_pc[slot]),
+                dmcu_code_pc(env->npe_game_control_write_pc[slot]),
+                env->npe_game_control_write_logical[slot],
+                env->npe_game_control_write_address[slot],
+                env->npe_game_control_write_old[slot],
+                env->npe_game_control_write_new[slot],
+                env->npe_game_control_write_bits[slot],
+                env->npe_game_control_write_sp[slot],
+                env->npe_game_control_write_fp[slot],
+                env->npe_game_control_write_ds0[slot],
+                env->npe_game_control_write_ds1[slot],
+                sequence + 1u == end ? "" : ";");
+        }
+    }
+    {
+        uint32_t trace_count = MIN(env->npe_game_branch_trace_count,
+                                   DMCU_NPE_GAME_BRANCH_TRACE_SLOTS);
+        uint32_t trace_index;
+
+        g_string_append_printf(text, "\nNPE_GAME_BRANCH=COUNT:%u TRACE:",
+                               env->npe_game_branch_trace_count);
+        for (trace_index = 0; trace_index < trace_count; trace_index++) {
+            g_string_append_printf(
+                text,
+                "#%u/s%02x/i%02x/l%u/fp%04x/m%04x/"
+                "g%04x,%04x,%04x,%04x,%04x,%04x,%04x%s",
+                trace_index,
+                env->npe_game_branch_state[trace_index],
+                env->npe_game_branch_index[trace_index],
+                env->npe_game_branch_live[trace_index],
+                env->npe_game_branch_fp[trace_index],
+                env->npe_game_branch_mode[trace_index],
+                env->npe_game_branch_grid[trace_index][0],
+                env->npe_game_branch_grid[trace_index][1],
+                env->npe_game_branch_grid[trace_index][2],
+                env->npe_game_branch_grid[trace_index][3],
+                env->npe_game_branch_grid[trace_index][4],
+                env->npe_game_branch_grid[trace_index][5],
+                env->npe_game_branch_grid[trace_index][6],
+                trace_index + 1u == trace_count ? "" : ";");
+        }
+    }
+    {
+        uint32_t trace_count = MIN(env->npe_game_data_trace_count,
+                                   DMCU_NPE_GAME_DATA_TRACE_SLOTS);
+        uint32_t trace_index;
+
+        g_string_append_printf(text, "\nNPE_GAME_DATA=COUNT:%u TRACE:",
+                               env->npe_game_data_trace_count);
+        for (trace_index = 0; trace_index < trace_count; trace_index++) {
+            g_string_append_printf(
+                text,
+                "#%u/%02x:%04x/l%04x/p%06x/v%04x/b%u/"
+                "ds%03x,%03x%s",
+                trace_index,
+                dmcu_code_segment(env->npe_game_data_trace_pc[trace_index]),
+                dmcu_code_pc(env->npe_game_data_trace_pc[trace_index]),
+                env->npe_game_data_trace_logical[trace_index],
+                env->npe_game_data_trace_physical[trace_index],
+                env->npe_game_data_trace_value[trace_index],
+                env->npe_game_data_trace_bits[trace_index],
+                env->npe_game_data_trace_ds0[trace_index],
+                env->npe_game_data_trace_ds1[trace_index],
+                trace_index + 1u == trace_count ? "" : ";");
+        }
+    }
+    {
+        uint32_t trace_count = MIN(
+            env->npe_game_data_write_trace_count,
+            DMCU_NPE_GAME_DATA_WRITE_TRACE_SLOTS);
+        uint32_t trace_index;
+
+        g_string_append_printf(
+            text, "\nNPE_GAME_DATA_WRITE=COUNT:%u TRACE:",
+            env->npe_game_data_write_trace_count);
+        for (trace_index = 0; trace_index < trace_count; trace_index++) {
+            g_string_append_printf(
+                text,
+                "#%u/%02x:%04x/l%04x/p%06x/%04x>%04x>%04x/b%u/"
+                "sp%04x/fp%04x/ds%03x,%03x%s",
+                trace_index,
+                dmcu_code_segment(
+                    env->npe_game_data_write_trace_pc[trace_index]),
+                dmcu_code_pc(
+                    env->npe_game_data_write_trace_pc[trace_index]),
+                env->npe_game_data_write_trace_logical[trace_index],
+                env->npe_game_data_write_trace_physical[trace_index],
+                env->npe_game_data_write_trace_pre[trace_index],
+                env->npe_game_data_write_trace_new[trace_index],
+                env->npe_game_data_write_trace_post[trace_index],
+                env->npe_game_data_write_trace_bits[trace_index],
+                env->npe_game_data_write_trace_sp[trace_index],
+                env->npe_game_data_write_trace_fp[trace_index],
+                env->npe_game_data_write_trace_ds0[trace_index],
+                env->npe_game_data_write_trace_ds1[trace_index],
+                trace_index + 1u == trace_count ? "" : ";");
+        }
+    }
+    g_string_append_printf(text, "\nNPE_GAME_FRAME=VALID:%03x",
+                           env->npe_game_frame_valid);
+    for (i = 0; i < DMCU_NPE_GAME_FRAME_STAGES; i++) {
+        if (!(env->npe_game_frame_valid & (1u << i))) {
+            continue;
+        }
+        g_string_append_printf(
+            text,
+            ",#%d:b%u/%08x,f%u/%08x,p%08x,m%04x",
+            i,
+            env->npe_game_frame_back_nonzero[i],
+            env->npe_game_frame_back_hash[i],
+            env->npe_game_frame_front_nonzero[i],
+            env->npe_game_frame_front_hash[i],
+            env->npe_game_frame_pointer[i],
+            env->npe_game_frame_mode[i]);
+    }
+    {
+        uint32_t table_hash = 2166136261u;
+        uint32_t table_nonzero = 0;
+        uint32_t table_offset;
+        uint32_t trace_count = MIN(env->npe_game_table_io_calls,
+                                   DMCU_NPE_GAME_TABLE_IO_SLOTS);
+        uint32_t trace_first = env->npe_game_table_io_calls >
+                               DMCU_NPE_GAME_TABLE_IO_SLOTS ?
+                               env->npe_game_table_io_calls -
+                               DMCU_NPE_GAME_TABLE_IO_SLOTS : 0u;
+        uint32_t trace_index;
+
+        for (table_offset = 0; table_offset < 20u * 14u; table_offset++) {
+            uint8_t value = address_space_ldub(
+                &address_space_memory, 0x526ca2u + table_offset,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+
+            table_nonzero += value != 0u;
+            table_hash = (table_hash ^ value) * 16777619u;
+        }
+        g_string_append_printf(
+            text,
+            "\nNPE_GAME_TABLE=LIVE:%u/%08x LOADER:%u/%u/A%u/"
+            "ARG:%08x/sp%04x/fp%04x/R%04x:%04x "
+            "STREAM:%u/%u/A%u/M%u:%u/T%u WRITES:%u/C%u/NZ%u "
+            "FIRST:%u@%02x:%04x/a%06x/%04x>%04x/b%u "
+            "FIRSTNZ:%u@%02x:%04x/a%06x/%04x>%04x/b%u "
+            "LAST:%02x:%04x/a%06x/%04x>%04x/b%u",
+            table_nonzero, table_hash,
+            env->npe_game_table_loader_calls,
+            env->npe_game_table_loader_returns,
+            env->npe_game_table_loader_active,
+            env->npe_game_table_loader_argument,
+            env->npe_game_table_loader_entry_sp,
+            env->npe_game_table_loader_entry_fp,
+            env->npe_game_table_loader_return_r0,
+            env->npe_game_table_loader_return_r1,
+            env->npe_game_table_io_calls,
+            env->npe_game_table_io_returns,
+            env->npe_game_table_io_active,
+            env->npe_game_table_io_methods,
+            env->npe_game_table_io_method_returns,
+            env->npe_game_table_io_table_calls,
+            env->npe_game_table_writes,
+            env->npe_game_table_changing_writes,
+            env->npe_game_table_nonzero_writes,
+            env->npe_game_table_first_write_valid,
+            dmcu_code_segment(env->npe_game_table_first_write_pc),
+            dmcu_code_pc(env->npe_game_table_first_write_pc),
+            env->npe_game_table_first_write_address,
+            env->npe_game_table_first_write_old,
+            env->npe_game_table_first_write_new,
+            env->npe_game_table_first_write_bits,
+            env->npe_game_table_first_nonzero_valid,
+            dmcu_code_segment(env->npe_game_table_first_nonzero_pc),
+            dmcu_code_pc(env->npe_game_table_first_nonzero_pc),
+            env->npe_game_table_first_nonzero_address,
+            env->npe_game_table_first_nonzero_old,
+            env->npe_game_table_first_nonzero_new,
+            env->npe_game_table_first_nonzero_bits,
+            dmcu_code_segment(env->npe_game_table_last_write_pc),
+            dmcu_code_pc(env->npe_game_table_last_write_pc),
+            env->npe_game_table_last_write_address,
+            env->npe_game_table_last_write_old,
+            env->npe_game_table_last_write_new,
+            env->npe_game_table_last_write_bits);
+        g_string_append(text, " TRACE:");
+        for (trace_index = 0; trace_index < trace_count; trace_index++) {
+            uint32_t sequence = trace_first + trace_index;
+            uint32_t slot = sequence % DMCU_NPE_GAME_TABLE_IO_SLOTS;
+
+            g_string_append_printf(
+                text,
+                "#%u/%02x:%04x/s%08x/d%08x/n%04x/p%08x>%08x/"
+                "m%02x:%04x/r%04x:%04x/e%04x/w%u%s",
+                sequence + 1u,
+                dmcu_code_segment(env->npe_game_table_io_from[slot]),
+                dmcu_code_pc(env->npe_game_table_io_from[slot]),
+                env->npe_game_table_io_stream[slot],
+                env->npe_game_table_io_destination[slot],
+                env->npe_game_table_io_length[slot],
+                env->npe_game_table_io_position_before[slot],
+                env->npe_game_table_io_position_after[slot],
+                dmcu_code_segment(env->npe_game_table_io_method[slot]),
+                dmcu_code_pc(env->npe_game_table_io_method[slot]),
+                env->npe_game_table_io_result_r0[slot],
+                env->npe_game_table_io_result_r1[slot],
+                env->npe_game_table_io_error[slot],
+                env->npe_game_table_io_writes[slot],
+                trace_index + 1u == trace_count ? "" : ",");
+        }
+        {
+            uint32_t page;
+            uint32_t position_min = env->npe_game_stream_position_min ==
+                                    UINT32_MAX ? 0u :
+                                    env->npe_game_stream_position_min;
+            bool first_page = true;
+
+            g_string_append_printf(
+                text,
+                "\nNPE_STREAM_POSITION=CALLS:%u RETURNS:%u CHANGED:%u "
+                "REVERSE:%u RANGE:%08x-%08x REQUESTED:%" G_GUINT64_FORMAT
+                " ADVANCED:%" G_GUINT64_FORMAT " PAGES:%u TRACE:",
+                env->npe_game_table_io_calls,
+                env->npe_game_stream_position_returns,
+                env->npe_game_stream_position_changed,
+                env->npe_game_stream_position_reverse,
+                position_min,
+                env->npe_game_stream_position_max,
+                env->npe_game_stream_requested_bytes,
+                env->npe_game_stream_advanced_bytes,
+                env->npe_game_stream_pages_touched);
+            for (page = 0; page < DMCU_NPE_GAME_STREAM_PAGE_COUNT; page++) {
+                uint32_t calls = env->npe_game_stream_page_calls[page];
+
+                if (!calls) {
+                    continue;
+                }
+                g_string_append_printf(text, "%s%03x=%u",
+                                       first_page ? "" : ",",
+                                       page, calls);
+                first_page = false;
+            }
+            if (first_page) {
+                g_string_append(text, "none");
+            }
+        }
+        {
+            uint32_t resolve_count = MIN(
+                env->npe_game_table_resolver_calls,
+                (uint32_t)DMCU_NPE_GAME_STREAM_RESOLVE_SLOTS);
+            uint32_t resolve_first = env->npe_game_table_resolver_calls >
+                                     DMCU_NPE_GAME_STREAM_RESOLVE_SLOTS ?
+                                     env->npe_game_table_resolver_calls -
+                                     DMCU_NPE_GAME_STREAM_RESOLVE_SLOTS : 0u;
+            uint32_t resolve_index;
+
+            g_string_append_printf(
+                text,
+                "\nNPE_STREAM_RESOLVE=CALLS:%u RETURNS:%u ACTIVE:%u TRACE:",
+                env->npe_game_table_resolver_calls,
+                env->npe_game_table_resolver_returns,
+                env->npe_game_table_resolver_active);
+            for (resolve_index = 0; resolve_index < resolve_count;
+                 resolve_index++) {
+                uint32_t sequence = resolve_first + resolve_index;
+                uint32_t slot = sequence %
+                                DMCU_NPE_GAME_STREAM_RESOLVE_SLOTS;
+
+                g_string_append_printf(
+                    text,
+                    "#%u/%02x:%04x/s%06x/o%08x/w%04x/"
+                    "p%08x>%08x/r%04x:%04x/e%04x%s",
+                    sequence + 1u,
+                    dmcu_code_segment(
+                        env->npe_game_table_resolver_from_trace[slot]),
+                    dmcu_code_pc(
+                        env->npe_game_table_resolver_from_trace[slot]),
+                    env->npe_game_table_resolver_stream_trace[slot],
+                    env->npe_game_table_resolver_offset_trace[slot],
+                    env->npe_game_table_resolver_whence_trace[slot],
+                    env->npe_game_table_resolver_position_before_trace[slot],
+                    env->npe_game_table_resolver_position_after_trace[slot],
+                    env->npe_game_table_resolver_result_r0_trace[slot],
+                    env->npe_game_table_resolver_result_r1_trace[slot],
+                    env->npe_game_table_resolver_error_trace[slot],
+                    resolve_index + 1u == resolve_count ? "" : ",");
+            }
+            if (resolve_count == 0u) {
+                g_string_append(text, "none");
+            }
+        }
+        {
+            uint32_t high_count = MIN(
+                env->npe_game_high_stream_io_calls,
+                (uint32_t)DMCU_NPE_GAME_HIGH_STREAM_IO_SLOTS);
+            uint32_t high_first = env->npe_game_high_stream_io_calls >
+                                  DMCU_NPE_GAME_HIGH_STREAM_IO_SLOTS ?
+                                  env->npe_game_high_stream_io_calls -
+                                  DMCU_NPE_GAME_HIGH_STREAM_IO_SLOTS : 0u;
+            uint32_t high_index;
+
+            g_string_append_printf(
+                text,
+                "\nNPE_HIGH_STREAM_IO=CALLS:%u RETURNS:%u ACTIVE:%u TRACE:",
+                env->npe_game_high_stream_io_calls,
+                env->npe_game_high_stream_io_returns,
+                env->npe_game_high_stream_io_active);
+            for (high_index = 0; high_index < high_count; high_index++) {
+                uint32_t sequence = high_first + high_index;
+                uint32_t slot = sequence %
+                                DMCU_NPE_GAME_HIGH_STREAM_IO_SLOTS;
+
+                g_string_append_printf(
+                    text,
+                    "#%u/%02x:%04x/d%06x/n%04x/p%08x>%08x/"
+                    "r%04x:%04x/e%04x%s",
+                    sequence + 1u,
+                    dmcu_code_segment(
+                        env->npe_game_high_stream_io_from[slot]),
+                    dmcu_code_pc(env->npe_game_high_stream_io_from[slot]),
+                    env->npe_game_high_stream_io_destination[slot],
+                    env->npe_game_high_stream_io_length[slot],
+                    env->npe_game_high_stream_io_position_before[slot],
+                    env->npe_game_high_stream_io_position_after[slot],
+                    env->npe_game_high_stream_io_result_r0[slot],
+                    env->npe_game_high_stream_io_result_r1[slot],
+                    env->npe_game_high_stream_io_error[slot],
+                    high_index + 1u == high_count ? "" : ",");
+            }
+            if (high_count == 0u) {
+                g_string_append(text, "none");
+            }
+        }
+        {
+            uint32_t leaf_count = MIN(
+                env->npe_transition_leaf_calls,
+                (uint32_t)DMCU_NPE_TRANSITION_LEAF_SLOTS);
+            uint32_t leaf_first = env->npe_transition_leaf_calls >
+                                  DMCU_NPE_TRANSITION_LEAF_SLOTS ?
+                                  env->npe_transition_leaf_calls -
+                                  DMCU_NPE_TRANSITION_LEAF_SLOTS : 0u;
+            uint32_t leaf_index;
+
+            g_string_append_printf(
+                text,
+                "\nNPE_TRANSITION_LEAF=CALLS:%u RETURNS:%u "
+                "LOW:%u HIGH:%u TRACE:",
+                env->npe_transition_leaf_calls,
+                env->npe_transition_leaf_returns,
+                env->npe_transition_leaf_low_dispatch_calls,
+                env->npe_transition_leaf_high_dispatch_calls);
+            for (leaf_index = 0; leaf_index < leaf_count; leaf_index++) {
+                uint32_t sequence = leaf_first + leaf_index;
+                uint32_t slot = sequence % DMCU_NPE_TRANSITION_LEAF_SLOTS;
+                const char *branch =
+                    env->npe_transition_leaf_branch[slot] == 1u ? "L" :
+                    env->npe_transition_leaf_branch[slot] == 2u ? "H" : "-";
+
+                g_string_append_printf(
+                    text,
+                    "#%u/%02x:%04x/sp%04x/s%04x/f%04x/"
+                    "a%04x,%04x,%04x,%04x,%04x,%04x/b%s/r%04x%s",
+                    sequence + 1u,
+                    dmcu_code_segment(env->npe_transition_leaf_from[slot]),
+                    dmcu_code_pc(env->npe_transition_leaf_from[slot]),
+                    env->npe_transition_leaf_sp[slot],
+                    env->npe_transition_leaf_state[slot],
+                    env->npe_transition_leaf_format[slot],
+                    env->npe_transition_leaf_args[slot][0],
+                    env->npe_transition_leaf_args[slot][1],
+                    env->npe_transition_leaf_args[slot][2],
+                    env->npe_transition_leaf_args[slot][3],
+                    env->npe_transition_leaf_args[slot][4],
+                    env->npe_transition_leaf_args[slot][5],
+                    branch,
+                    env->npe_transition_leaf_result[slot],
+                    leaf_index + 1u == leaf_count ? "" : ",");
+            }
+            if (leaf_count == 0u) {
+                g_string_append(text, "none");
+            }
+        }
+        {
+            uint32_t copy_count = MIN(
+                env->npe_game_table_copy_count,
+                (uint32_t)DMCU_NPE_GAME_TABLE_COPY_SLOTS);
+            uint32_t copy_first = env->npe_game_table_copy_count >
+                                  DMCU_NPE_GAME_TABLE_COPY_SLOTS ?
+                                  env->npe_game_table_copy_count -
+                                  DMCU_NPE_GAME_TABLE_COPY_SLOTS : 0u;
+            uint32_t copy_index;
+
+            g_string_append_printf(
+                text, "\nNPE_GAME_TABLE_COPY=COUNT:%u TRACE:",
+                env->npe_game_table_copy_count);
+            for (copy_index = 0; copy_index < copy_count; copy_index++) {
+                uint32_t sequence = copy_first + copy_index;
+                uint32_t copy_slot = sequence %
+                                     DMCU_NPE_GAME_TABLE_COPY_SLOTS;
+                const uint8_t *sample =
+                    env->npe_game_table_copy_sample[copy_slot];
+
+                g_string_append_printf(
+                    text,
+                    "#%u/%02x:%04x/d%06x/s%06x/n%08x/"
+                    "p%08x/c%08x/"
+                    "%02x%02x%02x%02x%02x%02x%02x%02x%s",
+                    sequence + 1u,
+                    dmcu_code_segment(
+                        env->npe_game_table_copy_from[copy_slot]),
+                    dmcu_code_pc(env->npe_game_table_copy_from[copy_slot]),
+                    env->npe_game_table_copy_destination[copy_slot],
+                    env->npe_game_table_copy_source[copy_slot],
+                    env->npe_game_table_copy_length[copy_slot],
+                    env->npe_game_table_copy_stream_position[copy_slot],
+                    env->npe_game_table_copy_cache_position[copy_slot],
+                    sample[0], sample[1], sample[2], sample[3],
+                    sample[4], sample[5], sample[6], sample[7],
+                    copy_index + 1u == copy_count ? "" : ",");
+            }
+            if (copy_count == 0u) {
+                g_string_append(text, "none");
+            }
+        }
+        {
+            uint32_t write_count = MIN(
+                env->npe_game_grid_write_count,
+                (uint32_t)DMCU_NPE_GAME_GRID_WRITE_SLOTS);
+            uint32_t write_first = env->npe_game_grid_write_count >
+                                   DMCU_NPE_GAME_GRID_WRITE_SLOTS ?
+                                   env->npe_game_grid_write_count -
+                                   DMCU_NPE_GAME_GRID_WRITE_SLOTS : 0u;
+            uint32_t write_index;
+
+            g_string_append_printf(
+                text, "\nNPE_GAME_GRID_WRITE=COUNT:%u TRACE:",
+                env->npe_game_grid_write_count);
+            for (write_index = 0; write_index < write_count; write_index++) {
+                uint32_t sequence = write_first + write_index;
+                uint32_t write_slot = sequence %
+                                      DMCU_NPE_GAME_GRID_WRITE_SLOTS;
+
+                g_string_append_printf(
+                    text,
+                    "#%u/%02x:%04x/a%06x/%04x>%04x/b%u%s",
+                    sequence + 1u,
+                    dmcu_code_segment(
+                        env->npe_game_grid_write_pc[write_slot]),
+                    dmcu_code_pc(env->npe_game_grid_write_pc[write_slot]),
+                    env->npe_game_grid_write_address[write_slot],
+                    env->npe_game_grid_write_old[write_slot],
+                    env->npe_game_grid_write_new[write_slot],
+                    env->npe_game_grid_write_bits[write_slot],
+                    write_index + 1u == write_count ? "" : ",");
+            }
+            if (write_count == 0u) {
+                g_string_append(text, "none");
+            }
+        }
+        g_string_append_printf(
+            text,
+            "\nNPE_GAME_GRID_COUNT=CALLS:%u/%u/A%u/"
+            "s%06x/d%06x/n%u/p%08x/c%08x/v%02x",
+            env->npe_game_grid_count_io_calls,
+            env->npe_game_grid_count_io_returns,
+            env->npe_game_grid_count_io_active,
+            env->npe_game_grid_count_io_stream,
+            env->npe_game_grid_count_io_destination,
+            env->npe_game_grid_count_io_length,
+            env->npe_game_grid_count_io_position,
+            env->npe_game_grid_count_io_cache_position,
+            env->npe_game_grid_count_io_value & 0xffu);
+    }
+    {
+        uint32_t edge_count = MIN(env->npe_game_table_loader_edge_count,
+                                  DMCU_NPE_GAME_LOADER_EDGE_SLOTS);
+        uint32_t edge_first = env->npe_game_table_loader_edge_count >
+                              DMCU_NPE_GAME_LOADER_EDGE_SLOTS ?
+                              env->npe_game_table_loader_edge_count -
+                              DMCU_NPE_GAME_LOADER_EDGE_SLOTS : 0u;
+        uint32_t edge_index;
+
+        g_string_append_printf(
+            text,
+            "\nNPE_GAME_LOADER_FLOW=LAST:%02x:%04x>%02x:%04x/"
+            "w%04x/sp%04x/fp%04x RESOLVE:%u/%u/A%u/"
+            "F%02x:%04x/to%02x:%04x/"
+            "args%04x,%04x,%04x,%04x,%04x/r%04x:%04x/e%04x "
+            "EDGES:%u TRACE:",
+            dmcu_code_segment(env->npe_game_table_loader_last_pc),
+            dmcu_code_pc(env->npe_game_table_loader_last_pc),
+            dmcu_code_segment(env->npe_game_table_loader_last_target),
+            dmcu_code_pc(env->npe_game_table_loader_last_target),
+            env->npe_game_table_loader_last_word,
+            env->npe_game_table_loader_last_sp,
+            env->npe_game_table_loader_last_fp,
+            env->npe_game_table_resolver_calls,
+            env->npe_game_table_resolver_returns,
+            env->npe_game_table_resolver_active,
+            dmcu_code_segment(env->npe_game_table_resolver_from),
+            dmcu_code_pc(env->npe_game_table_resolver_from),
+            dmcu_code_segment(
+                env->npe_game_table_resolver_expected_return),
+            dmcu_code_pc(env->npe_game_table_resolver_expected_return),
+            env->npe_game_table_resolver_args[0],
+            env->npe_game_table_resolver_args[1],
+            env->npe_game_table_resolver_args[2],
+            env->npe_game_table_resolver_args[3],
+            env->npe_game_table_resolver_args[4],
+            env->npe_game_table_resolver_result_r0,
+            env->npe_game_table_resolver_result_r1,
+            env->npe_game_table_resolver_error,
+            env->npe_game_table_loader_edge_count);
+        for (edge_index = 0; edge_index < edge_count; edge_index++) {
+            uint32_t sequence = edge_first + edge_index;
+            uint32_t slot = sequence % DMCU_NPE_GAME_LOADER_EDGE_SLOTS;
+
+            g_string_append_printf(
+                text,
+                "#%u/%02x:%04x>%02x:%04x/w%04x/sp%04x/fp%04x%s",
+                sequence + 1u,
+                dmcu_code_segment(
+                    env->npe_game_table_loader_edge_from[slot]),
+                dmcu_code_pc(env->npe_game_table_loader_edge_from[slot]),
+                dmcu_code_segment(env->npe_game_table_loader_edge_to[slot]),
+                dmcu_code_pc(env->npe_game_table_loader_edge_to[slot]),
+                env->npe_game_table_loader_edge_word[slot],
+                env->npe_game_table_loader_edge_sp[slot],
+                env->npe_game_table_loader_edge_fp[slot],
+                edge_index + 1u == edge_count ? "" : ",");
+        }
+    }
+    g_string_append_printf(
+        text, "\nNPE_LOW51_ENTRY=%u FROM:%02x:%04x TO:%02x:%04x "
+              "SEQ:%02x:%04x WORD:%04x EXT:%04x SP:%04x FP:%04x "
+              "DS:%03x,%03x GPR:",
+        env->npe_low51_entry_valid,
+        dmcu_code_segment(env->npe_low51_entry_from),
+        dmcu_code_pc(env->npe_low51_entry_from),
+        dmcu_code_segment(env->npe_low51_entry_target),
+        dmcu_code_pc(env->npe_low51_entry_target),
+        dmcu_code_segment(env->npe_low51_entry_sequential),
+        dmcu_code_pc(env->npe_low51_entry_sequential),
+        env->npe_low51_entry_word, env->npe_low51_entry_ext,
+        env->npe_low51_entry_sp, env->npe_low51_entry_fp,
+        env->npe_low51_entry_ds0, env->npe_low51_entry_ds1);
+    {
+        unsigned index;
+
+        for (index = 0; index < DMCU_NPE_LOW51_ENTRY_GPR_WORDS; index++) {
+            g_string_append_printf(text, "%s%04x", index ? "," : "",
+                                   env->npe_low51_entry_gpr[index]);
+        }
+        g_string_append(text, " STACK:");
+        for (index = 0; index < DMCU_NPE_LOW51_ENTRY_STACK_WORDS; index++) {
+            g_string_append_printf(text, "%s%04x", index ? "," : "",
+                                   env->npe_low51_entry_stack[index]);
+        }
+    }
+    g_string_append_printf(
+        text, "\nNPE_LOW51_EXEC=%u PC:%02x:%04x WORD:%04x SP:%04x FP:%04x "
+              "HISTORY:",
+        env->npe_low51_exec_valid,
+        dmcu_code_segment(env->npe_low51_exec_pc),
+        dmcu_code_pc(env->npe_low51_exec_pc),
+        env->npe_low51_exec_word, env->npe_low51_exec_sp,
+        env->npe_low51_exec_fp);
+    {
+        unsigned index;
+
+        for (index = 0; index < env->npe_low51_exec_history_count; index++) {
+            uint32_t pc = env->npe_low51_exec_history_pc[index];
+
+            g_string_append_printf(
+                text, "%s%02x:%04x/%04x@%04x",
+                index ? "," : "",
+                dmcu_code_segment(pc), dmcu_code_pc(pc),
+                env->npe_low51_exec_history_word[index],
+                env->npe_low51_exec_history_sp[index]);
+        }
+        if (!env->npe_low51_exec_history_count) {
+            g_string_append(text, "none");
+        }
+    }
+    g_string_append_printf(
+        text, "\nNPE_CONTROL_TRACE=PHASE:%u COUNT:%u FROZEN:%u "
+              "PENDING:%u ACTIVE:%u "
+              "CALLER:%02x:%04x RESULT:%04x OUTPUTS:%u TYPE:%04x CODE:%04x "
+              "DECODER:%u@%02x:%04x/R%04x "
+              "LOADER:%u/%u/E%u/R%u/in%04x:%04x/e%04x/f%04x/"
+              "out%04x:%04x/e%04x/f%04x/s%04x/to%02x:%04x "
+              "WAIT:%u@%02x:%04x>%02x:%04x/sp%04x/fp%04x/"
+              "r%04x:%04x/e%04x/f%04x "
+              "STACKSW:%u@%02x:%04x>%02x:%04x/sp%04x>%04x/fp%04x/"
+              "r%04x:%04x/e%04x/f%04x "
+              "STATEDISP:%u@%02x:%04x>%02x:%04x/sp%04x/fp%04x/"
+              "r%04x:%04x/t%04x,%04x,%04x,%04x,%04x,%04x "
+              "TABLEWRITE:%u/F%u@%02x:%04x/a%06x/v%04x/b%u/"
+              "L@%02x:%04x/a%06x/v%04x/b%u "
+              "ERRWRITE:%u@%02x:%04x/%04x>%04x/b%u "
+              "ERRNONZERO:%u@%02x:%04x/%04x>%04x/b%u TRACE:",
+        env->npe_control_trace_phase,
+        env->npe_control_trace_count, env->npe_control_trace_frozen,
+        env->npe_modal_control_trace_pending,
+        env->npe_modal_control_trace_active,
+        dmcu_code_segment(env->npe_modal_control_trace_caller),
+        dmcu_code_pc(env->npe_modal_control_trace_caller),
+        env->npe_modal_control_trace_result,
+        env->npe_modal_control_trace_outputs_valid,
+        env->npe_modal_control_trace_type,
+        env->npe_modal_control_trace_code,
+        env->npe_modal_control_trace_decoder_valid,
+        dmcu_code_segment(env->npe_modal_control_trace_decoder_caller),
+        dmcu_code_pc(env->npe_modal_control_trace_decoder_caller),
+        env->npe_modal_control_trace_decoder_result,
+        env->npe_loader_control_trace_active,
+        env->npe_loader_control_trace_completed,
+        env->npe_loader_control_trace_entries,
+        env->npe_loader_control_trace_returns,
+        env->npe_loader_control_trace_entry_r0,
+        env->npe_loader_control_trace_entry_r1,
+        env->npe_loader_control_trace_entry_error,
+        env->npe_loader_control_trace_entry_file_error,
+        env->npe_loader_control_trace_return_r0,
+        env->npe_loader_control_trace_return_r1,
+        env->npe_loader_control_trace_return_error,
+        env->npe_loader_control_trace_return_file_error,
+        env->npe_loader_control_trace_return_application_state,
+        dmcu_code_segment(env->npe_loader_control_trace_return_target),
+        dmcu_code_pc(env->npe_loader_control_trace_return_target),
+        env->npe_loader_runtime_wait_detected,
+        dmcu_code_segment(env->npe_loader_runtime_wait_from),
+        dmcu_code_pc(env->npe_loader_runtime_wait_from),
+        dmcu_code_segment(env->npe_loader_runtime_wait_target),
+        dmcu_code_pc(env->npe_loader_runtime_wait_target),
+        env->npe_loader_runtime_wait_sp,
+        env->npe_loader_runtime_wait_fp,
+        env->npe_loader_runtime_wait_r0,
+        env->npe_loader_runtime_wait_r1,
+        env->npe_loader_runtime_wait_error,
+        env->npe_loader_runtime_wait_file_error,
+        env->npe_loader_stack_switch_detected,
+        dmcu_code_segment(env->npe_loader_stack_switch_from),
+        dmcu_code_pc(env->npe_loader_stack_switch_from),
+        dmcu_code_segment(env->npe_loader_stack_switch_target),
+        dmcu_code_pc(env->npe_loader_stack_switch_target),
+        env->npe_loader_stack_switch_old_sp,
+        env->npe_loader_stack_switch_sp,
+        env->npe_loader_stack_switch_fp,
+        env->npe_loader_stack_switch_r0,
+        env->npe_loader_stack_switch_r1,
+        env->npe_loader_stack_switch_error,
+        env->npe_loader_stack_switch_file_error,
+        env->npe_loader_state_dispatch_detected,
+        dmcu_code_segment(env->npe_loader_state_dispatch_from),
+        dmcu_code_pc(env->npe_loader_state_dispatch_from),
+        dmcu_code_segment(env->npe_loader_state_dispatch_target),
+        dmcu_code_pc(env->npe_loader_state_dispatch_target),
+        env->npe_loader_state_dispatch_sp,
+        env->npe_loader_state_dispatch_fp,
+        env->npe_loader_state_dispatch_r0,
+        env->npe_loader_state_dispatch_r1,
+        env->npe_loader_state_dispatch_table[0],
+        env->npe_loader_state_dispatch_table[1],
+        env->npe_loader_state_dispatch_table[2],
+        env->npe_loader_state_dispatch_table[3],
+        env->npe_loader_state_dispatch_table[4],
+        env->npe_loader_state_dispatch_table[5],
+        env->npe_state_table_write_count,
+        env->npe_state_table_first_write_valid,
+        dmcu_code_segment(env->npe_state_table_first_write_pc),
+        dmcu_code_pc(env->npe_state_table_first_write_pc),
+        env->npe_state_table_first_write_address,
+        env->npe_state_table_first_write_value,
+        env->npe_state_table_first_write_bits,
+        dmcu_code_segment(env->npe_state_table_last_write_pc),
+        dmcu_code_pc(env->npe_state_table_last_write_pc),
+        env->npe_state_table_last_write_address,
+        env->npe_state_table_last_write_value,
+        env->npe_state_table_last_write_bits,
+        env->npe_loader_error_first_write_valid,
+        dmcu_code_segment(env->npe_loader_error_first_write_pc),
+        dmcu_code_pc(env->npe_loader_error_first_write_pc),
+        env->npe_loader_error_first_write_old,
+        env->npe_loader_error_first_write_new,
+        env->npe_loader_error_first_write_bits,
+        env->npe_loader_error_first_nonzero_valid,
+        dmcu_code_segment(env->npe_loader_error_first_nonzero_pc),
+        dmcu_code_pc(env->npe_loader_error_first_nonzero_pc),
+        env->npe_loader_error_first_nonzero_old,
+        env->npe_loader_error_first_nonzero_new,
+        env->npe_loader_error_first_nonzero_bits);
+    if (env->npe_control_trace_count) {
+        uint32_t start = env->npe_control_trace_count >
+                         DMCU_NPE_CONTROL_TRACE_SLOTS ?
+                         env->npe_control_trace_count -
+                         DMCU_NPE_CONTROL_TRACE_SLOTS : 0;
+        uint32_t trace;
+
+        for (trace = start; trace < env->npe_control_trace_count; trace++) {
+            uint32_t slot = trace % DMCU_NPE_CONTROL_TRACE_SLOTS;
+            uint32_t from = env->npe_control_trace_from[slot];
+            uint32_t target = env->npe_control_trace_target[slot];
+
+            g_string_append_printf(
+                text, "%s#%u/%02x:%04x>%02x:%04x/w%04x/sp%04x/fp%04x/"
+                      "r%04x:%04x/e%04x/f%04x",
+                trace == start ? "" : ",", trace + 1,
+                dmcu_code_segment(from), dmcu_code_pc(from),
+                dmcu_code_segment(target), dmcu_code_pc(target),
+                env->npe_control_trace_word[slot],
+                env->npe_control_trace_sp[slot],
+                env->npe_control_trace_fp[slot],
+                env->npe_control_trace_r0[slot],
+                env->npe_control_trace_r1[slot],
+                env->npe_control_trace_error[slot],
+                env->npe_control_trace_file_error[slot]);
+        }
+    } else {
+        g_string_append(text, "none");
+    }
+    g_string_append_printf(text, "\nNPE_FILE_READ=COUNT:%u TRACE:",
+                           env->npe_file_read_trace_count);
+    if (env->npe_file_read_trace_count) {
+        uint32_t count = MIN(env->npe_file_read_trace_count,
+                             (uint32_t)DMCU_NPE_FILE_READ_TRACE_SLOTS);
+        uint32_t first = env->npe_file_read_trace_count - count;
+        uint32_t trace;
+
+        for (trace = first; trace < env->npe_file_read_trace_count; trace++) {
+            uint32_t slot = trace % DMCU_NPE_FILE_READ_TRACE_SLOTS;
+            uint32_t from = env->npe_file_read_trace_from[slot];
+
+            g_string_append_printf(
+                text, "%s#%u/%02x:%04x/sp%04x/fp%04x/"
+                      "off%04x:%04x/dst%04x:%04x/len%04x:%04x/"
+                      "e%04x/f%04x/s%04x",
+                trace == first ? "" : ",", trace + 1,
+                dmcu_code_segment(from), dmcu_code_pc(from),
+                env->npe_file_read_trace_sp[slot],
+                env->npe_file_read_trace_fp[slot],
+                env->npe_file_read_trace_args[slot][0],
+                env->npe_file_read_trace_args[slot][1],
+                env->npe_file_read_trace_args[slot][2],
+                env->npe_file_read_trace_args[slot][3],
+                env->npe_file_read_trace_args[slot][4],
+                env->npe_file_read_trace_args[slot][5],
+                env->npe_file_read_trace_error[slot],
+                env->npe_file_read_trace_file_error[slot],
+                env->npe_file_read_trace_application_state[slot]);
+        }
+    } else {
+        g_string_append(text, "none");
+    }
+    g_string_append_printf(text, "\nNPE_FAR_COPY=COUNT:%u TRACE:",
+                           env->npe_far_copy_trace_count);
+    if (env->npe_far_copy_trace_count) {
+        uint32_t count = MIN(env->npe_far_copy_trace_count,
+                             (uint32_t)DMCU_NPE_FAR_COPY_TRACE_SLOTS);
+        uint32_t first = env->npe_far_copy_trace_count - count;
+        uint32_t trace;
+
+        for (trace = first; trace < env->npe_far_copy_trace_count; trace++) {
+            uint32_t slot = trace % DMCU_NPE_FAR_COPY_TRACE_SLOTS;
+            uint32_t from = env->npe_far_copy_trace_from[slot];
+
+            g_string_append_printf(
+                text, "%s#%u/%02x:%04x/sp%04x/fp%04x/i%u/"
+                      "dst%04x:%04x/src%04x:%04x/len%04x:%04x/"
+                      "e%04x/f%04x",
+                trace == first ? "" : ",", trace + 1,
+                dmcu_code_segment(from), dmcu_code_pc(from),
+                env->npe_far_copy_trace_sp[slot],
+                env->npe_far_copy_trace_fp[slot],
+                env->npe_far_copy_trace_interrupts[slot],
+                env->npe_far_copy_trace_args[slot][0],
+                env->npe_far_copy_trace_args[slot][1],
+                env->npe_far_copy_trace_args[slot][2],
+                env->npe_far_copy_trace_args[slot][3],
+                env->npe_far_copy_trace_args[slot][4],
+                env->npe_far_copy_trace_args[slot][5],
+                env->npe_far_copy_trace_error[slot],
+                env->npe_far_copy_trace_file_error[slot]);
+        }
+    } else {
+        g_string_append(text, "none");
+    }
     g_string_append_printf(text, "\nSTART_GLYPH_TRACE=COUNT:%u TRACE:",
                            env->start_glyph_trace_count);
     if (env->start_glyph_trace_count) {
@@ -13373,6 +20246,28 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
     return g_string_free(text, false);
 }
 
+static int np560_snapshot_load_unavailable(QEMUFile *f, void *opaque)
+{
+    error_report("NP560+ whole-machine restore is not implemented: "
+                 "peripheral and NAND/journal state cannot be restored yet");
+    return -ENOTSUP;
+}
+
+static void np560_snapshot_save_unavailable(QEMUFile *f, void *opaque)
+{
+    error_report("NP560+ whole-machine snapshot is not implemented: "
+                 "peripheral and NAND/journal state cannot be saved yet");
+    qemu_file_set_error(f, -ENOTSUP);
+}
+
+/* Also reject old incomplete streams through loadvm/device-load commands,
+ * which do not consult outgoing migration blockers. A per-section pre_load
+ * hook would not help: those old streams contain no NP560 device section. */
+static const SaveVMHandlers np560_snapshot_guard = {
+    .save_state = np560_snapshot_save_unavailable,
+    .load_setup = np560_snapshot_load_unavailable,
+};
+
 static void np560_init(MachineState *machine)
 {
     NP560MachineState *s = NP560_MACHINE(machine);
@@ -13392,6 +20287,26 @@ static void np560_init(MachineState *machine)
     gsize burn_code_size = 0;
     gsize driver_code_size = 0;
     size_t overlay_index;
+    size_t late_data_alias_groups = 0;
+    size_t late_code_alias_groups = 0;
+
+    /* NAND checkpoints are not execution snapshots. Until every peripheral
+     * and the NAND/journal timeline can restore atomically, reject whole-VM
+     * migration instead of accepting a RAM-only image with reset devices. */
+    if (runstate_check(RUN_STATE_INMIGRATE)) {
+        error_report("NP560+ whole-machine restore is not implemented: "
+                     "LCD, timers, audio and NAND/journal state are incomplete");
+        exit(EXIT_FAILURE);
+    }
+    error_setg(&s->migration_blocker,
+               "NP560+ whole-machine snapshot is not implemented: "
+               "LCD, timers, audio and NAND/journal state are incomplete");
+    migrate_add_blocker(&s->migration_blocker, &error_fatal);
+    register_savevm_live("np560-incomplete-state", 0, 1,
+                         &np560_snapshot_guard, s);
+
+    s->firmware_vma03 = s->boot_mode &&
+        g_str_equal(s->boot_mode, "firmware-vma03");
 
     if (s->soc_rom_skeleton && (!s->soc_rom || !*s->soc_rom)) {
         error_report("NP560+ soc-rom-skeleton=on requires soc-rom=FILE");
@@ -13423,14 +20338,6 @@ static void np560_init(MachineState *machine)
     memory_region_add_subregion(get_system_memory(),
                                 DMCU_UNBANKED_SFR_PAGE_BASE,
                                 &s->data_unbanked_sfr_alias);
-    np560_timer_reset(s);
-    memory_region_init_io(&s->timer_mmio, NULL, &np560_timer_ops, s,
-                          "np560.timer64", NP560_TIMER_SIZE);
-    memory_region_add_subregion_overlap(get_system_memory(),
-                                         DMCU_UNBANKED_LOW_PAGE_BASE +
-                                         NP560_TIMER_BASE,
-                                         &s->timer_mmio, 10);
-    qemu_register_reset(np560_timer_reset, s);
     np560_st7529_reset(s);
     memory_region_init_io(&s->lcd_mmio, NULL, &np560_st7529_ops, s,
                           "np560.st7529", NP560_ST7529_MMIO_SIZE);
@@ -13472,6 +20379,17 @@ static void np560_init(MachineState *machine)
                                          &s->adc_banked_alias, 10);
     qemu_register_reset(np560_adc_reset, s);
     np560_load_nand_image(s);
+    if (s->nand_journal && *s->nand_journal) {
+        Error *journal_error = NULL;
+
+        s->nand.journal = np560_nand_journal_open(s->nand_journal,
+            s->nand.data, s->nand.oob, NP560_NAND_PAGE_DATA, NP560_NAND_PAGE_OOB,
+            NP560_NAND_PAGES, NP560_NAND_PAGES_PER_BLOCK, &journal_error);
+        if (!s->nand.journal) {
+            error_report_err(journal_error);
+            exit(EXIT_FAILURE);
+        }
+    }
     np560_nand_reset(s);
     memory_region_init_io(&s->nand_mmio, NULL, &np560_nand_ops, s,
                           "np560.reconstructed-nand-controller",
@@ -13482,13 +20400,6 @@ static void np560_init(MachineState *machine)
                                          &s->nand_mmio, 10);
     qemu_register_reset(np560_nand_reset, s);
     memset(&s->keyboard, 0, sizeof(s->keyboard));
-    memory_region_init_io(&s->keyboard_gpio_mmio, NULL,
-                          &np560_keyboard_gpio_ops, s,
-                          "np560.keyboard-gpio", NP560_KEYBOARD_GPIO_SIZE);
-    memory_region_add_subregion_overlap(get_system_memory(),
-                                         DMCU_UNBANKED_SFR_PAGE_BASE +
-                                         NP560_KEYBOARD_GPIO_BASE - 0xf000,
-                                         &s->keyboard_gpio_mmio, 10);
     memory_region_init_io(&s->system_control_mmio, NULL,
                           &np560_system_control_ops, s,
                           "np560.system-control",
@@ -13540,6 +20451,17 @@ static void np560_init(MachineState *machine)
                                          NP560_KEYBOARD_BASE - 0xf000,
                                          &s->keyboard_mmio, 10);
     qemu_register_reset(np560_keyboard_reset, s);
+    memory_region_init_io(&s->low_sfr_mmio, NULL, &np560_low_sfr_ops, s,
+                          "np560.low-sfr-register-bank", NP560_LOW_SFR_SIZE);
+    memory_region_add_subregion_overlap(get_system_memory(),
+                                         DMCU_UNBANKED_SFR_PAGE_BASE +
+                                         NP560_LOW_SFR_BASE - 0xf000,
+                                         &s->low_sfr_mmio, 5);
+    memory_region_init_alias(&s->low_sfr_banked_alias, NULL,
+                             "np560.low-sfr-register-bank-banked-alias",
+                             &s->low_sfr_mmio, 0, NP560_LOW_SFR_SIZE);
+    memory_region_add_subregion_overlap(get_system_memory(), NP560_LOW_SFR_BASE,
+                                         &s->low_sfr_banked_alias, 5);
     memory_region_init(&s->code, NULL, "np560.code", DMCU_DATA_SIZE);
     /*
      * Do not silently execute zero-filled data RAM when the internal ROM is
@@ -13556,13 +20478,13 @@ static void np560_init(MachineState *machine)
     }
     memory_region_add_subregion(&s->code, 0, &s->missing_soc_rom);
 
-    memory_region_init_alias(&s->code_internal_prefix_alias, NULL,
-                             "np560.code-internal-prefix-alias", &s->data,
-                             NP560_INTERNAL_CODE_PREFIX_BASE,
-                             NP560_INTERNAL_CODE_PREFIX_SIZE);
+    memory_region_init_alias(&s->code_internal_x_alias, NULL,
+                             "np560.code-internal-x-alias", &s->data,
+                             NP560_INTERNAL_X_CODE_BASE,
+                             NP560_INTERNAL_X_CODE_SIZE);
     memory_region_add_subregion_overlap(
-        &s->code, NP560_INTERNAL_CODE_PREFIX_BASE,
-        &s->code_internal_prefix_alias, 2);
+        &s->code, NP560_INTERNAL_X_CODE_BASE,
+        &s->code_internal_x_alias, 2);
     memory_region_init_alias(
         &s->code_resident_record_load_overlay_alias, NULL,
         "np560.code-resident-record-load-overlay-alias", &s->data,
@@ -13599,6 +20521,23 @@ static void np560_init(MachineState *machine)
         mask_rom03_present = loaded > DMCU_ROM03_BASE + 0x0032;
         memory_region_add_subregion_overlap(&s->code, 0,
                                              &s->soc_rom_region, 1);
+        if (s->firmware_vma03 && loaded > NP560_INTERNAL_PROGRAM_BASE) {
+            uint32_t data_rom_end = MIN((uint32_t)loaded,
+                                        NP560_PROGRAM_VMA03_BASE);
+
+            /* Share immutable storage across instruction/data accesses.
+             * Do not expose the file's legacy low-RAM payload as ROM, or
+             * hide writable PRG RAM at 03:0000 and above. The historical
+             * shifted-NOR diagnostic profile keeps its existing layout.
+             * No application, table address, opcode or PC selects this. */
+            memory_region_init_alias(
+                &s->data_soc_rom_alias, NULL, "np560.data-soc-rom-alias",
+                &s->soc_rom_region, NP560_INTERNAL_PROGRAM_BASE,
+                data_rom_end - NP560_INTERNAL_PROGRAM_BASE);
+            memory_region_add_subregion_overlap(
+                get_system_memory(), NP560_INTERNAL_PROGRAM_BASE,
+                &s->data_soc_rom_alias, 1);
+        }
         /*
          * The recovered 24:7FE4 initializer reads exactly these three small
          * source ranges from internal program ROM through its copy helper.
@@ -13664,6 +20603,157 @@ static void np560_init(MachineState *machine)
             get_system_memory(),
             NP560_RESIDENT_ROOT_MENU_CONTROLLER_TABLE_BASE,
             &s->data_resident_root_menu_controller_table_alias, 2);
+        memory_region_init_alias(
+            &s->data_resident_root_event_table_80_alias, NULL,
+            "np560.data-resident-root-event-table-80-alias",
+            &s->soc_rom_region,
+            NP560_RESIDENT_ROOT_EVENT_TABLE_80_BASE,
+            NP560_RESIDENT_ROOT_EVENT_TABLE_80_SIZE);
+        memory_region_add_subregion_overlap(
+            get_system_memory(), NP560_RESIDENT_ROOT_EVENT_TABLE_80_BASE,
+            &s->data_resident_root_event_table_80_alias, 2);
+        memory_region_init_alias(
+            &s->data_resident_root_event_table_8e_alias, NULL,
+            "np560.data-resident-root-event-table-8e-alias",
+            &s->soc_rom_region,
+            NP560_RESIDENT_ROOT_EVENT_TABLE_8E_BASE,
+            NP560_RESIDENT_ROOT_EVENT_TABLE_8E_SIZE);
+        memory_region_add_subregion_overlap(
+            get_system_memory(), NP560_RESIDENT_ROOT_EVENT_TABLE_8E_BASE,
+            &s->data_resident_root_event_table_8e_alias, 2);
+        memory_region_init_alias(
+            &s->data_resident_game_world_controller_table_alias, NULL,
+            "np560.data-resident-game-world-controller-table-alias",
+            &s->soc_rom_region,
+            NP560_RESIDENT_GAME_WORLD_CONTROLLER_TABLE_BASE,
+            NP560_RESIDENT_GAME_WORLD_CONTROLLER_TABLE_SIZE);
+        memory_region_add_subregion_overlap(
+            get_system_memory(),
+            NP560_RESIDENT_GAME_WORLD_CONTROLLER_TABLE_BASE,
+            &s->data_resident_game_world_controller_table_alias, 2);
+        memory_region_init_alias(
+            &s->data_resident_game_world_event_dispatch_table_alias, NULL,
+            "np560.data-resident-game-world-event-dispatch-table-alias",
+            &s->soc_rom_region,
+            NP560_RESIDENT_GAME_WORLD_EVENT_DISPATCH_TABLE_BASE,
+            NP560_RESIDENT_GAME_WORLD_EVENT_DISPATCH_TABLE_SIZE);
+        memory_region_add_subregion_overlap(
+            get_system_memory(),
+            NP560_RESIDENT_GAME_WORLD_EVENT_DISPATCH_TABLE_BASE,
+            &s->data_resident_game_world_event_dispatch_table_alias, 2);
+        memory_region_init_alias(
+            &s->data_resident_main_action_event_table_alias, NULL,
+            "np560.data-resident-main-action-event-table-alias",
+            &s->soc_rom_region,
+            NP560_RESIDENT_MAIN_ACTION_EVENT_TABLE_BASE,
+            NP560_RESIDENT_MAIN_ACTION_EVENT_TABLE_SIZE);
+        memory_region_add_subregion_overlap(
+            get_system_memory(),
+            NP560_RESIDENT_MAIN_ACTION_EVENT_TABLE_BASE,
+            &s->data_resident_main_action_event_table_alias, 2);
+        memory_region_init_alias(
+            &s->data_resident_application_input_event_table_alias, NULL,
+            "np560.data-resident-application-input-event-table-alias",
+            &s->soc_rom_region,
+            NP560_RESIDENT_APPLICATION_INPUT_EVENT_TABLE_BASE,
+            NP560_RESIDENT_APPLICATION_INPUT_EVENT_TABLE_SIZE);
+        memory_region_add_subregion_overlap(
+            get_system_memory(),
+            NP560_RESIDENT_APPLICATION_INPUT_EVENT_TABLE_BASE,
+            &s->data_resident_application_input_event_table_alias, 2);
+        memory_region_init_alias(
+            &s->data_resident_event_e0_handler_table_alias, NULL,
+            "np560.data-resident-event-e0-handler-table-alias",
+            &s->soc_rom_region,
+            NP560_RESIDENT_EVENT_E0_HANDLER_TABLE_BASE,
+            NP560_RESIDENT_EVENT_E0_HANDLER_TABLE_SIZE);
+        memory_region_add_subregion_overlap(
+            get_system_memory(),
+            NP560_RESIDENT_EVENT_E0_HANDLER_TABLE_BASE,
+            &s->data_resident_event_e0_handler_table_alias, 2);
+        memory_region_init_alias(
+            &s->data_resident_resource_dispatch_kind_table_alias, NULL,
+            "np560.data-resident-resource-dispatch-kind-table-alias",
+            &s->soc_rom_region,
+            NP560_RESIDENT_RESOURCE_DISPATCH_KIND_TABLE_BASE,
+            NP560_RESIDENT_RESOURCE_DISPATCH_KIND_TABLE_SIZE);
+        memory_region_add_subregion_overlap(
+            get_system_memory(),
+            NP560_RESIDENT_RESOURCE_DISPATCH_KIND_TABLE_BASE,
+            &s->data_resident_resource_dispatch_kind_table_alias, 2);
+        memory_region_init_alias(
+            &s->data_resident_resource_dispatch_event_table_alias, NULL,
+            "np560.data-resident-resource-dispatch-event-table-alias",
+            &s->soc_rom_region,
+            NP560_RESIDENT_RESOURCE_DISPATCH_EVENT_TABLE_BASE,
+            NP560_RESIDENT_RESOURCE_DISPATCH_EVENT_TABLE_SIZE);
+        memory_region_add_subregion_overlap(
+            get_system_memory(),
+            NP560_RESIDENT_RESOURCE_DISPATCH_EVENT_TABLE_BASE,
+            &s->data_resident_resource_dispatch_event_table_alias, 2);
+        memory_region_init_alias(
+            &s->data_resident_sound_effect_switch_event_table_alias, NULL,
+            "np560.data-resident-sound-effect-switch-event-table-alias",
+            &s->soc_rom_region,
+            NP560_RESIDENT_SOUND_EFFECT_SWITCH_EVENT_TABLE_BASE,
+            NP560_RESIDENT_SOUND_EFFECT_SWITCH_EVENT_TABLE_SIZE);
+        memory_region_add_subregion_overlap(
+            get_system_memory(),
+            NP560_RESIDENT_SOUND_EFFECT_SWITCH_EVENT_TABLE_BASE,
+            &s->data_resident_sound_effect_switch_event_table_alias, 2);
+        memory_region_init_alias(
+            &s->data_resident_operation_dispatch_table_alias, NULL,
+            "np560.data-resident-operation-dispatch-table-alias",
+            &s->soc_rom_region,
+            NP560_RESIDENT_OPERATION_DISPATCH_TABLE_BASE,
+            NP560_RESIDENT_OPERATION_DISPATCH_TABLE_SIZE);
+        memory_region_add_subregion_overlap(
+            get_system_memory(),
+            NP560_RESIDENT_OPERATION_DISPATCH_TABLE_BASE,
+            &s->data_resident_operation_dispatch_table_alias, 2);
+        memory_region_init_alias(
+            &s->data_resident_application_page_mode_table_alias, NULL,
+            "np560.data-resident-application-page-mode-table-alias",
+            &s->soc_rom_region,
+            NP560_RESIDENT_APPLICATION_PAGE_MODE_TABLE_BASE,
+            NP560_RESIDENT_APPLICATION_PAGE_MODE_TABLE_SIZE);
+        memory_region_add_subregion_overlap(
+            get_system_memory(),
+            NP560_RESIDENT_APPLICATION_PAGE_MODE_TABLE_BASE,
+            &s->data_resident_application_page_mode_table_alias, 2);
+        memory_region_init_alias(
+            &s->data_resident_application_compare_mode_table_alias, NULL,
+            "np560.data-resident-application-compare-mode-table-alias",
+            &s->soc_rom_region,
+            NP560_RESIDENT_APPLICATION_COMPARE_MODE_TABLE_BASE,
+            NP560_RESIDENT_APPLICATION_COMPARE_MODE_TABLE_SIZE);
+        memory_region_add_subregion_overlap(
+            get_system_memory(),
+            NP560_RESIDENT_APPLICATION_COMPARE_MODE_TABLE_BASE,
+            &s->data_resident_application_compare_mode_table_alias, 2);
+        for (overlay_index = 0;
+             overlay_index <
+                 G_N_ELEMENTS(
+                     np560_resident_application_compare_inner_tables);
+             overlay_index++) {
+            const NP560FixedDataAlias *alias =
+                &np560_resident_application_compare_inner_tables[
+                    overlay_index
+                ];
+
+            memory_region_init_alias(
+                &s->data_resident_application_compare_inner_table_aliases[
+                    overlay_index
+                ],
+                NULL, alias->name, &s->soc_rom_region, alias->source,
+                alias->size);
+            memory_region_add_subregion_overlap(
+                get_system_memory(), alias->base,
+                &s->data_resident_application_compare_inner_table_aliases[
+                    overlay_index
+                ],
+                2);
+        }
         memory_region_init_alias(
             &s->data_maskrom_resource_alias, NULL,
             "np560.data-maskrom-resource-alias",
@@ -13738,19 +20828,21 @@ static void np560_init(MachineState *machine)
                                              &s->bootrom, 1);
     }
 
-    /*
-     * PRG is the immutable external NOR/code source, not a pre-initialized
-     * 4 MiB data-RAM blob.  The segment-20/segment-50 boundaries written by
-     * 20:0030 prove that only 20:0000..4F:FFFF is initially data-readable as
-     * NOR; data addresses at segment 50 and above use the zeroed RAM backing.
-     */
+    /* Keep the original PRG as an immutable source image.  Historical mode
+     * exposes it as NOR at 20:0000.  VMA03 models the updater having loaded
+     * that same image into executable external RAM at 03:0000, so code and
+     * data accesses must share the writable data backing there. */
     memory_region_init_rom(&s->program, NULL, "np560.program-nor",
                            DMCU_PROGRAM_SIZE, &error_fatal);
     memory_region_init_alias(&s->code_program_alias, NULL,
-                             "np560.code-program-alias", &s->program, 0,
+                             "np560.code-program-alias",
+                             s->firmware_vma03 ? &s->data : &s->program,
+                             s->firmware_vma03 ? NP560_PROGRAM_VMA03_BASE : 0,
                              DMCU_PROGRAM_SIZE);
-    memory_region_add_subregion_overlap(&s->code, DMCU_PROGRAM_BASE,
-                                         &s->code_program_alias, 1);
+    memory_region_add_subregion_overlap(
+        &s->code,
+        s->firmware_vma03 ? NP560_PROGRAM_VMA03_BASE : DMCU_PROGRAM_BASE,
+        &s->code_program_alias, s->firmware_vma03 ? 4 : 1);
 
     /* These same-PC linked functions are selected by the resident
      * application's code-bank contract.  Keep their flat destinations on
@@ -13797,11 +20889,14 @@ static void np560_init(MachineState *machine)
         &s->code, NP560_FACTORY_COMPILER_START_BASE,
         &s->code_factory_compiler_start_linked_alias, 3);
 
-    memory_region_init_alias(&s->data_program_nor_alias, NULL,
-                             "np560.data-program-nor-alias", &s->program, 0,
-                             NP560_PROGRAM_DATA_NOR_SIZE);
-    memory_region_add_subregion_overlap(get_system_memory(), DMCU_PROGRAM_BASE,
-                                         &s->data_program_nor_alias, 1);
+    if (!s->firmware_vma03) {
+        memory_region_init_alias(
+            &s->data_program_nor_alias, NULL, "np560.data-program-nor-alias",
+            &s->program, 0, NP560_PROGRAM_DATA_NOR_SIZE);
+        memory_region_add_subregion_overlap(
+            get_system_memory(), DMCU_PROGRAM_BASE,
+            &s->data_program_nor_alias, 1);
+    }
 
     /* The 26:371E/2F:4350 allocator produces writable data objects inside two
      * small holes in the otherwise data-visible program window.  Alias the
@@ -13836,13 +20931,15 @@ static void np560_init(MachineState *machine)
                                          NP560_MENU_TEXT_DATA_30_BASE,
                                          &s->data_menu_text_30_alias, 3);
 
-    /* The PIM initializer relocated from source 3B:64DA copies the strings
-     * at 2F:F46A/F482/F488 into its file-open buffers.  Those flat data-bus
-     * addresses contain executable words, which made every resident open
-     * receive instruction bytes instead of "0:\\...", "V1.0", and
-     * "NOAHPIM".  The same-linked +0x1d bank contains the complete string
-     * island through ".tmp"; source 4C:F49C starts the next balanced
-     * function, so do not expose any bytes beyond that exact boundary. */
+    /* The PIM initializer relocated from source 3B:64DA reads the complete
+     * word-serialized string island at 2F:F37E..F49B.  In particular, its
+     * two path builders concatenate 2F:F3DC ("\\studyrec") or 2F:F418
+     * ("\\nminbox") before appending 2F:F490 (".pim").  The flat data-bus
+     * destinations contain executable words, which made resident fopen see
+     * instruction bytes after an otherwise valid "0:\\..." prefix.  The
+     * exact same-linked +0x1d source island begins immediately after the
+     * balanced RETS at 4C:F37C and ends at ".tmp"; 4C:F49C starts the next
+     * balanced function, so expose neither adjacent function as data. */
     memory_region_init_alias(&s->data_pim_resource_2f_alias, NULL,
                              "np560.data-pim-resource-2f-alias",
                              &s->program,
@@ -14203,17 +21300,17 @@ static void np560_init(MachineState *machine)
         &s->code_memory_mode_overlay_alias, 2);
     memory_region_init_alias(&s->data_global_reset_overlay_alias, NULL,
                              "np560.data-global-reset-overlay-alias", &s->data,
-                             NP560_GLOBAL_RESET_OVERLAY_BASE,
-                             NP560_GLOBAL_RESET_OVERLAY_SIZE);
+                             NP560_GLOBAL_KEY_EVENT_WINDOW_BASE,
+                             NP560_GLOBAL_KEY_EVENT_WINDOW_SIZE);
     memory_region_add_subregion_overlap(
-        get_system_memory(), NP560_GLOBAL_RESET_OVERLAY_BASE,
+        get_system_memory(), NP560_GLOBAL_KEY_EVENT_WINDOW_BASE,
         &s->data_global_reset_overlay_alias, 2);
     memory_region_init_alias(&s->code_global_reset_overlay_alias, NULL,
                              "np560.code-global-reset-overlay-alias", &s->data,
-                             NP560_GLOBAL_RESET_OVERLAY_BASE,
-                             NP560_GLOBAL_RESET_OVERLAY_SIZE);
+                             NP560_GLOBAL_KEY_EVENT_WINDOW_BASE,
+                             NP560_GLOBAL_KEY_EVENT_WINDOW_SIZE);
     memory_region_add_subregion_overlap(
-        &s->code, NP560_GLOBAL_RESET_OVERLAY_BASE,
+        &s->code, NP560_GLOBAL_KEY_EVENT_WINDOW_BASE,
         &s->code_global_reset_overlay_alias, 2);
     /* 20:02E2 and three other sites call 32:4218 with no arguments.  The
      * flat destination is a frame-relative shared tail, while the uncalled
@@ -14798,49 +21895,109 @@ static void np560_init(MachineState *machine)
     memory_region_add_subregion_overlap(
         &s->code, NP560_APPLICATION_HW_STATE_OVERLAY_BASE,
         &s->code_application_hw_state_overlay_alias, 2);
+    /* 09:E000 publishes these two contiguous functions through the ordinary
+     * data bus, while the CPU executes them through the Harvard code bus.
+     * A small dedicated RAMBlock gives both views the same bytes without
+     * recursively aliasing the heavily fragmented external-data container. */
+    memory_region_init_ram(
+        &s->application_operation_action_ui_ram, NULL,
+        "np560.application-operation-action-ui-ram",
+        NP560_APPLICATION_OPERATION_ACTION_UI_OVERLAY_SIZE, &error_fatal);
+    memory_region_add_subregion_overlap(
+        get_system_memory(),
+        NP560_APPLICATION_OPERATION_ONE_ACTION_OVERLAY_BASE,
+        &s->application_operation_action_ui_ram, 2);
+    /* Cover the complete 2-KiB code page so TCG does not need a subpage
+     * container for CE22..CFFF.  The untouched C800..CE21 prefix is seeded
+     * from flat PRG and only the published suffix is mirrored by the CPU's
+     * real data-bus write path. */
+    memory_region_init_ram(
+        &s->application_operation_action_code_page_ram, NULL,
+        "np560.code-application-operation-one-action-overlay-alias",
+        NP560_APPLICATION_OPERATION_ACTION_CODE_PAGE_SIZE, &error_fatal);
+    memory_region_add_subregion_overlap(
+        &s->code, NP560_APPLICATION_OPERATION_ACTION_CODE_PAGE_BASE,
+        &s->application_operation_action_code_page_ram, 2);
+    memory_region_init_alias(
+        &s->code_application_operation_action_ui_tail_alias, NULL,
+        "np560.code-application-operation-action-ui-tail-alias",
+        &s->application_operation_action_ui_ram,
+        NP560_APPLICATION_OPERATION_ACTION_UI_TAIL_OFFSET,
+        NP560_APPLICATION_OPERATION_ACTION_UI_TAIL_SIZE);
+    memory_region_add_subregion_overlap(
+        &s->code, NP560_APPLICATION_OPERATION_ACTION_UI_TAIL_BASE,
+        &s->code_application_operation_action_ui_tail_alias, 2);
     for (overlay_index = 0;
          overlay_index < G_N_ELEMENTS(np560_late_overlays);
          overlay_index++) {
         const NP560ProgramOverlay *overlay =
             &np560_late_overlays[overlay_index];
+        uint32_t data_size = np560_late_data_union_size(overlay_index);
 
-        memory_region_init_alias(&s->data_late_overlay_alias[overlay_index],
-                                 NULL, overlay->data_name, &s->data,
-                                 overlay->base, overlay->size);
-        memory_region_add_subregion_overlap(
-            get_system_memory(), overlay->base,
-            &s->data_late_overlay_alias[overlay_index], 2);
-        if (overlay->code_name) {
-            uint32_t code_source = overlay->code_source;
-
-            /* All 43 recovered code islands in banks 27..29 have exact
-             * same-PC source bodies in banks 44..46.  Runtime sector
-             * reconstruction has been observed filling data continuously
-             * from 27:41FC through 29:DDFB while timer IRQ and storage
-             * helpers keep executing those islands.  Preserve the linked
-             * instruction view instead of making it coherent with that
-             * multi-bank data buffer.  Later collision sites carry their
-             * individually evidenced source in the table above. */
-            if (!code_source &&
-                overlay->base >= NP560_RESOURCE_BUFFER_CODE_BANK_BASE &&
-                overlay->base + overlay->size <=
-                    NP560_RESOURCE_BUFFER_CODE_BANK_LIMIT) {
-                code_source = overlay->base +
-                    NP560_RESOURCE_BUFFER_CODE_SOURCE_DELTA;
-            }
-            MemoryRegion *code_backing = code_source ?
-                &s->program : &s->data;
-            uint32_t code_offset = code_source ?
-                code_source - DMCU_PROGRAM_BASE : overlay->base;
-
-            memory_region_init_alias(&s->code_late_overlay_alias[overlay_index],
-                                     NULL, overlay->code_name, code_backing,
-                                     code_offset, overlay->size);
+        if (data_size) {
+            memory_region_init_alias(
+                &s->data_late_overlay_alias[overlay_index],
+                NULL, overlay->data_name, &s->data,
+                overlay->base, data_size);
             memory_region_add_subregion_overlap(
-                &s->code, overlay->base,
-                &s->code_late_overlay_alias[overlay_index], 2);
+                get_system_memory(), overlay->base,
+                &s->data_late_overlay_alias[overlay_index], 2);
+            late_data_alias_groups++;
+        }
+        if (overlay->code_name) {
+            NP560LateCodeView view = np560_late_code_view(overlay_index);
+            uint32_t code_size = np560_late_code_union_size(overlay_index);
+
+            if (code_size) {
+                MemoryRegion *code_backing = view.source ?
+                    &s->program : &s->data;
+                uint32_t code_offset = view.source ?
+                    view.source - DMCU_PROGRAM_BASE : view.base;
+
+                if (s->rom_mp3_arena_image && view.base ==
+                    NP560_APPLICATION_DISPLAY_STATE_OVERLAY_BASE) {
+                    uint32_t source = s->rom_mp3_arena_image;
+                    uint8_t *rom;
+                    if (!s->soc_rom || !*s->soc_rom) {
+                        error_report("MP3 arena release image requires a SoC ROM");
+                        exit(EXIT_FAILURE);
+                    }
+                    rom = memory_region_get_ram_ptr(&s->soc_rom_region);
+                    /* Explicit HLE integration, not a PC hook or a change
+                     * to shipped PRG. Only replace the entry with a ROM
+                     * trampoline; the complete allocator tail must match. */
+                    if (!s->rom_mp3_hle_base || !s->soc_rom_skeleton ||
+                        code_size != 0xf6 || source < 0x10000 ||
+                        source > 0x30000 - code_size || (source & 1) ||
+                        memory_region_size(&s->soc_rom_region) < source + code_size ||
+                        (lduw_le_p(rom + source) != 0xad01 &&
+                         lduw_le_p(rom + source) != 0xad02) ||
+                        (lduw_le_p(rom + source + 2) & 1)) {
+                        error_report("invalid MP3 arena release image");
+                        exit(EXIT_FAILURE);
+                    }
+                    code_backing = &s->soc_rom_region;
+                    code_offset = source;
+                }
+
+                memory_region_init_alias(
+                    &s->code_late_overlay_alias[overlay_index],
+                    NULL, overlay->code_name, code_backing,
+                    code_offset, code_size);
+                memory_region_add_subregion_overlap(
+                    &s->code, view.base,
+                    &s->code_late_overlay_alias[overlay_index],
+                    s->rom_mp3_arena_image && view.base ==
+                        NP560_APPLICATION_DISPLAY_STATE_OVERLAY_BASE ? 5 : 2);
+                late_code_alias_groups++;
+            }
         }
     }
+    qemu_log_mask(LOG_UNIMP,
+                  "np560 late overlay alias groups: data=%zu code=%zu "
+                  "entries=%zu\n",
+                  late_data_alias_groups, late_code_alias_groups,
+                  G_N_ELEMENTS(np560_late_overlays));
     for (overlay_index = 0;
          overlay_index < NP560_RESIDENT_ROOT_POLICY_WORD_COUNT;
          overlay_index++) {
@@ -14932,6 +22089,36 @@ static void np560_init(MachineState *machine)
         warn_report("NP560+ firmware is 0x%zx bytes; expected 0x%x",
                     loaded, DMCU_PROGRAM_SIZE);
     }
+    if (s->rom_mp3_arena_image && memcmp(
+            (uint8_t *)memory_region_get_ram_ptr(&s->soc_rom_region) +
+                s->rom_mp3_arena_image + 4,
+            (uint8_t *)memory_region_get_ram_ptr(&s->program) +
+                NP560_APPLICATION_DISPLAY_STATE_OVERLAY_SOURCE - DMCU_PROGRAM_BASE + 4,
+            NP560_APPLICATION_DISPLAY_STATE_OVERLAY_SIZE - 4)) {
+        error_report("MP3 arena release image differs from original allocator tail");
+        exit(EXIT_FAILURE);
+    }
+
+    if (s->firmware_vma03) {
+        memcpy(memory_region_get_ram_ptr(&s->data) +
+                   NP560_PROGRAM_VMA03_BASE,
+               memory_region_get_ram_ptr(&s->program),
+               DMCU_PROGRAM_SIZE);
+    }
+
+    memcpy(
+        memory_region_get_ram_ptr(&s->application_operation_action_ui_ram),
+        memory_region_get_ram_ptr(&s->program) +
+            NP560_APPLICATION_OPERATION_ONE_ACTION_OVERLAY_BASE -
+            DMCU_PROGRAM_BASE,
+        NP560_APPLICATION_OPERATION_ACTION_UI_OVERLAY_SIZE);
+    memcpy(
+        memory_region_get_ram_ptr(
+            &s->application_operation_action_code_page_ram),
+        memory_region_get_ram_ptr(&s->program) +
+            NP560_APPLICATION_OPERATION_ACTION_CODE_PAGE_BASE -
+            DMCU_PROGRAM_BASE,
+        NP560_APPLICATION_OPERATION_ACTION_CODE_PAGE_SIZE);
 
     /*
      * Each writable overlay alias has higher priority than immutable NOR on
@@ -14962,8 +22149,8 @@ static void np560_init(MachineState *machine)
                                NP560_MEMORY_RESET_OVERLAY_SIZE);
     np560_seed_program_overlay(s, NP560_MEMORY_MODE_OVERLAY_BASE,
                                NP560_MEMORY_MODE_OVERLAY_SIZE);
-    np560_seed_program_overlay(s, NP560_GLOBAL_RESET_OVERLAY_BASE,
-                               NP560_GLOBAL_RESET_OVERLAY_SIZE);
+    np560_seed_program_overlay(s, NP560_GLOBAL_KEY_EVENT_WINDOW_BASE,
+                               NP560_GLOBAL_KEY_EVENT_WINDOW_SIZE);
     np560_seed_program_overlay(s, NP560_STARTUP_TABLE_OVERLAY_BASE,
                                NP560_STARTUP_TABLE_OVERLAY_SIZE);
     np560_seed_program_overlay(s, NP560_STARTUP_POINTER_OVERLAY_BASE,
@@ -15042,13 +22229,53 @@ static void np560_init(MachineState *machine)
     for (overlay_index = 0;
          overlay_index < G_N_ELEMENTS(np560_late_overlays);
          overlay_index++) {
-        /* Destinations below segment 20 are reconstructed resident ROM, not
-         * flat PRG bytes.  The guest late loader fills their RAM aliases from
-         * the evidenced +0x1d source before executing them. */
-        if (np560_late_overlays[overlay_index].base >= DMCU_PROGRAM_BASE) {
+        uint32_t seed_base = np560_late_overlays[overlay_index].base;
+        uint32_t seed_size = np560_late_overlays[overlay_index].size;
+        bool seed_from_program =
+            np560_late_overlays[overlay_index].base >= DMCU_PROGRAM_BASE;
+
+        /* In the historical 20:0000 mapping, destinations below segment 20
+         * are reconstructed resident ROM and must wait for the guest loader.
+         * The VMA03 experiment maps the complete PRG at 03:0000 instead, so
+         * low writable/data views such as 0C:8622 contain same-address PRG
+         * constants and jump tables that have to exist before that loader can
+         * run. */
+        if (s->firmware_vma03 &&
+            seed_base >= NP560_PROGRAM_VMA03_BASE &&
+            seed_base + seed_size <=
+                NP560_PROGRAM_VMA03_BASE + DMCU_PROGRAM_SIZE) {
+            seed_from_program = true;
+        }
+        if (seed_from_program) {
+            if (np560_late_overlays[overlay_index].base ==
+                NP560_APPLICATION_OPERATION_TRANSITION_SERVICE_OVERLAY_BASE) {
+                seed_base =
+                    NP560_APPLICATION_OPERATION_TRANSITION_SERVICE_CODE_BASE;
+                seed_size =
+                    NP560_APPLICATION_OPERATION_TRANSITION_SERVICE_CODE_SIZE;
+            }
+            if (np560_late_overlays[overlay_index].base ==
+                NP560_APPLICATION_OPERATION_TRANSITION_SERVICE_LEAF_OVERLAY_BASE) {
+                seed_size =
+                    NP560_APPLICATION_OPERATION_TRANSITION_SERVICE_LEAF_CODE_SIZE;
+            }
+            if (np560_late_overlays[overlay_index].base ==
+                NP560_APPLICATION_OPERATION_GRID_REPOSITION_OVERLAY_BASE) {
+                seed_base =
+                    NP560_APPLICATION_OPERATION_GRID_REPOSITION_CODE_BASE;
+                seed_size =
+                    NP560_APPLICATION_OPERATION_GRID_REPOSITION_CODE_SIZE;
+            }
+            if (np560_late_overlays[overlay_index].base ==
+                NP560_APPLICATION_OPERATION_SCROLL_RENDERER_OVERLAY_BASE) {
+                seed_base =
+                    NP560_APPLICATION_OPERATION_SCROLL_RENDERER_CODE_BASE;
+                seed_size =
+                    NP560_APPLICATION_OPERATION_SCROLL_RENDERER_CODE_SIZE;
+            }
             np560_seed_program_overlay(s,
-                                       np560_late_overlays[overlay_index].base,
-                                       np560_late_overlays[overlay_index].size);
+                                       seed_base,
+                                       seed_size);
         }
     }
     np560_seed_program_overlay(s, NP560_UINT32_MULTIPLY_OVERLAY_BASE,
@@ -15104,6 +22331,8 @@ static void np560_init(MachineState *machine)
     if (!s->boot_mode || !*s->boot_mode ||
         g_str_equal(s->boot_mode, "firmware")) {
         reset_pc = DMCU_PROGRAM_BASE;
+    } else if (g_str_equal(s->boot_mode, "firmware-vma03")) {
+        reset_pc = NP560_PROGRAM_VMA03_BASE;
     } else if (g_str_equal(s->boot_mode, "usb")) {
         if (!s->usb_loader || !*s->usb_loader) {
             error_report("NP560+ boot-mode=usb requires usb-loader=FILE");
@@ -15124,9 +22353,20 @@ static void np560_init(MachineState *machine)
         reset_pc = dmcu_code_address(0x52, 0x0000);
     } else {
         error_report("Unknown NP560+ boot mode '%s' "
-                     "(use firmware, usb, burn, or driver)", s->boot_mode);
+                     "(use firmware, firmware-vma03, usb, burn, or driver)",
+                     s->boot_mode);
         exit(EXIT_FAILURE);
     }
+
+    s->reset_data_snapshot = g_memdup2(
+        memory_region_get_ram_ptr(&s->data), DMCU_DATA_SIZE);
+    s->reset_action_ui_snapshot = g_memdup2(
+        memory_region_get_ram_ptr(&s->application_operation_action_ui_ram),
+        NP560_APPLICATION_OPERATION_ACTION_UI_OVERLAY_SIZE);
+    s->reset_action_code_page_snapshot = g_memdup2(
+        memory_region_get_ram_ptr(
+            &s->application_operation_action_code_page_ram),
+        NP560_APPLICATION_OPERATION_ACTION_CODE_PAGE_SIZE);
 
     s->cpu = DMCU_CPU(object_new(machine->cpu_type));
     if (!s->cpu) {
@@ -15135,6 +22375,7 @@ static void np560_init(MachineState *machine)
     }
     cs = CPU(s->cpu);
     s->cpu->code_memory = &s->code;
+    s->cpu->internal_memory = &s->data;
     s->cpu->internal_data = memory_region_get_ram_ptr(&s->data);
     s->cpu->reset_pc = reset_pc;
     s->cpu->mask_rom03_present = mask_rom03_present;
@@ -15148,11 +22389,59 @@ static void np560_init(MachineState *machine)
     s->cpu->resident_rom_limit = resident_rom_limit;
     s->cpu->startup_context = s->startup_context;
     qdev_realize(DEVICE(s->cpu), NULL, &error_fatal);
+    if (s->rom_mp3_hle_base) {
+        if (!s->soc_rom_skeleton || s->rom_hle || s->hle_ui) {
+            error_report("rom-mp3-hle-base requires a strict skeleton, not legacy ROM/UI HLE");
+            exit(EXIT_FAILURE);
+        }
+        s->mp3_hle = np560_mp3_hle_new(s->cpu, s->rom_mp3_hle_base, &error_fatal);
+        s->cpu->rom_service_opaque = s->mp3_hle;
+        s->cpu->rom_service = np560_mp3_hle_service;
+        s->cpu->rom_service_reset = np560_mp3_hle_reset;
+    }
     cpu_reset(cs);
+    np560_timers_init(&s->periodic_timers, s->cpu);
+    qemu_register_reset(np560_timers_reset, &s->periodic_timers);
+    np560_audio_init(&s->audio, s->cpu);
+    qemu_register_reset(np560_audio_reset, &s->audio);
+    s->cpu->sfr_device_opaque = s;
+    s->cpu->sfr_device_read = np560_sfr_device_read;
+    s->cpu->sfr_device_write = np560_sfr_device_write;
+    object_property_add_str(OBJECT(machine), "audio-pcm",
+                            np560_get_audio_pcm, NULL);
+    object_property_add_str(OBJECT(machine), "rom-mp3-hle-state",
+                            np560_get_mp3_hle_state, NULL);
+    object_property_add_str(OBJECT(machine), "timer0-state",
+                            np560_get_timer0_state, NULL);
+    object_property_add_str(OBJECT(machine), "timebase-state",
+                            np560_get_timebase_state, NULL);
+    object_property_add_str(OBJECT(machine), "timer1-state",
+                            np560_get_timer1_state, NULL);
+    object_property_add_str(OBJECT(machine), "timer2-state",
+                            np560_get_timer2_state, NULL);
+    object_property_add_str(OBJECT(machine), "dtu-state",
+                            np560_get_dtu_state, NULL);
+    object_property_add_str(OBJECT(machine), "dtu-config-trace",
+                            np560_get_dtu_config_trace, NULL);
+    object_property_add_bool(OBJECT(machine), "dtu-refill-trace",
+                             np560_get_dtu_refill_trace, np560_set_dtu_refill_trace);
+    object_property_add_bool(OBJECT(machine), "control-observers-minimal",
+                             np560_get_control_observers_minimal,
+                             np560_set_control_observers_minimal);
+    object_property_add_bool(OBJECT(machine), "instruction-clock",
+                             np560_get_instruction_clock,
+                             np560_set_instruction_clock);
+    object_property_set_description(OBJECT(machine), "instruction-clock",
+        "Experimental one-cycle instruction baseline using PLL/CLKCON; not complete cycle timing");
+    object_property_add_str(OBJECT(machine), "instruction-clock-state",
+                            np560_get_instruction_clock_state, NULL);
+    object_property_set_description(OBJECT(machine), "control-observers-minimal",
+        "Experimental opt-in: omit historical control observers; retain strict faults and key ACK");
+    object_property_add_str(OBJECT(machine), "dtu-refill-state",
+                            np560_get_dtu_refill_state, NULL);
+    object_property_add_str(OBJECT(machine), "audio-file-trace",
+                            np560_get_audio_file_trace, NULL);
     np560_keyboard_reset(s);
-    s->system_tick_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
-                                        np560_system_tick, s);
-    np560_schedule_system_tick(s);
     object_property_add_uint32_ptr(OBJECT(machine), "key-state",
         &s->cpu->env.web_key_state, OBJ_PROP_FLAG_READWRITE);
     object_property_add_uint32_ptr(OBJECT(machine), "key-code",
@@ -15161,6 +22450,45 @@ static void np560_init(MachineState *machine)
         &s->cpu->env.web_matrix_state_low, OBJ_PROP_FLAG_READWRITE);
     object_property_add_uint32_ptr(OBJECT(machine), "key-matrix-high",
         &s->cpu->env.web_matrix_state_high, OBJ_PROP_FLAG_READWRITE);
+    object_property_add(OBJECT(machine), "key-matrix-pulse-index", "uint32",
+                        np560_get_key_matrix_pulse_index,
+                        np560_set_key_matrix_pulse_index, NULL, NULL);
+    object_property_set_description(
+        OBJECT(machine), "key-matrix-pulse-index",
+        "Diagnostic physical matrix index sampled for exactly one selected row");
+    /* Read-only, bounded key-edge diagnostics for latency-sensitive Web
+     * press/release orchestration.  Exposing these counters directly avoids
+     * serialising the full cpu-state report while a physical key is held;
+     * it does not inject, acknowledge, or alter a guest event. */
+    object_property_add_uint32_ptr(OBJECT(machine), "key-event-map-count",
+        &s->cpu->env.matrix_event_maps, OBJ_PROP_FLAG_READ);
+    object_property_add_uint16_ptr(OBJECT(machine), "key-event-last",
+        &s->cpu->env.matrix_event_last, OBJ_PROP_FLAG_READ);
+    object_property_add_uint32_ptr(OBJECT(machine), "key-candidate-count",
+        &s->cpu->env.matrix_candidate_writes, OBJ_PROP_FLAG_READ);
+    object_property_add_uint16_ptr(OBJECT(machine), "key-candidate-last",
+        &s->cpu->env.matrix_candidate_last, OBJ_PROP_FLAG_READ);
+    /* 20:2E9E is the return from the exact 33:4ECC foreground event mapper.
+     * Reuse the stable bounded application-trace entry instead of adding a
+     * second counter.  These properties only report that the guest reached
+     * the boundary and the R0 value it returned. */
+    object_property_add_uint32_ptr(OBJECT(machine), "key-foreground-ack-count",
+        &s->cpu->env.application_trace_calls[
+            DMCU_APPLICATION_KEYMAP_RETURN_TRACE_INDEX], OBJ_PROP_FLAG_READ);
+    object_property_add_uint32_ptr(OBJECT(machine), "key-foreground-ack-last",
+        &s->cpu->env.application_trace_r0[
+            DMCU_APPLICATION_KEYMAP_RETURN_TRACE_INDEX], OBJ_PROP_FLAG_READ);
+    /* 1E:F8E4 is the exact state-50/modal event-dispatch boundary after the
+     * guest has mapped a physical event.  These observer-only counters allow
+     * the Web probe to distinguish that consumer from root KEYMAPRET. */
+    object_property_add_uint32_ptr(OBJECT(machine), "key-modal-ack-count",
+        &s->cpu->env.matrix_modal_dispatches, OBJ_PROP_FLAG_READ);
+    object_property_add_uint16_ptr(OBJECT(machine), "key-modal-ack-last",
+        &s->cpu->env.matrix_modal_event_last, OBJ_PROP_FLAG_READ);
+    object_property_add_str(OBJECT(machine), "key-pipeline-status",
+                            np560_get_key_pipeline_status, NULL);
+    object_property_set_description(OBJECT(machine), "key-pipeline-status",
+        "Read-only JSON snapshot of bounded guest key pipeline counters");
 }
 
 static void np560_machine_class_init(ObjectClass *oc, void *data)
@@ -15169,6 +22497,7 @@ static void np560_machine_class_init(ObjectClass *oc, void *data)
 
     mc->desc = "Noah NP560+ (King Billion DMCU)";
     mc->init = np560_init;
+    mc->reset = np560_machine_reset;
     mc->default_cpu_type = TYPE_DMCU_V1_CPU;
     mc->default_cpus = 1;
     mc->min_cpus = 1;
@@ -15184,6 +22513,16 @@ static void np560_machine_class_init(ObjectClass *oc, void *data)
                                   NULL);
     object_class_property_set_description(oc, "lcd-frame",
         "Base64 240x120 5-bit grayscale output from the ST7529 controller");
+    object_class_property_add_str(oc, "lcd-completed-frame",
+                                  np560_get_lcd_completed_frame, NULL);
+    object_class_property_set_description(oc, "lcd-completed-frame",
+        "Base64 240x120 ST7529 output at the latest complete RAM window");
+    object_class_property_add_str(oc, "lcd-completed-frame-sequence",
+                                  np560_get_lcd_completed_frame_sequence,
+                                  NULL);
+    object_class_property_set_description(oc,
+        "lcd-completed-frame-sequence",
+        "Monotonic count of complete ST7529 RAM windows");
     object_class_property_add_str(oc, "lcd-gram-frame",
                                   np560_get_lcd_gram_frame, NULL);
     object_class_property_set_description(oc, "lcd-gram-frame",
@@ -15250,6 +22589,18 @@ static void np560_machine_class_init(ObjectClass *oc, void *data)
                                   np560_set_nand_checkpoint);
     object_class_property_set_description(oc, "nand-checkpoint",
         "Restore a complete NP560+ NAND data/OOB checkpoint");
+    object_class_property_add_str(oc, "nand-journal", np560_get_nand_journal,
+                                  np560_set_nand_journal);
+    object_class_property_set_description(oc, "nand-journal",
+        "Durably journal NAND mutations and replay against the unchanged seed");
+    object_class_property_add_str(oc, "nand-journal-state",
+                                  np560_get_nand_journal_state, NULL);
+    object_class_property_add_str(oc, "nand-journal-maintenance",
+                                  np560_get_nand_journal_maintenance, NULL);
+    object_class_property_add_bool(oc, "nand-journal-compact", NULL,
+                                   np560_set_nand_journal_compact);
+    object_class_property_set_description(oc, "nand-journal-compact",
+        "Atomically compact NAND history against the unchanged seed (true)");
     object_class_property_add_str(oc, "nand-save", np560_get_nand_save,
                                   np560_set_nand_save);
     object_class_property_set_description(oc, "nand-save",
@@ -15269,6 +22620,11 @@ static void np560_machine_class_init(ObjectClass *oc, void *data)
                                   np560_set_debug_data_save);
     object_class_property_set_description(oc, "debug-data-save",
         "Diagnostic only: save ADDRESS:SIZE@FILE directly from data RAM");
+    object_class_property_add_str(oc, "debug-code-save",
+                                  np560_get_debug_code_save,
+                                  np560_set_debug_code_save);
+    object_class_property_set_description(oc, "debug-code-save",
+        "Diagnostic only: save ADDRESS:SIZE@FILE from the DMCU code bus");
     object_class_property_add_str(oc, "debug-program-load",
                                   np560_get_debug_program_load,
                                   np560_set_debug_program_load);
@@ -15282,7 +22638,8 @@ static void np560_machine_class_init(ObjectClass *oc, void *data)
     object_class_property_add_str(oc, "boot-mode", np560_get_boot_mode,
                                   np560_set_boot_mode);
     object_class_property_set_description(oc, "boot-mode",
-        "Reset source: firmware (default), usb, burn, or driver");
+        "Reset source: firmware (default), experimental firmware-vma03, "
+        "usb, burn, or driver");
     object_class_property_add_bool(oc, "hle-ui", np560_get_hle_ui,
                                    np560_set_hle_ui);
     object_class_property_set_description(oc, "hle-ui",
@@ -15307,6 +22664,12 @@ static void np560_machine_instance_init(Object *obj)
     s->hle_ui = false;
     s->adc_level = 8;
     s->external_power = 0;
+    object_property_add_uint32_ptr(obj, "rom-mp3-hle-base",
+                                   &s->rom_mp3_hle_base, OBJ_PROP_FLAG_READWRITE);
+    object_property_add_uint32_ptr(obj, "rom-mp3-arena-image",
+                                   &s->rom_mp3_arena_image, OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "rom-mp3-hle-base",
+        "Explicit version-1 MP3 HLE gates in ROM 01/02 (zero disables)");
     object_property_add_uint32_ptr(obj, "startup-context",
                                    &s->startup_context,
                                    OBJ_PROP_FLAG_READWRITE);
@@ -15326,16 +22689,29 @@ static void np560_machine_finalize(Object *obj)
 {
     NP560MachineState *s = NP560_MACHINE(obj);
 
+    if (s->cpu) {
+        s->cpu->rom_service = NULL;
+        s->cpu->rom_service_reset = NULL;
+        s->cpu->rom_service_opaque = NULL;
+    }
+    np560_mp3_hle_free(s->mp3_hle);
+
+    migrate_del_blocker(&s->migration_blocker);
+    unregister_savevm(NULL, "np560-incomplete-state", s);
+
     qemu_unregister_reset(np560_st7529_reset, s);
     qemu_unregister_reset(np560_ecc_reset, s);
     qemu_unregister_reset(np560_adc_reset, s);
     qemu_unregister_reset(np560_nand_reset, s);
     qemu_unregister_reset(np560_keyboard_reset, s);
-    qemu_unregister_reset(np560_timer_reset, s);
-    if (s->system_tick_timer) {
-        timer_del(s->system_tick_timer);
-        timer_free(s->system_tick_timer);
-    }
+    qemu_unregister_reset(np560_timers_reset, &s->periodic_timers);
+    qemu_unregister_reset(np560_audio_reset, &s->audio);
+    s->cpu->sfr_device_read = NULL;
+    s->cpu->sfr_device_write = NULL;
+    s->cpu->sfr_device_opaque = NULL;
+    np560_audio_destroy(&s->audio);
+    np560_timers_destroy(&s->periodic_timers);
+    np560_nand_journal_close(s->nand.journal);
     g_free(s->nand.data);
     g_free(s->nand.oob);
     g_free(s->soc_rom);
@@ -15346,11 +22722,16 @@ static void np560_machine_finalize(Object *obj)
     g_free(s->nand_image);
     g_free(s->nand_checkpoint);
     g_free(s->nand_save);
+    g_free(s->nand_journal);
     g_free(s->debug_data_load);
     g_free(s->debug_data_write);
     g_free(s->debug_data_save);
+    g_free(s->debug_code_save);
     g_free(s->debug_program_load);
     g_free(s->boot_mode);
+    g_free(s->reset_data_snapshot);
+    g_free(s->reset_action_ui_snapshot);
+    g_free(s->reset_action_code_page_snapshot);
 }
 
 static const TypeInfo np560_machine_type = {

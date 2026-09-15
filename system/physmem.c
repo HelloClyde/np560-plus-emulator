@@ -976,8 +976,16 @@ static uint16_t phys_section_add(PhysPageMap *map,
 {
     /* The physical section number is ORed with a page-aligned
      * pointer to produce the iotlb entries.  Thus it should
-     * never overflow into the page-aligned value.
+    * never overflow into the page-aligned value.
      */
+    if (map->sections_nb >= TARGET_PAGE_SIZE) {
+        fprintf(stderr,
+                "phys_section_add overflow: count=%u region=%s "
+                "address=0x%" HWADDR_PRIx " size=0x%" HWADDR_PRIx "\n",
+                map->sections_nb, memory_region_name(section->mr),
+                section->offset_within_address_space,
+                int128_get64(section->size));
+    }
     assert(map->sections_nb < TARGET_PAGE_SIZE);
 
     if (map->sections_nb == map->sections_nb_alloc) {

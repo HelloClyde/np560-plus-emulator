@@ -37,6 +37,14 @@ extern int use_icount;
  */
 void icount_update(CPUState *cpu);
 
+/* Add target execution/wait time beyond the already charged instruction.
+ * Only a single-vCPU target using fixed shift=0, single-instruction TBs,
+ * and no record/replay may call this, from that vCPU's I/O-safe boundary.
+ * It preserves the raw instruction count and shortens the current timer
+ * budget, so the next device deadline cannot be skipped by a stale budget.
+ */
+void icount_account_extra_ns(CPUState *cpu, uint64_t ns);
+
 /* get raw icount value */
 int64_t icount_get_raw(void);
 

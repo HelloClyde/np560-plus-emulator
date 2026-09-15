@@ -3,13 +3,16 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/error-report.h"
+#include "qemu/main-loop.h"
 #include "cpu.h"
+#include "observer-sites.h"
 #include "exec/exec-all.h"
 #include "exec/tb-flush.h"
 #include "exec/address-spaces.h"
 #include "exec/cpu_ldst.h"
 #include "exec/helper-proto.h"
 #include "hw/core/tcg-cpu-ops.h"
+#include "sysemu/runstate.h"
 
 #define MASK16 0xffffu
 #define MASK24 0xffffffu
@@ -212,6 +215,726 @@ static inline void trace_clock_format_output_write(CPUDMCUState *env,
     env->clock_format_output_trace_bus[slot] = bus;
 }
 
+static inline uint8_t clock_raster_pixel(uint32_t base,
+                                         unsigned x, unsigned y)
+{
+    /* The exact 18:6454 blitter stores logical row y at physical row 119-y.
+     * Each physical byte contains the even pixel in its high nibble. */
+    uint32_t address = base + (119u - y) * 120u + x / 2u;
+    uint8_t packed = address_space_ldub(
+        &address_space_memory, address, MEMTXATTRS_UNSPECIFIED, NULL);
+
+    return (x & 1u) ? packed & 0x0fu : packed >> 4;
+}
+
+static inline void snapshot_clock_raster_stage(CPUDMCUState *env,
+                                                uint32_t slot,
+                                                unsigned stage)
+{
+    static const uint32_t bases[2] = { 0x00500000u, 0x00503840u };
+    uint32_t hashes[2] = { 2166136261u, 2166136261u };
+    uint16_t foreground[2] = { 0, 0 };
+    uint16_t levels[2] = { 0, 0 };
+    unsigned buffer;
+    unsigned x;
+    unsigned y;
+
+    if (slot >= DMCU_CLOCK_RASTER_TRACE_SLOTS ||
+        stage >= DMCU_CLOCK_RASTER_TRACE_STAGES) {
+        return;
+    }
+    /* Exclude the leading blank at x=188.  These five 8x8 cells are wholly
+     * inside the x=195..238 background resource and contain 00:00 itself. */
+    for (buffer = 0; buffer < ARRAY_SIZE(bases); buffer++) {
+        for (y = 107; y <= 114; y++) {
+            for (x = 196; x <= 235; x++) {
+                uint8_t pixel = clock_raster_pixel(bases[buffer], x, y);
+
+                hashes[buffer] = (hashes[buffer] ^ pixel) * 16777619u;
+                foreground[buffer] += pixel == 0x0fu;
+                levels[buffer] |= 1u << pixel;
+            }
+        }
+    }
+    env->clock_raster_back_hash[slot][stage] = hashes[0];
+    env->clock_raster_front_hash[slot][stage] = hashes[1];
+    env->clock_raster_back_foreground[slot][stage] = foreground[0];
+    env->clock_raster_front_foreground[slot][stage] = foreground[1];
+    env->clock_raster_back_levels[slot][stage] = levels[0];
+    env->clock_raster_front_levels[slot][stage] = levels[1];
+    env->clock_raster_pointer[slot][stage] =
+        ((uint32_t)internal_data_read(0x04fcu, 16) << 16) |
+        internal_data_read(0x04feu, 16);
+    env->clock_raster_mode[slot][stage] =
+        internal_data_read(0x4bb0u, 16);
+    env->clock_raster_mask_a[slot][stage] =
+        internal_data_read(0x4ba8u, 16);
+    env->clock_raster_mask_b[slot][stage] =
+        internal_data_read(0x4baeu, 16);
+    env->clock_raster_valid[slot] |= 1u << stage;
+}
+
+enum {
+    NPE_GAME_FRAME_UI_ENTRY,
+    NPE_GAME_FRAME_MEMORY_MODE_RETURN,
+    NPE_GAME_FRAME_UI_INIT_ENTRY,
+    NPE_GAME_FRAME_UI_INIT_RETURN,
+    NPE_GAME_FRAME_BUFFER_SYNC_RETURN,
+    NPE_GAME_FRAME_SERVICE_RETURN,
+    NPE_GAME_FRAME_GRID_ENTRY,
+    NPE_GAME_FRAME_GRID_RETURN,
+    NPE_GAME_FRAME_INITIALIZE_ENTRY,
+    NPE_GAME_FRAME_INITIALIZE_RETURN,
+    NPE_GAME_FRAME_DRAW_ENTRY,
+    NPE_GAME_FRAME_DRAW_RETURN,
+};
+
+static void reset_npe_game_trace(CPUDMCUState *env)
+{
+    /* This reset is issued only on the source-proven mode-2 transition
+     * 2F:B726 -> 1F:D1A6.  Arm immediately so loader-time section 13/14/15
+     * seeks and reads are retained; waiting for the first runtime 0x86 event
+     * loses those calls and incorrectly makes the post-loader section-12
+     * ceiling look like a whole-launch ceiling.  All consumers are strictly
+     * observation-only, so this does not alter the guest loader or game. */
+    env->npe_game_trace_armed = true;
+    env->npe_game_service_dispatch_calls = 0;
+    env->npe_game_ui_handler_calls = 0;
+    env->npe_game_ui_handler_returns = 0;
+    env->npe_game_code86_paths = 0;
+    env->npe_game_flag_7a7e_one_paths = 0;
+    env->npe_game_flag_7a7c_one_paths = 0;
+    env->npe_game_flag_7a7a = 0;
+    env->npe_game_flag_7a7c = 0;
+    env->npe_game_flag_7a7e = 0;
+    env->npe_game_memory_mode_calls = 0;
+    env->npe_game_memory_mode_returns = 0;
+    env->npe_game_ui_init_calls = 0;
+    env->npe_game_ui_init_returns = 0;
+    env->npe_game_ui_init_call_pre_sp = 0;
+    env->npe_game_ui_init_call_post_sp = 0;
+    env->npe_game_ui_init_call_pre_fp = 0;
+    env->npe_game_ui_init_call_post_fp = 0;
+    memset(env->npe_game_ui_init_call_frame, 0,
+           sizeof(env->npe_game_ui_init_call_frame));
+    env->npe_game_ui_init_rets_seen = 0;
+    env->npe_game_ui_init_rets_target = 0;
+    env->npe_game_ui_init_rets_word = 0;
+    env->npe_game_ui_init_rets_pre_sp = 0;
+    env->npe_game_ui_init_rets_post_sp = 0;
+    env->npe_game_ui_init_rets_pre_fp = 0;
+    env->npe_game_ui_init_rets_post_fp = 0;
+    memset(env->npe_game_ui_init_rets_frame, 0,
+           sizeof(env->npe_game_ui_init_rets_frame));
+    env->npe_game_ui_init_continuation_entries = 0;
+    env->npe_game_ui_init_continuation_from = 0;
+    env->npe_game_ui_init_continuation_word = 0;
+    env->npe_game_ui_init_continuation_pre_sp = 0;
+    env->npe_game_ui_init_continuation_post_sp = 0;
+    env->npe_game_ui_init_continuation_pre_fp = 0;
+    env->npe_game_ui_init_continuation_post_fp = 0;
+    env->npe_game_ui_lifecycle_sequence = 0;
+    env->npe_game_ui_wrapper_8a5c_calls = 0;
+    env->npe_game_ui_wrapper_8a5c_sequence = 0;
+    env->npe_game_ui_wrapper_9140_calls = 0;
+    env->npe_game_ui_wrapper_9140_sequence = 0;
+    env->npe_game_ui_publisher_calls = 0;
+    env->npe_game_ui_publisher_call_sequence = 0;
+    env->npe_game_ui_publisher_returns = 0;
+    env->npe_game_ui_publisher_return_sequence = 0;
+    env->npe_game_ui_wrapper_tail_calls = 0;
+    env->npe_game_ui_wrapper_tail_sequence = 0;
+    env->npe_game_ui_init_call_sequence = 0;
+    env->npe_game_ui_e15a_calls = 0;
+    env->npe_game_ui_e15a_call_sequence = 0;
+    env->npe_game_ui_e15a_returns = 0;
+    env->npe_game_ui_e15a_return_sequence = 0;
+    env->npe_game_ui_e15a_continuation_entries = 0;
+    env->npe_game_ui_e15a_continuation_sequence = 0;
+    env->npe_game_ui_e15a_continuation_from = 0;
+    env->npe_game_ui_6ab8_calls = 0;
+    env->npe_game_ui_6ab8_call_sequence = 0;
+    env->npe_game_ui_6ab8_returns = 0;
+    env->npe_game_ui_6ab8_return_sequence = 0;
+    env->npe_game_ui_6ab8_continuation_entries = 0;
+    env->npe_game_ui_6ab8_continuation_sequence = 0;
+    env->npe_game_ui_6ab8_continuation_from = 0;
+    env->npe_game_ui_5c22_calls = 0;
+    env->npe_game_ui_5c22_call_sequence = 0;
+    env->npe_game_ui_5c22_returns = 0;
+    env->npe_game_ui_5c22_return_sequence = 0;
+    env->npe_game_ui_5c22_continuation_entries = 0;
+    env->npe_game_ui_5c22_continuation_sequence = 0;
+    env->npe_game_ui_5c22_continuation_from = 0;
+    memset(env->npe_game_frame_clear_child_calls, 0,
+           sizeof(env->npe_game_frame_clear_child_calls));
+    memset(env->npe_game_frame_clear_child_targets, 0,
+           sizeof(env->npe_game_frame_clear_child_targets));
+    memset(env->npe_game_frame_clear_child_continuations, 0,
+           sizeof(env->npe_game_frame_clear_child_continuations));
+    memset(env->npe_game_frame_clear_child_continuation_from, 0,
+           sizeof(env->npe_game_frame_clear_child_continuation_from));
+    env->npe_game_transition_service_calls = 0;
+    env->npe_game_transition_service_entries = 0;
+    env->npe_game_transition_service_returns = 0;
+    env->npe_game_transition_service_continuations = 0;
+    env->npe_game_transition_service_continuation_from = 0;
+    env->npe_game_transition_service_child_calls = 0;
+    env->npe_game_transition_service_child_returns = 0;
+    env->npe_game_transition_service_leaf_calls = 0;
+    env->npe_game_transition_service_leaf_returns = 0;
+    /* The transition/resource-gate rings deliberately span this game-trace
+     * re-arm.  Their producer runs during cold boot, before mode 2 is
+     * selected; the architectural CPU reset already zeroes the whole env. */
+    env->npe_game_buffer_sync_calls = 0;
+    env->npe_game_buffer_sync_returns = 0;
+    env->npe_game_state_publish_calls = 0;
+    env->npe_game_state_publish_returns = 0;
+    env->npe_game_service_returns = 0;
+    env->npe_game_service_mode = 0;
+    env->npe_game_service_pointer = 0;
+    env->npe_game_grid_calls = 0;
+    env->npe_game_grid_returns = 0;
+    env->npe_game_initialize_calls = 0;
+    env->npe_game_initialize_returns = 0;
+    env->npe_game_range_calls = 0;
+    env->npe_game_randomize_calls = 0;
+    env->npe_game_compare_calls = 0;
+    env->npe_game_draw_calls = 0;
+    env->npe_game_draw_returns = 0;
+    env->npe_game_draw_item_calls = 0;
+    env->npe_game_state_dispatch_calls = 0;
+    env->npe_game_draw_trace_active = false;
+    env->npe_game_draw_trace_call = 0;
+    env->npe_game_draw_trace_edge_count = 0;
+    env->npe_game_draw_trace_active_child = 0;
+    memset(env->npe_game_draw_child_calls, 0,
+           sizeof(env->npe_game_draw_child_calls));
+    memset(env->npe_game_draw_child_returns, 0,
+           sizeof(env->npe_game_draw_child_returns));
+    memset(env->npe_game_draw_child_target, 0,
+           sizeof(env->npe_game_draw_child_target));
+    memset(env->npe_game_draw_child_return_from, 0,
+           sizeof(env->npe_game_draw_child_return_from));
+    memset(env->npe_game_draw_child_call_sp, 0,
+           sizeof(env->npe_game_draw_child_call_sp));
+    memset(env->npe_game_draw_child_call_fp, 0,
+           sizeof(env->npe_game_draw_child_call_fp));
+    memset(env->npe_game_draw_child_return_sp, 0,
+           sizeof(env->npe_game_draw_child_return_sp));
+    memset(env->npe_game_draw_child_return_fp, 0,
+           sizeof(env->npe_game_draw_child_return_fp));
+    memset(env->npe_game_draw_trace_from, 0,
+           sizeof(env->npe_game_draw_trace_from));
+    memset(env->npe_game_draw_trace_target, 0,
+           sizeof(env->npe_game_draw_trace_target));
+    memset(env->npe_game_draw_trace_word, 0,
+           sizeof(env->npe_game_draw_trace_word));
+    memset(env->npe_game_draw_trace_sp, 0,
+           sizeof(env->npe_game_draw_trace_sp));
+    memset(env->npe_game_draw_trace_fp, 0,
+           sizeof(env->npe_game_draw_trace_fp));
+    memset(env->npe_game_draw_trace_r0, 0,
+           sizeof(env->npe_game_draw_trace_r0));
+    memset(env->npe_game_draw_trace_r1, 0,
+           sizeof(env->npe_game_draw_trace_r1));
+    memset(env->npe_game_draw_trace_child, 0,
+           sizeof(env->npe_game_draw_trace_child));
+    env->npe_game_state_writes = 0;
+    env->npe_game_state_changing_writes = 0;
+    env->npe_game_state_nonzero_writes = 0;
+    env->npe_game_state_first_write_valid = false;
+    env->npe_game_state_first_nonzero_valid = false;
+    env->npe_game_state_first_write_pc = 0;
+    env->npe_game_state_first_write_address = 0;
+    env->npe_game_state_first_write_logical = 0;
+    env->npe_game_state_first_write_old = 0;
+    env->npe_game_state_first_write_new = 0;
+    env->npe_game_state_first_write_sp = 0;
+    env->npe_game_state_first_write_fp = 0;
+    env->npe_game_state_first_write_ds0 = 0;
+    env->npe_game_state_first_write_ds1 = 0;
+    env->npe_game_state_first_write_bits = 0;
+    env->npe_game_state_first_nonzero_pc = 0;
+    env->npe_game_state_first_nonzero_address = 0;
+    env->npe_game_state_first_nonzero_logical = 0;
+    env->npe_game_state_first_nonzero_old = 0;
+    env->npe_game_state_first_nonzero_new = 0;
+    env->npe_game_state_first_nonzero_sp = 0;
+    env->npe_game_state_first_nonzero_fp = 0;
+    env->npe_game_state_first_nonzero_ds0 = 0;
+    env->npe_game_state_first_nonzero_ds1 = 0;
+    env->npe_game_state_first_nonzero_bits = 0;
+    env->npe_game_state_last_write_pc = 0;
+    env->npe_game_state_last_write_address = 0;
+    env->npe_game_state_last_write_logical = 0;
+    env->npe_game_state_last_write_old = 0;
+    env->npe_game_state_last_write_new = 0;
+    env->npe_game_state_last_write_sp = 0;
+    env->npe_game_state_last_write_fp = 0;
+    env->npe_game_state_last_write_ds0 = 0;
+    env->npe_game_state_last_write_ds1 = 0;
+    env->npe_game_state_last_write_bits = 0;
+    env->npe_game_callback_entries = 0;
+    env->npe_game_callback_state_zero_paths = 0;
+    env->npe_game_callback_state_one_paths = 0;
+    env->npe_game_callback_state_other_paths = 0;
+    env->npe_game_callback_state = 0;
+    env->npe_game_branch_trace_count = 0;
+    memset(env->npe_game_branch_state, 0,
+           sizeof(env->npe_game_branch_state));
+    memset(env->npe_game_branch_index, 0,
+           sizeof(env->npe_game_branch_index));
+    memset(env->npe_game_branch_live, 0,
+           sizeof(env->npe_game_branch_live));
+    memset(env->npe_game_branch_fp, 0,
+           sizeof(env->npe_game_branch_fp));
+    memset(env->npe_game_branch_mode, 0,
+           sizeof(env->npe_game_branch_mode));
+    memset(env->npe_game_branch_grid, 0,
+           sizeof(env->npe_game_branch_grid));
+    env->npe_game_data_trace_count = 0;
+    memset(env->npe_game_data_trace_pc, 0,
+           sizeof(env->npe_game_data_trace_pc));
+    memset(env->npe_game_data_trace_physical, 0,
+           sizeof(env->npe_game_data_trace_physical));
+    memset(env->npe_game_data_trace_logical, 0,
+           sizeof(env->npe_game_data_trace_logical));
+    memset(env->npe_game_data_trace_value, 0,
+           sizeof(env->npe_game_data_trace_value));
+    memset(env->npe_game_data_trace_ds0, 0,
+           sizeof(env->npe_game_data_trace_ds0));
+    memset(env->npe_game_data_trace_ds1, 0,
+           sizeof(env->npe_game_data_trace_ds1));
+    memset(env->npe_game_data_trace_bits, 0,
+           sizeof(env->npe_game_data_trace_bits));
+    env->npe_game_data_write_trace_count = 0;
+    memset(env->npe_game_data_write_trace_pc, 0,
+           sizeof(env->npe_game_data_write_trace_pc));
+    memset(env->npe_game_data_write_trace_physical, 0,
+           sizeof(env->npe_game_data_write_trace_physical));
+    memset(env->npe_game_data_write_trace_logical, 0,
+           sizeof(env->npe_game_data_write_trace_logical));
+    memset(env->npe_game_data_write_trace_pre, 0,
+           sizeof(env->npe_game_data_write_trace_pre));
+    memset(env->npe_game_data_write_trace_new, 0,
+           sizeof(env->npe_game_data_write_trace_new));
+    memset(env->npe_game_data_write_trace_post, 0,
+           sizeof(env->npe_game_data_write_trace_post));
+    memset(env->npe_game_data_write_trace_sp, 0,
+           sizeof(env->npe_game_data_write_trace_sp));
+    memset(env->npe_game_data_write_trace_fp, 0,
+           sizeof(env->npe_game_data_write_trace_fp));
+    memset(env->npe_game_data_write_trace_ds0, 0,
+           sizeof(env->npe_game_data_write_trace_ds0));
+    memset(env->npe_game_data_write_trace_ds1, 0,
+           sizeof(env->npe_game_data_write_trace_ds1));
+    memset(env->npe_game_data_write_trace_bits, 0,
+           sizeof(env->npe_game_data_write_trace_bits));
+    env->npe_game_frame_valid = 0;
+    memset(env->npe_game_frame_back_hash, 0,
+           sizeof(env->npe_game_frame_back_hash));
+    memset(env->npe_game_frame_front_hash, 0,
+           sizeof(env->npe_game_frame_front_hash));
+    memset(env->npe_game_frame_back_nonzero, 0,
+           sizeof(env->npe_game_frame_back_nonzero));
+    memset(env->npe_game_frame_front_nonzero, 0,
+           sizeof(env->npe_game_frame_front_nonzero));
+    memset(env->npe_game_frame_pointer, 0,
+           sizeof(env->npe_game_frame_pointer));
+    memset(env->npe_game_frame_mode, 0,
+           sizeof(env->npe_game_frame_mode));
+    env->npe_game_table_loader_active = false;
+    env->npe_game_table_loader_calls = 0;
+    env->npe_game_table_loader_returns = 0;
+    env->npe_game_table_loader_argument = 0;
+    env->npe_game_table_loader_entry_sp = 0;
+    env->npe_game_table_loader_entry_fp = 0;
+    env->npe_game_table_loader_return_r0 = 0;
+    env->npe_game_table_loader_return_r1 = 0;
+    env->npe_game_table_loader_last_pc = 0;
+    env->npe_game_table_loader_last_target = 0;
+    env->npe_game_table_loader_last_word = 0;
+    env->npe_game_table_loader_last_sp = 0;
+    env->npe_game_table_loader_last_fp = 0;
+    env->npe_game_table_loader_edge_count = 0;
+    memset(env->npe_game_table_loader_edge_from, 0,
+           sizeof(env->npe_game_table_loader_edge_from));
+    memset(env->npe_game_table_loader_edge_to, 0,
+           sizeof(env->npe_game_table_loader_edge_to));
+    memset(env->npe_game_table_loader_edge_word, 0,
+           sizeof(env->npe_game_table_loader_edge_word));
+    memset(env->npe_game_table_loader_edge_sp, 0,
+           sizeof(env->npe_game_table_loader_edge_sp));
+    memset(env->npe_game_table_loader_edge_fp, 0,
+           sizeof(env->npe_game_table_loader_edge_fp));
+    env->npe_game_table_resolver_active = false;
+    env->npe_game_table_resolver_calls = 0;
+    env->npe_game_table_resolver_returns = 0;
+    env->npe_game_table_resolver_from = 0;
+    env->npe_game_table_resolver_expected_return = 0;
+    memset(env->npe_game_table_resolver_args, 0,
+           sizeof(env->npe_game_table_resolver_args));
+    env->npe_game_table_resolver_result_r0 = 0;
+    env->npe_game_table_resolver_result_r1 = 0;
+    env->npe_game_table_resolver_error = 0;
+    env->npe_game_table_resolver_current_slot = 0;
+    memset(env->npe_game_table_resolver_from_trace, 0,
+           sizeof(env->npe_game_table_resolver_from_trace));
+    memset(env->npe_game_table_resolver_stream_trace, 0,
+           sizeof(env->npe_game_table_resolver_stream_trace));
+    memset(env->npe_game_table_resolver_offset_trace, 0,
+           sizeof(env->npe_game_table_resolver_offset_trace));
+    memset(env->npe_game_table_resolver_position_before_trace, 0,
+           sizeof(env->npe_game_table_resolver_position_before_trace));
+    memset(env->npe_game_table_resolver_position_after_trace, 0,
+           sizeof(env->npe_game_table_resolver_position_after_trace));
+    memset(env->npe_game_table_resolver_whence_trace, 0,
+           sizeof(env->npe_game_table_resolver_whence_trace));
+    memset(env->npe_game_table_resolver_result_r0_trace, 0,
+           sizeof(env->npe_game_table_resolver_result_r0_trace));
+    memset(env->npe_game_table_resolver_result_r1_trace, 0,
+           sizeof(env->npe_game_table_resolver_result_r1_trace));
+    memset(env->npe_game_table_resolver_error_trace, 0,
+           sizeof(env->npe_game_table_resolver_error_trace));
+    env->npe_game_table_io_active = false;
+    env->npe_game_table_io_calls = 0;
+    env->npe_game_table_io_returns = 0;
+    env->npe_game_table_io_methods = 0;
+    env->npe_game_table_io_method_returns = 0;
+    env->npe_game_table_io_table_calls = 0;
+    env->npe_game_table_io_current_slot = 0;
+    env->npe_game_table_io_write_base = 0;
+    memset(env->npe_game_table_io_from, 0,
+           sizeof(env->npe_game_table_io_from));
+    memset(env->npe_game_table_io_stream, 0,
+           sizeof(env->npe_game_table_io_stream));
+    memset(env->npe_game_table_io_destination, 0,
+           sizeof(env->npe_game_table_io_destination));
+    memset(env->npe_game_table_io_position_before, 0,
+           sizeof(env->npe_game_table_io_position_before));
+    memset(env->npe_game_table_io_position_after, 0,
+           sizeof(env->npe_game_table_io_position_after));
+    memset(env->npe_game_table_io_length, 0,
+           sizeof(env->npe_game_table_io_length));
+    memset(env->npe_game_table_io_method, 0,
+           sizeof(env->npe_game_table_io_method));
+    memset(env->npe_game_table_io_result_r0, 0,
+           sizeof(env->npe_game_table_io_result_r0));
+    memset(env->npe_game_table_io_result_r1, 0,
+           sizeof(env->npe_game_table_io_result_r1));
+    memset(env->npe_game_table_io_error, 0,
+           sizeof(env->npe_game_table_io_error));
+    memset(env->npe_game_table_io_writes, 0,
+           sizeof(env->npe_game_table_io_writes));
+    env->npe_game_high_stream_io_active = false;
+    env->npe_game_high_stream_io_calls = 0;
+    env->npe_game_high_stream_io_returns = 0;
+    env->npe_game_high_stream_io_current_slot = 0;
+    memset(env->npe_game_high_stream_io_from, 0,
+           sizeof(env->npe_game_high_stream_io_from));
+    memset(env->npe_game_high_stream_io_destination, 0,
+           sizeof(env->npe_game_high_stream_io_destination));
+    memset(env->npe_game_high_stream_io_position_before, 0,
+           sizeof(env->npe_game_high_stream_io_position_before));
+    memset(env->npe_game_high_stream_io_position_after, 0,
+           sizeof(env->npe_game_high_stream_io_position_after));
+    memset(env->npe_game_high_stream_io_length, 0,
+           sizeof(env->npe_game_high_stream_io_length));
+    memset(env->npe_game_high_stream_io_result_r0, 0,
+           sizeof(env->npe_game_high_stream_io_result_r0));
+    memset(env->npe_game_high_stream_io_result_r1, 0,
+           sizeof(env->npe_game_high_stream_io_result_r1));
+    memset(env->npe_game_high_stream_io_error, 0,
+           sizeof(env->npe_game_high_stream_io_error));
+    env->npe_transition_leaf_calls = 0;
+    env->npe_transition_leaf_returns = 0;
+    env->npe_transition_leaf_low_dispatch_calls = 0;
+    env->npe_transition_leaf_high_dispatch_calls = 0;
+    memset(env->npe_transition_leaf_from, 0,
+           sizeof(env->npe_transition_leaf_from));
+    memset(env->npe_transition_leaf_sp, 0,
+           sizeof(env->npe_transition_leaf_sp));
+    memset(env->npe_transition_leaf_state, 0,
+           sizeof(env->npe_transition_leaf_state));
+    memset(env->npe_transition_leaf_format, 0,
+           sizeof(env->npe_transition_leaf_format));
+    memset(env->npe_transition_leaf_args, 0,
+           sizeof(env->npe_transition_leaf_args));
+    memset(env->npe_transition_leaf_branch, 0,
+           sizeof(env->npe_transition_leaf_branch));
+    memset(env->npe_transition_leaf_result, 0,
+           sizeof(env->npe_transition_leaf_result));
+    env->npe_game_stream_position_min = UINT32_MAX;
+    env->npe_game_stream_position_max = 0;
+    env->npe_game_stream_position_returns = 0;
+    env->npe_game_stream_position_changed = 0;
+    env->npe_game_stream_position_reverse = 0;
+    env->npe_game_stream_pages_touched = 0;
+    env->npe_game_stream_requested_bytes = 0;
+    env->npe_game_stream_advanced_bytes = 0;
+    memset(env->npe_game_stream_page_calls, 0,
+           sizeof(env->npe_game_stream_page_calls));
+    env->npe_game_grid_count_io_active = false;
+    env->npe_game_grid_count_io_calls = 0;
+    env->npe_game_grid_count_io_returns = 0;
+    env->npe_game_grid_count_io_stream = 0;
+    env->npe_game_grid_count_io_destination = 0;
+    env->npe_game_grid_count_io_position = 0;
+    env->npe_game_grid_count_io_cache_position = 0;
+    env->npe_game_grid_count_io_length = 0;
+    env->npe_game_grid_count_io_value = 0;
+    env->npe_game_table_copy_count = 0;
+    memset(env->npe_game_table_copy_from, 0,
+           sizeof(env->npe_game_table_copy_from));
+    memset(env->npe_game_table_copy_destination, 0,
+           sizeof(env->npe_game_table_copy_destination));
+    memset(env->npe_game_table_copy_source, 0,
+           sizeof(env->npe_game_table_copy_source));
+    memset(env->npe_game_table_copy_length, 0,
+           sizeof(env->npe_game_table_copy_length));
+    memset(env->npe_game_table_copy_stream_position, 0,
+           sizeof(env->npe_game_table_copy_stream_position));
+    memset(env->npe_game_table_copy_cache_position, 0,
+           sizeof(env->npe_game_table_copy_cache_position));
+    memset(env->npe_game_table_copy_sample, 0,
+           sizeof(env->npe_game_table_copy_sample));
+    env->npe_game_grid_write_count = 0;
+    memset(env->npe_game_grid_write_pc, 0,
+           sizeof(env->npe_game_grid_write_pc));
+    memset(env->npe_game_grid_write_address, 0,
+           sizeof(env->npe_game_grid_write_address));
+    memset(env->npe_game_grid_write_old, 0,
+           sizeof(env->npe_game_grid_write_old));
+    memset(env->npe_game_grid_write_new, 0,
+           sizeof(env->npe_game_grid_write_new));
+    memset(env->npe_game_grid_write_bits, 0,
+           sizeof(env->npe_game_grid_write_bits));
+    env->npe_game_table_writes = 0;
+    env->npe_game_table_changing_writes = 0;
+    env->npe_game_table_nonzero_writes = 0;
+    env->npe_game_table_first_write_valid = false;
+    env->npe_game_table_first_nonzero_valid = false;
+    env->npe_game_table_first_write_pc = 0;
+    env->npe_game_table_first_write_address = 0;
+    env->npe_game_table_first_write_old = 0;
+    env->npe_game_table_first_write_new = 0;
+    env->npe_game_table_first_write_bits = 0;
+    env->npe_game_table_first_nonzero_pc = 0;
+    env->npe_game_table_first_nonzero_address = 0;
+    env->npe_game_table_first_nonzero_old = 0;
+    env->npe_game_table_first_nonzero_new = 0;
+    env->npe_game_table_first_nonzero_bits = 0;
+    env->npe_game_table_last_write_pc = 0;
+    env->npe_game_table_last_write_address = 0;
+    env->npe_game_table_last_write_old = 0;
+    env->npe_game_table_last_write_new = 0;
+    env->npe_game_table_last_write_bits = 0;
+}
+
+static void snapshot_npe_game_frame(CPUDMCUState *env, unsigned stage)
+{
+    static const uint32_t bases[2] = { 0x00500000u, 0x00503840u };
+    uint32_t hash[2] = { 2166136261u, 2166136261u };
+    uint16_t nonzero[2] = { 0, 0 };
+    unsigned buffer;
+    unsigned offset;
+
+    if (stage >= DMCU_NPE_GAME_FRAME_STAGES ||
+        (env->npe_game_frame_valid & (1u << stage))) {
+        return;
+    }
+    /* Both native pages are 240x120 packed 4-bit pixels (0x3840 bytes).
+     * Hash physical bytes exactly as the LCD flush consumes them. */
+    for (buffer = 0; buffer < ARRAY_SIZE(bases); buffer++) {
+        for (offset = 0; offset < DMCU_NATIVE_FRAMEBUFFER_BYTES; offset++) {
+            uint8_t value = address_space_ldub(
+                &address_space_memory, bases[buffer] + offset,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+
+            hash[buffer] = (hash[buffer] ^ value) * 16777619u;
+            nonzero[buffer] += value != 0;
+        }
+    }
+    env->npe_game_frame_back_hash[stage] = hash[0];
+    env->npe_game_frame_front_hash[stage] = hash[1];
+    env->npe_game_frame_back_nonzero[stage] = nonzero[0];
+    env->npe_game_frame_front_nonzero[stage] = nonzero[1];
+    env->npe_game_frame_pointer[stage] =
+        ((uint32_t)internal_data_read(0x04fcu, 16) << 16) |
+        internal_data_read(0x04feu, 16);
+    env->npe_game_frame_mode[stage] = address_space_lduw_le(
+        &address_space_memory, 0x527934u,
+        MEMTXATTRS_UNSPECIFIED, NULL);
+    env->npe_game_frame_valid |= 1u << stage;
+}
+
+enum {
+    CLOCK_RESOURCE_RELEASE_PRE_8B26,
+    CLOCK_RESOURCE_RELEASE_CALL_8B26,
+    CLOCK_RESOURCE_RELEASE_ENTRY_8B26,
+    CLOCK_RESOURCE_RELEASE_RETURN_8B26,
+    CLOCK_RESOURCE_RELEASE_CALL_3A56,
+    CLOCK_RESOURCE_RELEASE_ENTRY_3A56,
+    CLOCK_RESOURCE_RELEASE_RETURN_3A56,
+    CLOCK_RESOURCE_RELEASE_EXIT,
+};
+
+static uint16_t clock_resource_release_bitmap(uint16_t handle,
+                                              uint16_t *mask, bool *valid)
+{
+    uint32_t address;
+
+    *valid = handle <= 0x00ffu;
+    if (!*valid) {
+        *mask = 0;
+        return 0xffffu;
+    }
+    address = 0x005127eau + ((uint32_t)handle >> 4) * 2u;
+    *mask = 0x8000u >> (handle & 15u);
+    return address_space_lduw_le(&address_space_memory, address,
+                                 MEMTXATTRS_UNSPECIFIED, NULL);
+}
+
+/* Snapshot one boundary in the exact footer/clock resource handle lifetime.
+ * The list walk is capped even if a damaged next pointer forms a cycle.  It
+ * reads the physical 51:4A40 object chain and 51:27EA allocation bitmap only;
+ * it never clears a bit, unlinks a node, or changes any other guest state. */
+static void snapshot_clock_resource_release(CPUDMCUState *env,
+                                            unsigned stage,
+                                            uint32_t pc, uint32_t target,
+                                            uint16_t word, uint16_t ext,
+                                            uint16_t pre_sp, uint16_t pre_fp,
+                                            uint16_t post_sp, uint16_t post_fp,
+                                            bool argument_valid,
+                                            uint16_t argument)
+{
+    uint32_t active = env->clock_resource_release_active;
+    uint32_t slot;
+    uint16_t resource_fp;
+    uint16_t handle;
+    uint16_t lookup;
+    uint32_t node = 0x00514a40u;
+    uint32_t first_match = 0xffffffffu;
+    uint32_t first_next = 0xffffffffu;
+    uint16_t first_word = 0xffffu;
+    uint16_t first_key = 0xffffu;
+    uint16_t matches = 0;
+    uint16_t bitmap_mask;
+    uint16_t bitmap_word;
+    bool bitmap_valid;
+    unsigned depth;
+
+    if (!active || active > DMCU_CLOCK_RESOURCE_RELEASE_TRACE_SLOTS ||
+        stage >= DMCU_CLOCK_RESOURCE_RELEASE_STAGES) {
+        return;
+    }
+    slot = active - 1u;
+    resource_fp = env->clock_resource_release_resource_fp[slot];
+    handle = resource_fp ?
+        internal_data_read((resource_fp - 6u) & MASK16, 16) : 0xffffu;
+    lookup = argument_valid ? argument : handle;
+
+    for (depth = 0; depth < 256u && node; depth++) {
+        uint16_t node_word = address_space_lduw_le(
+            &address_space_memory, node & MASK24,
+            MEMTXATTRS_UNSPECIFIED, NULL);
+        uint16_t next_hi = address_space_lduw_le(
+            &address_space_memory, (node + 2u) & MASK24,
+            MEMTXATTRS_UNSPECIFIED, NULL);
+        uint16_t next_lo = address_space_lduw_le(
+            &address_space_memory, (node + 4u) & MASK24,
+            MEMTXATTRS_UNSPECIFIED, NULL);
+        uint16_t key = node_word & 0x3fffu;
+        uint32_t next_node = (((uint32_t)next_hi & 0xffu) << 16) | next_lo;
+
+        if (key == lookup) {
+            if (!matches) {
+                first_match = node & MASK24;
+                first_next = next_node & MASK24;
+                first_word = node_word;
+                first_key = key;
+            }
+            matches++;
+        }
+        if (!next_node || next_node == node) {
+            break;
+        }
+        node = next_node & MASK24;
+    }
+
+    bitmap_word = clock_resource_release_bitmap(
+        lookup, &bitmap_mask, &bitmap_valid);
+    env->clock_resource_release_stage_valid[slot] |= 1u << stage;
+    env->clock_resource_release_stage_pc[slot][stage] = pc & MASK24;
+    env->clock_resource_release_stage_target[slot][stage] = target & MASK24;
+    env->clock_resource_release_stage_word[slot][stage] = word;
+    env->clock_resource_release_stage_ext[slot][stage] = ext;
+    env->clock_resource_release_stage_pre_sp[slot][stage] = pre_sp;
+    env->clock_resource_release_stage_post_sp[slot][stage] = post_sp;
+    env->clock_resource_release_stage_pre_fp[slot][stage] = pre_fp;
+    env->clock_resource_release_stage_post_fp[slot][stage] = post_fp;
+    env->clock_resource_release_stage_handle[slot][stage] = handle;
+    env->clock_resource_release_stage_argument[slot][stage] = argument;
+    env->clock_resource_release_stage_node[slot][stage] = first_match;
+    env->clock_resource_release_stage_next[slot][stage] = first_next;
+    env->clock_resource_release_stage_node_word[slot][stage] = first_word;
+    env->clock_resource_release_stage_node_key[slot][stage] = first_key;
+    env->clock_resource_release_stage_node_matches[slot][stage] = matches;
+    env->clock_resource_release_stage_bitmap_word[slot][stage] = bitmap_word;
+    env->clock_resource_release_stage_bitmap_mask[slot][stage] = bitmap_mask;
+    env->clock_resource_release_stage_interrupts[slot][stage] =
+        env->interrupt_entries;
+    if (argument_valid) {
+        env->clock_resource_release_stage_argument_valid[slot] |= 1u << stage;
+    }
+    if (bitmap_valid) {
+        env->clock_resource_release_stage_bitmap_valid[slot] |= 1u << stage;
+        if (bitmap_word & bitmap_mask) {
+            env->clock_resource_release_stage_bitmap_set[slot] |= 1u << stage;
+        }
+    }
+    if (env->in_interrupt) {
+        env->clock_resource_release_stage_in_irq[slot] |= 1u << stage;
+    }
+}
+
+static void snapshot_npe_resource_return_stage(CPUDMCUState *env,
+                                               unsigned stage,
+                                               uint32_t pc,
+                                               uint32_t target,
+                                               uint16_t word,
+                                               uint16_t pre_sp,
+                                               uint16_t pre_fp)
+{
+    uint32_t active = env->npe_resource_return_active_slot;
+    uint32_t slot;
+    uint16_t base;
+
+    if (!active || active > DMCU_NPE_RESOURCE_RETURN_TRACE_SLOTS ||
+        stage >= DMCU_NPE_RESOURCE_RETURN_TRACE_STAGES) {
+        return;
+    }
+    slot = active - 1u;
+    base = env->npe_resource_return_frame_base[slot];
+    env->npe_resource_return_stage_valid[slot] |= 1u << stage;
+    env->npe_resource_return_stage_pc[slot][stage] = pc & MASK24;
+    env->npe_resource_return_stage_target[slot][stage] = target & MASK24;
+    env->npe_resource_return_stage_word[slot][stage] = word;
+    env->npe_resource_return_stage_sp[slot][stage] = pre_sp;
+    env->npe_resource_return_stage_post_sp[slot][stage] =
+        env->gpr[DMCU_SP] & MASK16;
+    env->npe_resource_return_stage_fp[slot][stage] = pre_fp;
+    env->npe_resource_return_stage_frame[slot][stage][0] =
+        internal_data_read(base, 16);
+    env->npe_resource_return_stage_frame[slot][stage][1] =
+        internal_data_read((base + 2u) & MASK16, 16);
+    env->npe_resource_return_final_frame[slot][0] =
+        env->npe_resource_return_stage_frame[slot][stage][0];
+    env->npe_resource_return_final_frame[slot][1] =
+        env->npe_resource_return_stage_frame[slot][stage][1];
+}
+
 /* Observer-only watch for the low word of the root controller's saved object
  * pointer.  The watch is armed after 1D:F30A has initialized the local, so the
  * first later change names the writer which turns a valid menu object into a
@@ -247,11 +970,11 @@ static inline void trace_root_object_slot_write(CPUDMCUState *env,
     env->root_object_slot_first_bad_in_irq = env->in_interrupt;
 }
 
-/* Observer-only provenance for the root menu object's leading descriptor.
- * The exact controller later receives 51:4A46 and reads the child count at
- * +8.  Retain every value-changing external write through +0x0F so the
- * constructor and its source registers can be identified without changing
- * guest memory or supplying a synthetic descriptor. */
+/* Observer-only provenance for the first root-registry node and its leading
+ * object descriptor.  The selector reads the node key at 51:4A40 and returns
+ * object 51:4A46.  Retain every value-changing external write through object
+ * offset +0x0F so transient lookup-key damage and descriptor construction can
+ * be attributed without changing guest memory or supplying synthetic state. */
 static inline void trace_root_object_data_write(CPUDMCUState *env,
                                                 uint32_t physical,
                                                 uint32_t logical,
@@ -260,8 +983,8 @@ static inline void trace_root_object_data_write(CPUDMCUState *env,
                                                 int bits,
                                                 uint32_t pc)
 {
-    const uint32_t base = 0x514a46u;
-    const uint32_t end = base + 0x10u;
+    const uint32_t base = 0x514a40u;
+    const uint32_t end = 0x514a56u;
     uint32_t width = bits / 8u;
     uint32_t sequence;
     uint32_t slot;
@@ -394,6 +1117,371 @@ static void trace_operation_object_write(CPUDMCUState *env,
         old_value & width_mask(bits), value & width_mask(bits), bits,
         env->gpr[DMCU_SP] & MASK16, env->gpr[DMCU_FP] & MASK16);
     operation_object_watch_writes++;
+}
+
+/* Retain every guest store which overlaps the Start callback's caller-owned
+ * 0x28-byte object.  Both internal-SRAM and translated-data stores pass
+ * through here before the real write, so this is observer-only and also
+ * exposes an accidental bus/alias change. */
+static inline void trace_start_object_write(CPUDMCUState *env,
+                                             uint32_t address,
+                                             uint32_t old_value,
+                                            uint32_t new_value,
+                                            int bits, uint8_t bus)
+{
+    uint32_t base = env->start_object_watch_base & MASK16;
+    uint32_t width = bits / 8u;
+    uint64_t sequence;
+    uint32_t slot;
+
+    if (!env->start_object_watch_active || address >= 0x10000u ||
+        address >= base + 0x28u || address + width <= base) {
+        return;
+    }
+
+    sequence = env->start_object_write_count++;
+    slot = sequence % DMCU_START_OBJECT_WRITE_TRACE_SLOTS;
+    env->start_object_write_pc[slot] =
+        env->current_instruction_pc & MASK24;
+    env->start_object_write_address[slot] = address & MASK16;
+    env->start_object_write_old[slot] = old_value & width_mask(bits);
+    env->start_object_write_new[slot] = new_value & width_mask(bits);
+    env->start_object_write_sp[slot] = env->gpr[DMCU_SP] & MASK16;
+    env->start_object_write_fp[slot] = env->gpr[DMCU_FP] & MASK16;
+    env->start_object_write_bits[slot] = bits;
+    env->start_object_write_bus[slot] = bus;
+    env->start_object_write_in_irq[slot] = env->in_interrupt;
+}
+
+static inline void snapshot_npe_render_object(CPUDMCUState *env,
+                                               uint8_t *snapshot)
+{
+    uint16_t base = env->npe_render_object_base & MASK16;
+    unsigned index;
+
+    for (index = 0; index < DMCU_NPE_RENDER_OBJECT_BYTES; index++) {
+        snapshot[index] = internal_data_read(
+            (base + index) & MASK16, 8) & 0xffu;
+    }
+}
+
+/* Read the two far callback fields installed by 18:CFA8.  Segment zero is
+ * the DMCU's internal SRAM and must not be mistaken for external physical
+ * page zero; non-zero far pointers use the ordinary translated data space.
+ * This helper observes memory only. */
+static inline void snapshot_npe_operation_callbacks(
+    uint16_t object_hi, uint16_t object_lo, uint16_t *snapshot)
+{
+    static const uint16_t offsets[4] = { 0x1eu, 0x20u, 0x22u, 0x24u };
+    unsigned index;
+
+    for (index = 0; index < ARRAY_SIZE(offsets); index++) {
+        uint32_t address = (((uint32_t)object_hi << 16) | object_lo) +
+                           offsets[index];
+
+        snapshot[index] = object_hi == 0 ?
+            internal_data_read(address & MASK16, 16) :
+            address_space_lduw_le(&address_space_memory, address & MASK24,
+                                  MEMTXATTRS_UNSPECIFIED, NULL);
+    }
+}
+
+/* Snapshot the complete 0x40-byte header passed by the NewJourney movement
+ * path to the resident renderer.  A zero segment is internal SRAM; other
+ * valid 24-bit far pointers use the translated data address space. */
+static inline bool snapshot_npe_game_render_object(
+    uint16_t object_hi, uint16_t object_lo, uint16_t *snapshot)
+{
+    uint32_t object;
+    unsigned index;
+
+    memset(snapshot, 0xff,
+           DMCU_NPE_GAME_RENDER_OBJECT_WORDS * sizeof(snapshot[0]));
+    if (object_hi & 0xff00u) {
+        return false;
+    }
+
+    object = ((uint32_t)(object_hi & 0xffu) << 16) | object_lo;
+    for (index = 0; index < DMCU_NPE_GAME_RENDER_OBJECT_WORDS; index++) {
+        uint32_t address = (object + index * 2u) & MASK24;
+
+        snapshot[index] = object_hi == 0 ?
+            internal_data_read(address & MASK16, 16) :
+            address_space_lduw_le(&address_space_memory, address,
+                                  MEMTXATTRS_UNSPECIFIED, NULL);
+    }
+    return true;
+}
+
+/* Snapshot the five fields which bracket the exact 1F:5BFA result and its
+ * consumers in 1C:D462.  Offsets 08/10/12 are local object state; 54/56 are
+ * the far record pointer used by the immediately following type check. */
+static inline void snapshot_npe_object_mask_fields(
+    uint16_t object_hi, uint16_t object_lo, uint16_t *snapshot)
+{
+    static const uint16_t offsets[
+        DMCU_NPE_OBJECT_MASK_SNAPSHOT_WORDS] = {
+        0x08u, 0x10u, 0x12u, 0x54u, 0x56u,
+    };
+    unsigned index;
+
+    for (index = 0; index < ARRAY_SIZE(offsets); index++) {
+        uint32_t address = (((uint32_t)object_hi << 16) | object_lo) +
+                           offsets[index];
+
+        snapshot[index] = object_hi == 0 ?
+            internal_data_read(address & MASK16, 16) :
+            address_space_lduw_le(&address_space_memory, address & MASK24,
+                                  MEMTXATTRS_UNSPECIFIED, NULL);
+    }
+}
+
+/* Retain every internal/translated store which overlaps the exact local
+ * object passed by 1B:2732 to 21:CEF4.  The caller supplies the value already
+ * present before the real store, so this observer neither reorders nor
+ * changes guest-visible memory. */
+static inline void trace_npe_render_object_write(CPUDMCUState *env,
+                                                  uint32_t address,
+                                                  uint32_t old_value,
+                                                  uint32_t new_value,
+                                                  int bits, uint8_t bus)
+{
+    uint32_t base = env->npe_render_object_base & MASK16;
+    uint32_t width = bits / 8u;
+    uint64_t event;
+    uint32_t slot;
+
+    if (!env->npe_render_object_watch_active || address >= 0x10000u ||
+        address >= base + DMCU_NPE_RENDER_OBJECT_BYTES ||
+        address + width <= base) {
+        return;
+    }
+
+    event = env->npe_render_object_write_sequence++;
+    slot = event % DMCU_NPE_RENDER_OBJECT_WRITE_TRACE_SLOTS;
+    env->npe_render_object_write_event[slot] = event;
+    env->npe_render_object_write_pc[slot] =
+        env->current_instruction_pc & MASK24;
+    env->npe_render_object_write_address[slot] = address & MASK16;
+    env->npe_render_object_write_old[slot] =
+        old_value & width_mask(bits);
+    env->npe_render_object_write_new[slot] =
+        new_value & width_mask(bits);
+    env->npe_render_object_write_sp[slot] =
+        env->gpr[DMCU_SP] & MASK16;
+    env->npe_render_object_write_fp[slot] =
+        env->gpr[DMCU_FP] & MASK16;
+    env->npe_render_object_write_bits[slot] = bits;
+    env->npe_render_object_write_bus[slot] = bus;
+    env->npe_render_object_write_in_interrupt[slot] = env->in_interrupt;
+}
+
+static inline void snapshot_npe_materialize_far_bytes(uint16_t object_hi,
+                                                       uint16_t object_lo,
+                                                       uint8_t *snapshot,
+                                                       size_t size)
+{
+    size_t index;
+
+    for (index = 0; index < size; index++) {
+        uint32_t address = (((uint32_t)object_hi << 16) | object_lo) + index;
+
+        snapshot[index] = object_hi == 0 ?
+            internal_data_read(address & MASK16, 8) & 0xffu :
+            address_space_ldub(&address_space_memory,
+                               (address & MASK24) ^ 1u,
+                               MEMTXATTRS_UNSPECIFIED, NULL);
+    }
+}
+
+static inline void snapshot_npe_materialize_near_bytes(uint16_t base,
+                                                        uint8_t *snapshot,
+                                                        size_t size)
+{
+    size_t index;
+
+    for (index = 0; index < size; index++) {
+        snapshot[index] = internal_data_read((base + index) & MASK16, 8) &
+                          0xffu;
+    }
+}
+
+/* Preserve the first operation-1 traversal of exact 29:9746.  Every value is
+ * sampled at an existing call/return boundary; this helper never changes a
+ * register, stack word, directory record, or item count. */
+static inline void trace_npe_materialize_stage(CPUDMCUState *env,
+                                                uint8_t stage,
+                                                uint32_t from,
+                                                uint32_t target,
+                                                uint16_t sp,
+                                                uint16_t fp)
+{
+    uint32_t event = env->npe_materialize_trace_count++;
+
+    if (event >= DMCU_NPE_MATERIALIZE_TRACE_SLOTS) {
+        return;
+    }
+
+    env->npe_materialize_trace_stage[event] = stage;
+    env->npe_materialize_trace_from[event] = from & MASK24;
+    env->npe_materialize_trace_target[event] = target & MASK24;
+    env->npe_materialize_trace_sp[event] = sp & MASK16;
+    env->npe_materialize_trace_fp[event] = fp & MASK16;
+    env->npe_materialize_trace_r0[event] = env->gpr[0] & MASK16;
+    env->npe_materialize_trace_r1[event] = env->gpr[1] & MASK16;
+
+    if (env->npe_materialize_frame_fp) {
+        uint16_t frame = env->npe_materialize_frame_fp;
+
+        env->npe_materialize_trace_first_status[event] =
+            internal_data_read((frame + 0xfff8u) & MASK16, 16);
+        env->npe_materialize_trace_next_status[event] =
+            internal_data_read((frame + 0xfffau) & MASK16, 16);
+        env->npe_materialize_trace_accumulator_hi[event] =
+            internal_data_read((frame + 0xfed8u) & MASK16, 16);
+        env->npe_materialize_trace_accumulator_lo[event] =
+            internal_data_read((frame + 0xfedau) & MASK16, 16);
+        snapshot_npe_materialize_near_bytes(
+            (frame + 0xfedcu) & MASK16,
+            env->npe_materialize_trace_record[event],
+            DMCU_NPE_MATERIALIZE_RECORD_BYTES);
+    } else {
+        env->npe_materialize_trace_first_status[event] = 0;
+        env->npe_materialize_trace_next_status[event] = 0;
+        env->npe_materialize_trace_accumulator_hi[event] = 0;
+        env->npe_materialize_trace_accumulator_lo[event] = 0;
+        memset(env->npe_materialize_trace_record[event], 0,
+               DMCU_NPE_MATERIALIZE_RECORD_BYTES);
+    }
+}
+
+void dmcu_start_page_return_record_write(CPUDMCUState *env,
+                                         uint32_t address,
+                                         uint32_t old_value,
+                                         uint32_t new_value,
+                                         int bits,
+                                         uint8_t bus,
+                                         uint32_t pc)
+{
+    uint32_t base = env->start_page_renderer_return_frame_base & MASK16;
+    uint32_t width = bits / 8u;
+    uint64_t sequence;
+    uint32_t slot;
+    uint32_t index;
+    uint32_t depth;
+    uint16_t fp;
+    uint16_t frame_fp;
+
+    if (!env->start_page_renderer_trace_active ||
+        address >= base + 4u || address + width <= base) {
+        return;
+    }
+
+    sequence = env->start_page_return_write_count++;
+    slot = sequence % DMCU_START_PAGE_RETURN_WRITE_TRACE_SLOTS;
+    env->start_page_return_write_call_sequence[slot] =
+        env->start_page_renderer_trace_active_sequence;
+    env->start_page_return_write_pc[slot] = pc & MASK24;
+    fp = env->gpr[DMCU_FP] & MASK16;
+    env->start_page_return_write_caller[slot] = dmcu_code_address(
+        internal_data_read((fp + 2u) & MASK16, 16) & 0xffu,
+        internal_data_read((fp + 4u) & MASK16, 16));
+    env->start_page_return_write_address[slot] = address & MASK16;
+    env->start_page_return_write_old[slot] =
+        old_value & width_mask(bits);
+    env->start_page_return_write_new[slot] =
+        new_value & width_mask(bits);
+    env->start_page_return_write_sp[slot] = env->gpr[DMCU_SP] & MASK16;
+    env->start_page_return_write_fp[slot] = fp;
+    env->start_page_return_write_ds0[slot] =
+        env->sfr[DMCU_SFR_DS0] & 0x1ffu;
+    env->start_page_return_write_ds1[slot] =
+        env->sfr[DMCU_SFR_DS1] & 0x1ffu;
+    for (index = 0; index < DMCU_START_PAGE_RETURN_GPR_WORDS; index++) {
+        env->start_page_return_write_gpr[slot][index] =
+            env->gpr[index] & MASK16;
+    }
+    for (index = 0; index < DMCU_START_PAGE_RETURN_ARGUMENT_WORDS; index++) {
+        env->start_page_return_write_args[slot][index] =
+            internal_data_read((fp + 6u + index * 2u) & MASK16, 16);
+    }
+    memset(env->start_page_return_write_frame_fp[slot], 0,
+           sizeof(env->start_page_return_write_frame_fp[slot]));
+    memset(env->start_page_return_write_frame_caller[slot], 0,
+           sizeof(env->start_page_return_write_frame_caller[slot]));
+    memset(env->start_page_return_write_frame_args[slot], 0,
+           sizeof(env->start_page_return_write_frame_args[slot]));
+    frame_fp = fp;
+    for (depth = 0;
+         depth < DMCU_START_PAGE_RETURN_FRAME_DEPTH && frame_fp; depth++) {
+        uint16_t parent_fp = internal_data_read(frame_fp, 16);
+
+        env->start_page_return_write_frame_fp[slot][depth] = frame_fp;
+        env->start_page_return_write_frame_caller[slot][depth] =
+            dmcu_code_address(
+                internal_data_read((frame_fp + 2u) & MASK16, 16) & 0xffu,
+                internal_data_read((frame_fp + 4u) & MASK16, 16));
+        for (index = 0; index < DMCU_START_PAGE_RETURN_ARGUMENT_WORDS;
+             index++) {
+            env->start_page_return_write_frame_args[slot][depth][index] =
+                internal_data_read(
+                    (frame_fp + 6u + index * 2u) & MASK16, 16);
+        }
+        if (parent_fp == frame_fp) {
+            break;
+        }
+        frame_fp = parent_fp;
+    }
+    env->start_page_return_write_repeat_pc[slot] = env->repeat_pc & MASK24;
+    env->start_page_return_write_repeat_end[slot] = env->repeat_end & MASK24;
+    env->start_page_return_write_repeat_count[slot] = env->repeat_count;
+    env->start_page_return_write_bits[slot] = bits;
+    env->start_page_return_write_bus[slot] = bus;
+    env->start_page_return_write_in_irq[slot] = env->in_interrupt;
+}
+
+void dmcu_npe_resource_return_record_write(CPUDMCUState *env,
+                                           uint32_t address,
+                                           uint32_t old_value,
+                                           uint32_t new_value,
+                                           int bits,
+                                           uint8_t bus,
+                                           uint32_t pc)
+{
+    uint32_t active = env->npe_resource_return_active_slot;
+    uint32_t width = bits / 8u;
+    uint32_t slot;
+    uint16_t base;
+    uint64_t sequence;
+    uint32_t write_slot;
+
+    if (!active || active > DMCU_NPE_RESOURCE_RETURN_TRACE_SLOTS) {
+        return;
+    }
+    slot = active - 1u;
+    base = env->npe_resource_return_frame_base[slot];
+    if (address >= (uint32_t)base + 4u || address + width <= base) {
+        return;
+    }
+
+    sequence = env->npe_resource_return_write_count++;
+    write_slot = sequence % DMCU_NPE_RESOURCE_RETURN_WRITE_SLOTS;
+    env->npe_resource_return_write_sequence[write_slot] = sequence + 1u;
+    env->npe_resource_return_write_call_sequence[write_slot] =
+        env->npe_resource_return_active_sequence;
+    env->npe_resource_return_write_pc[write_slot] = pc & MASK24;
+    env->npe_resource_return_write_address[write_slot] = address & MASK16;
+    env->npe_resource_return_write_old[write_slot] =
+        old_value & width_mask(bits);
+    env->npe_resource_return_write_new[write_slot] =
+        new_value & width_mask(bits);
+    env->npe_resource_return_write_sp[write_slot] =
+        env->gpr[DMCU_SP] & MASK16;
+    env->npe_resource_return_write_fp[write_slot] =
+        env->gpr[DMCU_FP] & MASK16;
+    env->npe_resource_return_write_bits[write_slot] = bits;
+    env->npe_resource_return_write_bus[write_slot] = bus;
+    env->npe_resource_return_write_in_irq[write_slot] = env->in_interrupt;
 }
 
 /* Observer-only provenance for the startup condition which selects the
@@ -529,17 +1617,45 @@ static inline uint32_t sfr_read(CPUDMCUState *env, unsigned reg, int bits)
         value |= env->psw & DMCU_PSW_N ? 0x8 : 0;
         return value & (bits == 8 ? 0xff : 0xffff);
     }
-    return env->sfr[reg] & (bits == 8 ? 0xff : 0xffff);
+    value = env->sfr[reg];
+    if (dmcu_sfr_has_timing(reg)) {
+        DMCUCPU *cpu = DMCU_CPU(env_cpu(env));
+        QEMU_IOTHREAD_LOCK_GUARD();
+
+        value = env->sfr[reg];
+        if (cpu->sfr_device_read) {
+            value = cpu->sfr_device_read(cpu->sfr_device_opaque, reg, value);
+        }
+    }
+    return value & (bits == 8 ? 0xff : 0xffff);
 }
 
-static inline void sfr_write(CPUDMCUState *env, unsigned reg,
-                             uint32_t value, int bits)
+static void sfr_write_internal(CPUDMCUState *env, unsigned reg,
+                               uint32_t value, int bits, bool direct)
 {
     uint32_t old_value;
+    /* Direct register instructions bypass memory.c's MMIO BQL guard.
+     * Serialize the old-value read, backing-store update and device hook
+     * with virtual timer callbacks and QMP audio/timer observations. MMIO
+     * and DTU callers may already hold BQL; the conditional guard must not
+     * relock it. CPU-only registers stay on their existing fast path. */
+    g_autoptr(IOThreadLockAuto) device_lock =
+        dmcu_sfr_has_timing(reg & 0xff) ?
+        qemu_iothread_auto_lock(__FILE__, __LINE__) : NULL;
 
     reg &= 0xff;
     if (reg >= 0xf0) {
         reg_write(env, reg - 0xf0, value, bits);
+        return;
+    }
+    /* CN1916884A p16 / fig. 7A: CLKCON writes require SOCR.UP.
+     * Factory 0C:5154 and 24:FF92 save/restore REG2E between EE00/FE00.
+     * Reject before changing either SFR backing or device clock state;
+     * direct, BIT, POP and data-bus aliases all share this write path.
+     * Other protected registers need their own evidence, not a blanket
+     * restriction on the timer, PLL or remaining SFR register file. */
+    if (reg == DMCU_SFR_CLKCON &&
+        !(env->sfr[DMCU_SFR_SOCR] & DMCU_SOCR_UP)) {
         return;
     }
     if (reg == DMCU_SFR_SB) {
@@ -562,13 +1678,90 @@ static inline void sfr_write(CPUDMCUState *env, unsigned reg,
                    (written & 0x2 ? DMCU_PSW_V : 0) |
                    (written & 0x4 ? DMCU_PSW_C : 0) |
                    (written & 0x8 ? DMCU_PSW_N : 0);
+        dmcu_irq_update(env);
         return;
     }
-    old_value = env->sfr[reg];
+    old_value = sfr_read(env, reg, 16);
     if (bits == 8) {
-        env->sfr[reg] = (env->sfr[reg] & 0xff00) | (value & 0xff);
+        env->sfr[reg] = (old_value & 0xff00) | (value & 0xff);
     } else {
         env->sfr[reg] = value & 0xffff;
+    }
+    if (reg >= DMCU_DTUC_FIRST &&
+        reg < DMCU_DTUC_FIRST + DMCU_DTU_CHANNELS) {
+        if (!(old_value & DMCU_DTUC_COUNT)) {
+            dmcu_dtu_trace_reload(env, reg - DMCU_DTUC_FIRST,
+                                  env->sfr[reg] & DMCU_DTUC_COUNT);
+        }
+        env->dtu_fault_sources = 0;
+        dmcu_irq_update(env);
+    }
+    if (reg >= DMCU_ICR_FIRST && reg < DMCU_ICR_FIRST + DMCU_ICR_COUNT &&
+        ((old_value | env->sfr[reg]) & DMCU_ICR_ED) &&
+        ((old_value ^ env->sfr[reg]) &
+         (DMCU_ICR_EN | DMCU_ICR_ED | DMCU_ICR_PRI))) {
+        DMCUCPU *cpu = DMCU_CPU(env_cpu(env));
+        DMCUDTUConfigEvent *event = &env->dtu_config_trace[
+            env->dtu_config_count++ % DMCU_DTU_CONFIG_TRACE_SLOTS];
+        unsigned i;
+
+        event->pc = env->current_instruction_pc & MASK24;
+        event->reg = reg;
+        event->old_value = old_value;
+        event->value = env->sfr[reg];
+        event->sp = env->gpr[DMCU_SP];
+        event->fp = env->gpr[DMCU_FP];
+        event->ds0 = env->sfr[DMCU_SFR_DS0];
+        event->ds1 = env->sfr[DMCU_SFR_DS1];
+        event->in_interrupt = env->in_interrupt;
+        for (i = 0; i < ARRAY_SIZE(event->stack); i++) {
+            uint16_t address = (event->sp & ~1u) + i * 2;
+            event->stack[i] = cpu->internal_data ?
+                lduw_le_p(cpu->internal_data + address) : 0;
+        }
+        for (i = 0; i < ARRAY_SIZE(event->dtu); i++) {
+            event->dtu[i] = env->sfr[DMCU_DTUC_FIRST + i];
+        }
+    }
+    if (reg == DMCU_SFR_SOCR ||
+        (reg >= DMCU_ICR_FIRST && reg < DMCU_ICR_FIRST + DMCU_ICR_COUNT)) {
+        if (reg != DMCU_SFR_SOCR) {
+            env->dtu_fault_sources &= ~(1u << (reg - DMCU_ICR_FIRST));
+        }
+        dmcu_irq_update(env);
+    }
+    if (dmcu_sfr_has_timing(reg)) {
+        DMCUCPU *cpu = DMCU_CPU(env_cpu(env));
+
+        if (cpu->sfr_device_write) {
+            cpu->sfr_device_write(cpu->sfr_device_opaque, reg,
+                                  old_value, env->sfr[reg]);
+        }
+    }
+
+    /* Keep direct hardware-register discovery independent from the Fxxx
+     * memory windows.  This is observer-only: the architectural write above
+     * is unchanged.  DS0/DS1 are excluded because they are bank selectors,
+     * while SB and PSW returned through their dedicated architectural paths. */
+    if (direct && reg != DMCU_SFR_DS0 && reg != DMCU_SFR_DS1) {
+        uint64_t sequence = env->direct_sfr_write_count++;
+        uint32_t slot = sequence % DMCU_DIRECT_SFR_WRITE_TRACE_SLOTS;
+
+        env->direct_sfr_write_reg_count[reg]++;
+        env->direct_sfr_write_sequence[slot] = sequence;
+        env->direct_sfr_write_pc[slot] =
+            env->current_instruction_pc & MASK24;
+        env->direct_sfr_write_reg[slot] = reg;
+        env->direct_sfr_write_old_value[slot] = old_value & MASK16;
+        env->direct_sfr_write_new_value[slot] = env->sfr[reg] & MASK16;
+        env->direct_sfr_write_sp[slot] = env->gpr[DMCU_SP] & MASK16;
+        env->direct_sfr_write_fp[slot] = env->gpr[DMCU_FP] & MASK16;
+        env->direct_sfr_write_ds0[slot] =
+            env->sfr[DMCU_SFR_DS0] & 0x01ffu;
+        env->direct_sfr_write_ds1[slot] =
+            env->sfr[DMCU_SFR_DS1] & 0x01ffu;
+        env->direct_sfr_write_bits[slot] = bits;
+        env->direct_sfr_write_in_interrupt[slot] = env->in_interrupt;
     }
 
     if (reg == 0xb0) {
@@ -578,12 +1771,34 @@ static inline void sfr_write(CPUDMCUState *env, unsigned reg,
 
     if ((reg == DMCU_SFR_DS0 || reg == DMCU_SFR_DS1) &&
         old_value != env->sfr[reg]) {
-        tlb_flush(env_cpu(env));
+        /* DS changes only the Harvard data mapping. Retain instruction
+         * translations; code writes still use QEMU's normal invalidation. */
+        tlb_flush_by_mmuidx(env_cpu(env), 1u << MMU_DATA_IDX);
     } else if (reg != DMCU_SFR_DS0 && reg != DMCU_SFR_DS1) {
         qemu_log_mask(LOG_UNIMP, "DMCU SFR[%02x] <- %04x at %02x:%04x\n",
                       reg, env->sfr[reg] & MASK16,
                       dmcu_code_segment(env->pc), dmcu_code_pc(env->pc));
     }
+}
+
+static inline void sfr_write(CPUDMCUState *env, unsigned reg,
+                             uint32_t value, int bits)
+{
+    sfr_write_internal(env, reg, value, bits, true);
+}
+
+/* The SoC's memory-mapped register window must share the architectural
+ * register state, including DS TLB invalidation and the shift buffer.  A
+ * memory-bus write has its own bus trace; do not also count it as a direct
+ * register instruction in DIRECT_SFR_WRITE. */
+uint16_t dmcu_sfr_read_word(CPUDMCUState *env, unsigned reg)
+{
+    return sfr_read(env, reg, 16);
+}
+
+void dmcu_sfr_write_word(CPUDMCUState *env, unsigned reg, uint16_t value)
+{
+    sfr_write_internal(env, reg, value, 16, false);
 }
 
 static inline uint32_t data_physical_address(CPUDMCUState *env, uint32_t addr)
@@ -692,13 +1907,398 @@ static inline void trace_outer_context_data(CPUDMCUState *env, uint32_t addr,
     env->context_data_trace_count++;
 }
 
+/* Observe, but never repair, the lifecycle-sensitive data window used by the
+ * exact 1B:7A20 NPE signature comparisons.  A permanent source alias at
+ * 32:4956 was rejected as the implementation boundary; a later no-alias run
+ * reproduced the root loop with zero range accesses, so an earlier guest
+ * owner is not assumed.  Retain first reads and writes independently to find
+ * the actual installation boundary. */
+static inline void trace_npe_literal_data_access(CPUDMCUState *env,
+                                                 uint32_t logical,
+                                                 uint32_t physical,
+                                                 uint32_t value, int bits,
+                                                 bool write)
+{
+    uint32_t width = bits / 8u;
+    uint32_t *count = write ? &env->npe_literal_data_writes
+                            : &env->npe_literal_data_reads;
+    uint32_t slot;
+    uint32_t pc;
+
+    if (physical >= 0x32497cu || physical + width <= 0x324956u) {
+        return;
+    }
+    slot = *count;
+    if (*count != UINT32_MAX) {
+        (*count)++;
+    }
+    if (slot >= DMCU_NPE_LITERAL_DATA_TRACE_SLOTS) {
+        return;
+    }
+    pc = env->current_instruction_pc & MASK24;
+    if (write) {
+        env->npe_literal_data_write_pc[slot] = pc;
+        env->npe_literal_data_write_physical[slot] = physical & MASK24;
+        env->npe_literal_data_write_logical[slot] = logical & MASK16;
+        env->npe_literal_data_write_value[slot] = value & width_mask(bits);
+        env->npe_literal_data_write_ds0[slot] =
+            env->sfr[DMCU_SFR_DS0] & 0x1ff;
+        env->npe_literal_data_write_ds1[slot] =
+            env->sfr[DMCU_SFR_DS1] & 0x1ff;
+        env->npe_literal_data_write_bits[slot] = bits;
+        env->npe_literal_data_write_dispatch[slot] =
+            env->npe_format_dispatch_active;
+    } else {
+        env->npe_literal_data_read_pc[slot] = pc;
+        env->npe_literal_data_read_physical[slot] = physical & MASK24;
+        env->npe_literal_data_read_logical[slot] = logical & MASK16;
+        env->npe_literal_data_read_value[slot] = value & width_mask(bits);
+        env->npe_literal_data_read_ds0[slot] =
+            env->sfr[DMCU_SFR_DS0] & 0x1ff;
+        env->npe_literal_data_read_ds1[slot] =
+            env->sfr[DMCU_SFR_DS1] & 0x1ff;
+        env->npe_literal_data_read_bits[slot] = bits;
+        env->npe_literal_data_read_dispatch[slot] =
+            env->npe_format_dispatch_active;
+    }
+}
+
+/* Observe writes to the exact 20 x 14-byte object table consumed by
+ * 25:8392 and the mode-one controller.  This runs before the pending store,
+ * records the old and new values, and never changes guest state. */
+static inline void trace_npe_game_table_write(CPUDMCUState *env,
+                                              uint32_t physical,
+                                              uint32_t value, int bits)
+{
+    const uint32_t table_start = 0x526ca2u;
+    const uint32_t table_end = table_start + 20u * 14u;
+    uint32_t width = bits / 8u;
+    uint32_t old_value;
+    uint32_t new_value = value & width_mask(bits);
+    uint32_t pc;
+
+    if (!env->npe_game_trace_armed || physical >= table_end ||
+        physical + width <= table_start) {
+        return;
+    }
+    old_value = bits == 8 ?
+        address_space_ldub(&address_space_memory, physical,
+                           MEMTXATTRS_UNSPECIFIED, NULL) :
+        address_space_lduw_le(&address_space_memory, physical,
+                              MEMTXATTRS_UNSPECIFIED, NULL);
+    old_value &= width_mask(bits);
+    pc = env->current_instruction_pc & MASK24;
+    env->npe_game_table_writes++;
+    env->npe_game_table_changing_writes += old_value != new_value;
+    env->npe_game_table_nonzero_writes += new_value != 0u;
+    if (!env->npe_game_table_first_write_valid) {
+        env->npe_game_table_first_write_valid = true;
+        env->npe_game_table_first_write_pc = pc;
+        env->npe_game_table_first_write_address = physical & MASK24;
+        env->npe_game_table_first_write_old = old_value;
+        env->npe_game_table_first_write_new = new_value;
+        env->npe_game_table_first_write_bits = bits;
+    }
+    if (!env->npe_game_table_first_nonzero_valid && new_value != 0u) {
+        env->npe_game_table_first_nonzero_valid = true;
+        env->npe_game_table_first_nonzero_pc = pc;
+        env->npe_game_table_first_nonzero_address = physical & MASK24;
+        env->npe_game_table_first_nonzero_old = old_value;
+        env->npe_game_table_first_nonzero_new = new_value;
+        env->npe_game_table_first_nonzero_bits = bits;
+    }
+    env->npe_game_table_last_write_pc = pc;
+    env->npe_game_table_last_write_address = physical & MASK24;
+    env->npe_game_table_last_write_old = old_value;
+    env->npe_game_table_last_write_new = new_value;
+    env->npe_game_table_last_write_bits = bits;
+}
+
+/* Observe stores which overlap the physical word containing logical
+ * A4:7A3E.  Byte accesses to logical 7A3E use physical lane 52:7A3F, while
+ * word stores begin at 52:7A3E.  Record both forms before the pending store;
+ * the observer never changes the address, value, or guest-visible memory. */
+static inline void trace_npe_game_state_write(CPUDMCUState *env,
+                                              uint32_t logical,
+                                              uint32_t physical,
+                                              uint32_t value, int bits)
+{
+    const uint32_t state_start = 0x527a3eu;
+    const uint32_t state_end = state_start + 2u;
+    uint32_t width = bits / 8u;
+    uint32_t old_value;
+    uint32_t new_value = value & width_mask(bits);
+    uint32_t pc;
+
+    if (physical >= state_end || physical + width <= state_start) {
+        return;
+    }
+    old_value = bits == 8 ?
+        address_space_ldub(&address_space_memory, physical,
+                           MEMTXATTRS_UNSPECIFIED, NULL) :
+        address_space_lduw_le(&address_space_memory, physical,
+                              MEMTXATTRS_UNSPECIFIED, NULL);
+    old_value &= width_mask(bits);
+    pc = env->current_instruction_pc & MASK24;
+    env->npe_game_state_writes++;
+    env->npe_game_state_changing_writes += old_value != new_value;
+    env->npe_game_state_nonzero_writes += new_value != 0u;
+    if (!env->npe_game_state_first_write_valid) {
+        env->npe_game_state_first_write_valid = true;
+        env->npe_game_state_first_write_pc = pc;
+        env->npe_game_state_first_write_address = physical & MASK24;
+        env->npe_game_state_first_write_logical = logical & MASK16;
+        env->npe_game_state_first_write_old = old_value;
+        env->npe_game_state_first_write_new = new_value;
+        env->npe_game_state_first_write_sp = env->gpr[DMCU_SP] & MASK16;
+        env->npe_game_state_first_write_fp = env->gpr[DMCU_FP] & MASK16;
+        env->npe_game_state_first_write_ds0 =
+            env->sfr[DMCU_SFR_DS0] & 0x1ffu;
+        env->npe_game_state_first_write_ds1 =
+            env->sfr[DMCU_SFR_DS1] & 0x1ffu;
+        env->npe_game_state_first_write_bits = bits;
+    }
+    if (!env->npe_game_state_first_nonzero_valid && new_value != 0u) {
+        env->npe_game_state_first_nonzero_valid = true;
+        env->npe_game_state_first_nonzero_pc = pc;
+        env->npe_game_state_first_nonzero_address = physical & MASK24;
+        env->npe_game_state_first_nonzero_logical = logical & MASK16;
+        env->npe_game_state_first_nonzero_old = old_value;
+        env->npe_game_state_first_nonzero_new = new_value;
+        env->npe_game_state_first_nonzero_sp = env->gpr[DMCU_SP] & MASK16;
+        env->npe_game_state_first_nonzero_fp = env->gpr[DMCU_FP] & MASK16;
+        env->npe_game_state_first_nonzero_ds0 =
+            env->sfr[DMCU_SFR_DS0] & 0x1ffu;
+        env->npe_game_state_first_nonzero_ds1 =
+            env->sfr[DMCU_SFR_DS1] & 0x1ffu;
+        env->npe_game_state_first_nonzero_bits = bits;
+    }
+    env->npe_game_state_last_write_pc = pc;
+    env->npe_game_state_last_write_address = physical & MASK24;
+    env->npe_game_state_last_write_logical = logical & MASK16;
+    env->npe_game_state_last_write_old = old_value;
+    env->npe_game_state_last_write_new = new_value;
+    env->npe_game_state_last_write_sp = env->gpr[DMCU_SP] & MASK16;
+    env->npe_game_state_last_write_fp = env->gpr[DMCU_FP] & MASK16;
+    env->npe_game_state_last_write_ds0 =
+        env->sfr[DMCU_SFR_DS0] & 0x1ffu;
+    env->npe_game_state_last_write_ds1 =
+        env->sfr[DMCU_SFR_DS1] & 0x1ffu;
+    env->npe_game_state_last_write_bits = bits;
+}
+
+/* Preserve boot-lifetime provenance for the operation selector (52:7934),
+ * the resident-controller gate (52:7A50), and the transition flag
+ * (52:7AB4).  These three words decide whether 1A:1312 executes its normal
+ * body or tail-exits through 31:A3F4.  The bounded ring observes the pending
+ * store only; it does not change its address, value, or timing. */
+static inline void trace_npe_game_control_write(CPUDMCUState *env,
+                                                uint32_t logical,
+                                                uint32_t physical,
+                                                uint32_t value, int bits)
+{
+    static const uint32_t watched[] = {
+        0x527934u, 0x527a50u, 0x527ab4u,
+    };
+    uint32_t width = bits / 8u;
+    uint32_t sequence;
+    uint32_t slot;
+    uint32_t old_value;
+    unsigned index;
+    bool overlaps = false;
+
+    for (index = 0; index < ARRAY_SIZE(watched); index++) {
+        if (physical < watched[index] + 2u &&
+            physical + width > watched[index]) {
+            overlaps = true;
+            break;
+        }
+    }
+    if (!overlaps) {
+        return;
+    }
+
+    old_value = bits == 8 ?
+        address_space_ldub(&address_space_memory, physical,
+                           MEMTXATTRS_UNSPECIFIED, NULL) :
+        address_space_lduw_le(&address_space_memory, physical,
+                              MEMTXATTRS_UNSPECIFIED, NULL);
+    sequence = env->npe_game_control_write_count++;
+    slot = sequence % DMCU_NPE_GAME_CONTROL_WRITE_SLOTS;
+    env->npe_game_control_write_pc[slot] =
+        env->current_instruction_pc & MASK24;
+    env->npe_game_control_write_address[slot] = physical & MASK24;
+    env->npe_game_control_write_logical[slot] = logical & MASK16;
+    env->npe_game_control_write_old[slot] = old_value & width_mask(bits);
+    env->npe_game_control_write_new[slot] = value & width_mask(bits);
+    env->npe_game_control_write_sp[slot] = env->gpr[DMCU_SP] & MASK16;
+    env->npe_game_control_write_fp[slot] = env->gpr[DMCU_FP] & MASK16;
+    env->npe_game_control_write_ds0[slot] =
+        env->sfr[DMCU_SFR_DS0] & 0x1ffu;
+    env->npe_game_control_write_ds1[slot] =
+        env->sfr[DMCU_SFR_DS1] & 0x1ffu;
+    env->npe_game_control_write_bits[slot] = bits;
+}
+
+/* Observe every write to the seven-word game grid/state block used by
+ * 1D:5820 and the mode-one frame controller.  The ring is deliberately
+ * separate from the object-table summary so loader writes and a possible
+ * later constructor remain distinguishable.  It never changes guest state. */
+static inline void trace_npe_game_grid_write(CPUDMCUState *env,
+                                             uint32_t physical,
+                                             uint32_t value, int bits)
+{
+    const uint32_t grid_start = 0x52783au;
+    const uint32_t grid_end = grid_start + 14u;
+    uint32_t width = bits / 8u;
+    uint32_t sequence;
+    uint32_t slot;
+
+    if (!env->npe_game_trace_armed || physical >= grid_end ||
+        physical + width <= grid_start) {
+        return;
+    }
+
+    sequence = env->npe_game_grid_write_count++;
+    slot = sequence % DMCU_NPE_GAME_GRID_WRITE_SLOTS;
+    env->npe_game_grid_write_pc[slot] =
+        env->current_instruction_pc & MASK24;
+    env->npe_game_grid_write_address[slot] = physical & MASK24;
+    env->npe_game_grid_write_old[slot] =
+        (bits == 8 ?
+         address_space_ldub(&address_space_memory, physical,
+                            MEMTXATTRS_UNSPECIFIED, NULL) :
+         address_space_lduw_le(&address_space_memory, physical,
+                               MEMTXATTRS_UNSPECIFIED, NULL)) &
+        width_mask(bits);
+    env->npe_game_grid_write_new[slot] = value & width_mask(bits);
+    env->npe_game_grid_write_bits[slot] = bits;
+}
+
+/* The live NPE closure at 00:5600..A4BA selects DS0=66 and DS0=63 before
+ * reading three narrow global ranges.  Observe the processor-translated
+ * addresses and values here, after the normal read has completed.  The
+ * ranges use physical addresses so the 32 KiB segment mapping and byte-lane
+ * XOR are part of the evidence rather than an assumption. */
+static inline void trace_npe_game_data_read(CPUDMCUState *env,
+                                            uint32_t logical,
+                                            uint32_t physical,
+                                            uint32_t value, int bits)
+{
+    uint32_t pc = env->current_instruction_pc & MASK24;
+    uint32_t slot;
+    bool target_range;
+
+    if (!env->npe_game_trace_armed ||
+        pc < dmcu_code_address(0x00, 0x5600) ||
+        pc > dmcu_code_address(0x00, 0xa4ba)) {
+        return;
+    }
+    target_range =
+        (physical >= 0x334874u && physical < 0x334884u) ||
+        (physical >= 0x3355beu && physical < 0x335625u) ||
+        (physical >= 0x31f122u && physical < 0x31f12au);
+    if (!target_range) {
+        return;
+    }
+    slot = env->npe_game_data_trace_count;
+    if (env->npe_game_data_trace_count != UINT32_MAX) {
+        env->npe_game_data_trace_count++;
+    }
+    if (slot >= DMCU_NPE_GAME_DATA_TRACE_SLOTS) {
+        return;
+    }
+    env->npe_game_data_trace_pc[slot] = pc;
+    env->npe_game_data_trace_physical[slot] = physical & MASK24;
+    env->npe_game_data_trace_logical[slot] = logical & MASK16;
+    env->npe_game_data_trace_value[slot] = value & width_mask(bits);
+    env->npe_game_data_trace_ds0[slot] =
+        env->sfr[DMCU_SFR_DS0] & 0x1ff;
+    env->npe_game_data_trace_ds1[slot] =
+        env->sfr[DMCU_SFR_DS1] & 0x1ff;
+    env->npe_game_data_trace_bits[slot] = bits;
+}
+
+/* Observe the complete lifetime of stores to the same three source-proven
+ * NPE data ranges.  The begin helper samples the normal mapped bus before the
+ * store and the end helper samples it after translated_data_write() performs
+ * the unchanged cpu_st[bw]_data operation.  A read-only NOR alias therefore
+ * remains directly distinguishable from writable RAM without changing the
+ * address, value, ordering, or result of the guest store. */
+static inline int trace_npe_game_data_write_begin(CPUDMCUState *env,
+                                                  uint32_t logical,
+                                                  uint32_t physical,
+                                                  uint32_t value, int bits)
+{
+    uint32_t width = bits / 8u;
+    uint32_t sequence;
+    uint32_t slot;
+    bool target_range;
+
+    if (!env->npe_game_trace_armed) {
+        return -1;
+    }
+    target_range =
+        (physical < 0x334884u && physical + width > 0x334874u) ||
+        (physical < 0x335625u && physical + width > 0x3355beu) ||
+        (physical < 0x31f12au && physical + width > 0x31f122u);
+    if (!target_range) {
+        return -1;
+    }
+
+    sequence = env->npe_game_data_write_trace_count;
+    if (env->npe_game_data_write_trace_count != UINT32_MAX) {
+        env->npe_game_data_write_trace_count++;
+    }
+    if (sequence >= DMCU_NPE_GAME_DATA_WRITE_TRACE_SLOTS) {
+        return -1;
+    }
+    slot = sequence;
+    env->npe_game_data_write_trace_pc[slot] =
+        env->current_instruction_pc & MASK24;
+    env->npe_game_data_write_trace_physical[slot] = physical & MASK24;
+    env->npe_game_data_write_trace_logical[slot] = logical & MASK16;
+    env->npe_game_data_write_trace_pre[slot] =
+        (bits == 8 ?
+         address_space_ldub(&address_space_memory, physical,
+                            MEMTXATTRS_UNSPECIFIED, NULL) :
+         address_space_lduw_le(&address_space_memory, physical,
+                               MEMTXATTRS_UNSPECIFIED, NULL)) &
+        width_mask(bits);
+    env->npe_game_data_write_trace_new[slot] = value & width_mask(bits);
+    env->npe_game_data_write_trace_sp[slot] = env->gpr[DMCU_SP] & MASK16;
+    env->npe_game_data_write_trace_fp[slot] = env->gpr[DMCU_FP] & MASK16;
+    env->npe_game_data_write_trace_ds0[slot] =
+        env->sfr[DMCU_SFR_DS0] & 0x1ffu;
+    env->npe_game_data_write_trace_ds1[slot] =
+        env->sfr[DMCU_SFR_DS1] & 0x1ffu;
+    env->npe_game_data_write_trace_bits[slot] = bits;
+    return slot;
+}
+
+static inline void trace_npe_game_data_write_end(CPUDMCUState *env, int slot,
+                                                 uint32_t physical, int bits)
+{
+    if (slot < 0) {
+        return;
+    }
+    env->npe_game_data_write_trace_post[slot] =
+        (bits == 8 ?
+         address_space_ldub(&address_space_memory, physical,
+                            MEMTXATTRS_UNSPECIFIED, NULL) :
+         address_space_lduw_le(&address_space_memory, physical,
+                               MEMTXATTRS_UNSPECIFIED, NULL)) &
+        width_mask(bits);
+}
+
 static inline uint32_t translated_data_read(CPUDMCUState *env, uint32_t addr,
                                             int bits)
 {
     uint32_t backing_addr = data_backing_address(env, addr, bits);
-    uint32_t value = bits == 8 ? cpu_ldub_data(env, backing_addr)
-                               : cpu_lduw_data(env, backing_addr);
+    uint32_t value;
     uint32_t pc = env->pc & MASK24;
+    uint32_t npe_actual_physical =
+        data_actual_physical_address(env, addr, bits);
     static unsigned font_lookup_data_reads;
     static unsigned resident_file_table_reads;
     static unsigned foreground_dispatch_table_reads;
@@ -706,6 +2306,159 @@ static inline uint32_t translated_data_read(CPUDMCUState *env, uint32_t addr,
     static unsigned modal_dispatch_index_reads;
     static unsigned modal_dispatch_table_reads;
     static unsigned modal_record_field_reads;
+    static unsigned foreground_event_queue_reads;
+    static unsigned operation_context_source_reads;
+    static unsigned storage_probe_callback_reads;
+
+    if (unlikely(env->instruction_clock_enabled)) {
+        dmcu_instruction_clock_data(env, npe_actual_physical);
+    }
+    value = bits == 8 ? cpu_ldub_data(env, backing_addr)
+                     : cpu_lduw_data(env, backing_addr);
+
+    trace_npe_literal_data_access(env, addr, npe_actual_physical, value, bits,
+                                  false);
+    trace_npe_game_data_read(env, addr, npe_actual_physical, value, bits);
+
+    /* A1:387A is the exact word tested by the relocated 32:5F86 transition
+     * service before it calls its resource backend.  Keep every overlapping
+     * data-bus read in a bounded ring.  This is intentionally narrower than
+     * a general memory trace and never substitutes a value. */
+    if (npe_actual_physical < 0x50b87cu &&
+        npe_actual_physical + bits / 8u > 0x50b87au) {
+        uint32_t sequence = env->npe_transition_gate_reads++;
+        uint32_t slot = sequence % DMCU_NPE_TRANSITION_GATE_SLOTS;
+
+        env->npe_transition_gate_read_pc[slot] =
+            env->current_instruction_pc & MASK24;
+        env->npe_transition_gate_read_logical[slot] = addr & MASK16;
+        env->npe_transition_gate_read_physical[slot] =
+            npe_actual_physical & MASK24;
+        env->npe_transition_gate_read_value[slot] =
+            value & width_mask(bits);
+        env->npe_transition_gate_read_ds0[slot] =
+            env->sfr[DMCU_SFR_DS0] & 0x01ffu;
+        env->npe_transition_gate_read_ds1[slot] =
+            env->sfr[DMCU_SFR_DS1] & 0x01ffu;
+        env->npe_transition_gate_read_bits[slot] = bits;
+    }
+
+    /* 5F:F928 optionally transfers through the far callback stored at
+     * A2:29B4.  Preserve the exact value the guest sees at each of its four
+     * loads; this distinguishes a bad callback producer from a RETS/stack
+     * implementation error without changing the read result. */
+    if ((env->current_instruction_pc ==
+             dmcu_code_address(0x5f, 0xf992) ||
+         env->current_instruction_pc ==
+             dmcu_code_address(0x5f, 0xf996) ||
+         env->current_instruction_pc ==
+             dmcu_code_address(0x5f, 0xf9a8) ||
+         env->current_instruction_pc ==
+             dmcu_code_address(0x5f, 0xf9ac)) &&
+        storage_probe_callback_reads < 64u) {
+        qemu_log_mask(
+            LOG_UNIMP,
+            "DMCU storage probe callback read #%u at %02x:%04x "
+            "logical=%04x physical=%06x value=%04x bits=%d "
+            "sp=%04x fp=%04x ds=%03x,%03x\n",
+            storage_probe_callback_reads + 1u,
+            dmcu_code_segment(env->current_instruction_pc),
+            dmcu_code_pc(env->current_instruction_pc), addr & MASK16,
+            npe_actual_physical & MASK24, value & width_mask(bits), bits,
+            env->gpr[DMCU_SP] & MASK16, env->gpr[DMCU_FP] & MASK16,
+            env->sfr[DMCU_SFR_DS0] & 0x1ff,
+            env->sfr[DMCU_SFR_DS1] & 0x1ff);
+        storage_probe_callback_reads++;
+    }
+
+    /* One-shot, log-only provenance for the late 46:9746 -> 29:9746
+     * operation-context overlay.  It distinguishes a missing ROM-01 copy
+     * execution from a data-bus source alias without changing the value
+     * returned to the guest. */
+    if (npe_actual_physical >= 0x469746u &&
+        npe_actual_physical < 0x4699eau &&
+        operation_context_source_reads < 32u) {
+        qemu_log_mask(
+            LOG_UNIMP,
+            "DMCU operation context source read #%u pc=%02x:%04x "
+            "logical=%04x physical=%06x value=%04x bits=%d "
+            "DS0=%03x DS1=%03x\n",
+            ++operation_context_source_reads,
+            dmcu_code_segment(pc), dmcu_code_pc(pc), addr & MASK16,
+            npe_actual_physical & MASK24, value & width_mask(bits), bits,
+            env->sfr[DMCU_SFR_DS0] & 0x1ff,
+            env->sfr[DMCU_SFR_DS1] & 0x1ff);
+    }
+
+    /*
+     * Diagnostic-only provenance for the physical NAND page buffer used by
+     * the isolated NPE FAT16 checkpoint.  Page 0x1004b is DMA'd to 51:1000;
+     * its application-directory sector begins at +0x200 and the first game
+     * record at +0x240.  Preserve every bounded guest read while the existing
+     * post-page control trace is armed.  The range also includes the witnessed
+     * 51:1a40 sector-copy destination, so the low-level verifier/copy can be
+     * separated from its first directory parser consumer.  This observer
+     * neither changes the returned value nor extends the trace lifetime.
+     */
+    if (((env->npe_directory_trace_remaining &&
+          npe_actual_physical >= 0x511000u &&
+          npe_actual_physical < 0x511840u) ||
+         (env->npe_directory_trace_triggered &&
+          npe_actual_physical >= 0x511a40u &&
+          npe_actual_physical < 0x511c40u)) &&
+        env->npe_directory_data_read_count < 16384u) {
+        uint32_t sequence = ++env->npe_directory_data_read_count;
+
+        qemu_log_mask(
+            LOG_UNIMP,
+            "DMCU NPE directory page read #%u pc=%02x:%04x logical=%04x "
+            "physical=%06x value=%04x bits=%d DS0=%03x DS1=%03x "
+            "SP=%04x FP=%04x R0=%04x R1=%04x R2=%04x R3=%04x "
+            "R8=%04x R9=%04x R10=%04x\n",
+            sequence, dmcu_code_segment(pc), dmcu_code_pc(pc),
+            addr & MASK16, npe_actual_physical & MASK24,
+            value & width_mask(bits), bits,
+            env->sfr[DMCU_SFR_DS0] & 0x1ff,
+            env->sfr[DMCU_SFR_DS1] & 0x1ff,
+            env->gpr[DMCU_SP] & MASK16, env->gpr[DMCU_FP] & MASK16,
+            env->gpr[0] & MASK16, env->gpr[1] & MASK16,
+            env->gpr[2] & MASK16, env->gpr[3] & MASK16,
+            env->gpr[8] & MASK16, env->gpr[9] & MASK16,
+            env->gpr[10] & MASK16);
+    }
+
+    /*
+     * Observer-only provenance for the foreground event ring rooted at
+     * 51:1F90.  The B0 start-menu request is known to be appended here and
+     * the count returns to zero shortly afterwards.  Record the bounded set
+     * of guest reads which identify the real consumer; do not infer a
+     * dispatcher or alter the queue contents in the CPU model.
+     */
+    if (foreground_event_queue_reads < 512u) {
+        uint32_t actual_physical =
+            data_actual_physical_address(env, addr, bits);
+
+        if (actual_physical >= 0x511f90u &&
+            actual_physical < 0x5120f0u &&
+            (actual_physical != 0x511f90u ||
+             (value & width_mask(bits)) != 0)) {
+            qemu_log_mask(
+                LOG_UNIMP,
+                "DMCU foreground event queue read #%u pc=%02x:%04x "
+                "logical=%04x physical=%06x value=%04x bits=%d "
+                "DS0=%03x DS1=%03x SP=%04x FP=%04x "
+                "R0=%04x R1=%04x R2=%04x R3=%04x\n",
+                foreground_event_queue_reads + 1u,
+                dmcu_code_segment(pc), dmcu_code_pc(pc), addr & MASK16,
+                actual_physical & MASK24, value & width_mask(bits), bits,
+                env->sfr[DMCU_SFR_DS0] & 0x1ff,
+                env->sfr[DMCU_SFR_DS1] & 0x1ff,
+                env->gpr[DMCU_SP] & MASK16, env->gpr[DMCU_FP] & MASK16,
+                env->gpr[0] & MASK16, env->gpr[1] & MASK16,
+                env->gpr[2] & MASK16, env->gpr[3] & MASK16);
+            foreground_event_queue_reads++;
+        }
+    }
     /* Preserve the four byte fetches which form the width and height words
      * consumed by the exact 26:CF40 root-resource clipper.  Recording the
      * translated physical address as well as the returned byte separates a
@@ -1047,9 +2800,9 @@ static inline void trace_application_init_frame_write(
 }
 
 /*
- * The shipped 08:40D0 timer vector saves FP at unbanked 00:04D6 before its
+ * The shipped 08:40D0 timer vector saves FP/R11 at unbanked 00:04D0 before its
  * synthetic RETI enters the application callback, then restores FP from the
- * same word at 08:4264.  Observe the first later write while that one-slot
+ * same word at 08:4258.  Observe the first later write while that one-slot
  * save area is live.  This is deliberately diagnostic-only: the write is
  * neither suppressed nor changed.
  */
@@ -1062,8 +2815,8 @@ static inline void trace_irq_save_fp_write(CPUDMCUState *env,
 {
     uint32_t width = bits / 8;
 
-    if (!env->in_interrupt || physical >= 0x000004d8u ||
-        physical + width <= 0x000004d6u) {
+    if (!env->in_interrupt || physical >= 0x000004d2u ||
+        physical + width <= 0x000004d0u) {
         return;
     }
 
@@ -1110,7 +2863,7 @@ static inline void trace_irq_save_fp_write(CPUDMCUState *env,
     env->irq_save_fp_first_overwrite_fp = env->gpr[DMCU_FP] & MASK16;
 }
 
-/* Watch the three words pushed by the CPU at hardware-IRQ entry.  The timer
+/* Watch the architectural frame pushed by the CPU at hardware-IRQ entry. The timer
  * vector builds a separate synthetic RETI frame below them, so writes to the
  * original PSW/CS/PC words are never required for the callback transition.
  * Record provenance only; do not suppress or rewrite the guest store. */
@@ -1124,7 +2877,8 @@ static inline void trace_interrupt_frame_write(CPUDMCUState *env,
     uint32_t base = env->interrupt_frame_base & MASK16;
 
     if (!env->in_interrupt || !env->interrupt_frame_watch_active ||
-        physical >= base + 6u || physical + width <= base ||
+        physical >= base + env->interrupt_frame_size ||
+        physical + width <= base ||
         (old_value & width_mask(bits)) ==
             (new_value & width_mask(bits))) {
         return;
@@ -1319,6 +3073,181 @@ static inline void trace_resource_range_write(CPUDMCUState *env,
     }
 }
 
+/* Observe writes to the exact A2:2AE0 error word while the 25:5460
+ * resource/context check is active.  Byte stores use the already translated
+ * physical lane so WORD_OLD/WORD_NEW describe the complete resulting word.
+ * This runs before the ordinary store and never changes the value, address,
+ * register state, or control flow. */
+static void trace_npe_resource_check_error_write(CPUDMCUState *env,
+                                                 uint32_t actual_physical,
+                                                 uint32_t value, int bits)
+{
+    const uint32_t error_address = 0x00512ae0u;
+    uint32_t width = bits / 8u;
+    uint16_t old_word;
+    uint16_t new_word;
+    uint16_t old_access;
+
+    if (!env->npe_resource_check_watch_active ||
+        actual_physical >= error_address + 2u ||
+        actual_physical + width <= error_address) {
+        return;
+    }
+
+    old_word = address_space_lduw_le(
+        &address_space_memory, error_address,
+        MEMTXATTRS_UNSPECIFIED, NULL);
+    if (bits == 16) {
+        old_access = old_word;
+        new_word = value & MASK16;
+    } else {
+        old_access = address_space_ldub(
+            &address_space_memory, actual_physical,
+            MEMTXATTRS_UNSPECIFIED, NULL);
+        if (actual_physical == error_address) {
+            new_word = (old_word & 0xff00u) | (value & 0xffu);
+        } else {
+            new_word = (old_word & 0x00ffu) |
+                       ((value & 0xffu) << 8);
+        }
+    }
+
+    {
+        uint64_t sequence = env->npe_resource_check_error_write_sequence++;
+        uint32_t slot = sequence %
+            DMCU_NPE_RESOURCE_ERROR_WRITE_TRACE_SLOTS;
+
+        env->npe_resource_check_error_write_event[slot] = sequence;
+        env->npe_resource_check_error_write_pc[slot] =
+            env->current_instruction_pc & MASK24;
+        env->npe_resource_check_error_write_address[slot] =
+            actual_physical & MASK24;
+        env->npe_resource_check_error_write_word_old[slot] = old_word;
+        env->npe_resource_check_error_write_word_new[slot] = new_word;
+        env->npe_resource_check_error_write_r0[slot] =
+            env->gpr[0] & MASK16;
+        env->npe_resource_check_error_write_r1[slot] =
+            env->gpr[1] & MASK16;
+        env->npe_resource_check_error_write_sp[slot] =
+            env->gpr[DMCU_SP] & MASK16;
+        env->npe_resource_check_error_write_fp[slot] =
+            env->gpr[DMCU_FP] & MASK16;
+        env->npe_resource_check_error_write_bits[slot] = bits;
+        env->npe_resource_check_error_write_stage[slot] =
+            env->npe_resource_check_stage;
+    }
+
+    if (!env->npe_resource_check_error_first_write_valid) {
+        env->npe_resource_check_error_first_write_valid = true;
+        env->npe_resource_check_error_first_write_pc =
+            env->current_instruction_pc & MASK24;
+        env->npe_resource_check_error_first_write_address =
+            actual_physical & MASK24;
+        env->npe_resource_check_error_first_write_old =
+            old_access & width_mask(bits);
+        env->npe_resource_check_error_first_write_new =
+            value & width_mask(bits);
+        env->npe_resource_check_error_first_write_word_old = old_word;
+        env->npe_resource_check_error_first_write_word_new = new_word;
+        env->npe_resource_check_error_first_write_sp =
+            env->gpr[DMCU_SP] & MASK16;
+        env->npe_resource_check_error_first_write_fp =
+            env->gpr[DMCU_FP] & MASK16;
+        env->npe_resource_check_error_first_write_bits = bits;
+        env->npe_resource_check_error_first_write_stage =
+            env->npe_resource_check_stage;
+    }
+
+    if (new_word &&
+        !env->npe_resource_check_error_first_nonzero_valid) {
+        env->npe_resource_check_error_first_nonzero_valid = true;
+        env->npe_resource_check_error_first_nonzero_pc =
+            env->current_instruction_pc & MASK24;
+        env->npe_resource_check_error_first_nonzero_address =
+            actual_physical & MASK24;
+        env->npe_resource_check_error_first_nonzero_old =
+            old_access & width_mask(bits);
+        env->npe_resource_check_error_first_nonzero_new =
+            value & width_mask(bits);
+        env->npe_resource_check_error_first_nonzero_word_old = old_word;
+        env->npe_resource_check_error_first_nonzero_word_new = new_word;
+        env->npe_resource_check_error_first_nonzero_sp =
+            env->gpr[DMCU_SP] & MASK16;
+        env->npe_resource_check_error_first_nonzero_fp =
+            env->gpr[DMCU_FP] & MASK16;
+        env->npe_resource_check_error_first_nonzero_bits = bits;
+        env->npe_resource_check_error_first_nonzero_stage =
+            env->npe_resource_check_stage;
+    }
+}
+
+/* Observe the original far stream/object slot at A4:54E8.  This is called
+ * before the pending guest store, so OLD is the actual preceding value.  It
+ * records provenance only and never changes the write or guest-visible RAM. */
+static void trace_npe_stream_global_write(CPUDMCUState *env,
+                                          uint32_t actual_physical,
+                                          uint32_t value, int bits)
+{
+    const uint32_t base = 0x005254e8u;
+    uint32_t width = bits / 8u;
+    uint32_t sequence;
+    uint32_t slot;
+
+    if (actual_physical >= base + 4u ||
+        actual_physical + width <= base) {
+        return;
+    }
+
+    sequence = env->npe_stream_global_writes++;
+    slot = sequence % DMCU_NPE_STREAM_GLOBAL_WRITE_TRACE_SLOTS;
+    env->npe_stream_global_write_pc[slot] =
+        env->current_instruction_pc & MASK24;
+    env->npe_stream_global_write_address[slot] =
+        actual_physical & MASK24;
+    env->npe_stream_global_write_old[slot] =
+        (bits == 8 ?
+         address_space_ldub(&address_space_memory, actual_physical,
+                            MEMTXATTRS_UNSPECIFIED, NULL) :
+         address_space_lduw_le(&address_space_memory, actual_physical,
+                               MEMTXATTRS_UNSPECIFIED, NULL)) &
+        width_mask(bits);
+    env->npe_stream_global_write_new[slot] = value & width_mask(bits);
+    env->npe_stream_global_write_sp[slot] =
+        env->gpr[DMCU_SP] & MASK16;
+    env->npe_stream_global_write_fp[slot] =
+        env->gpr[DMCU_FP] & MASK16;
+    env->npe_stream_global_write_ds0[slot] =
+        env->sfr[DMCU_SFR_DS0] & 0x1ff;
+    env->npe_stream_global_write_ds1[slot] =
+        env->sfr[DMCU_SFR_DS1] & 0x1ff;
+    env->npe_stream_global_write_bits[slot] = bits;
+}
+
+static inline bool dmcu_np560_sfr_range_is_modelled(uint32_t start,
+                                                     uint32_t end)
+{
+    static const struct {
+        uint16_t start;
+        uint16_t end;
+    } modelled[] = {
+        { 0xf000u, 0xf100u }, /* shared, bit-addressable DPRAM, not devices */
+        { 0xf100u, 0xf102u }, /* system/IRQ control */
+        { 0xf160u, 0xf166u }, /* physical key matrix */
+        { 0xf20au, 0xf210u }, /* Hsiao ECC */
+        { 0xf2d0u, 0xf2d2u }, /* ADC comparator */
+        { 0xf300u, 0xf322u }, /* reconstructed NAND controller */
+        { 0xf340u, 0xf348u }, /* legacy keyboard latch */
+    };
+    unsigned range;
+
+    for (range = 0; range < ARRAY_SIZE(modelled); range++) {
+        if (start < modelled[range].end && end > modelled[range].start) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static inline void translated_data_write(CPUDMCUState *env, uint32_t addr,
                                           uint32_t value, int bits)
 {
@@ -1327,8 +3256,16 @@ static inline void translated_data_write(CPUDMCUState *env, uint32_t addr,
     uint32_t actual_physical =
         data_actual_physical_address(env, addr, bits);
     uint32_t instruction_pc = env->current_instruction_pc & MASK24;
+    bool transition_gate_write =
+        actual_physical < 0x50b87cu &&
+        actual_physical + bits / 8u > 0x50b87au;
+    uint16_t transition_gate_old = transition_gate_write ?
+        address_space_lduw_le(&address_space_memory, 0x50b87au,
+                              MEMTXATTRS_UNSPECIFIED, NULL) : 0u;
+    int npe_game_data_write_slot;
     static unsigned framebuffer_writes;
     static unsigned storage_root_writes;
+    static unsigned storage_callback_writes;
     static unsigned storage_geometry_writes;
     static unsigned storage_record_writes;
     static unsigned storage_descriptor_writes;
@@ -1345,6 +3282,441 @@ static inline void translated_data_write(CPUDMCUState *env, uint32_t addr,
     static unsigned foreground_state_handler_writes;
     static unsigned modal_record_pointer_writes;
     static unsigned modal_record_body_writes;
+    static unsigned foreground_event_queue_writes;
+    static unsigned operation_context_destination_writes;
+    static unsigned storage_probe_callback_writes;
+    static unsigned npe_global_context_writes;
+
+    if (unlikely(env->instruction_clock_enabled)) {
+        dmcu_instruction_clock_data(env, actual_physical);
+    }
+
+    /* IGNDS exposes the SoC's unbanked F000..FFFF register window.  Keep a
+     * complete per-0x100 inventory and a bounded provenance ring for writes
+     * outside the ranges already implemented by the NP560 machine.  This is
+     * deliberately observer-only: it neither changes the pending store nor
+     * supplies a value to the guest.  The unknown ring is the hardware
+    * discovery boundary used for audio and other still-unmodelled devices. */
+    if (env->ignore_ds_count && (addr & MASK16) >= 0xf000u) {
+        uint32_t logical = addr & MASK16;
+        uint32_t end = logical + bits / 8u;
+        uint64_t sequence = env->unbanked_sfr_write_count++;
+
+        env->unbanked_sfr_write_bucket[(logical >> 8) & 0x0fu]++;
+        if (!dmcu_np560_sfr_range_is_modelled(logical, end)) {
+            uint64_t unknown = env->unbanked_sfr_unknown_write_count++;
+            uint32_t slot = unknown %
+                            DMCU_UNBANKED_SFR_WRITE_TRACE_SLOTS;
+
+            env->unbanked_sfr_unknown_sequence[slot] = sequence;
+            env->unbanked_sfr_unknown_pc[slot] = instruction_pc;
+            env->unbanked_sfr_unknown_logical[slot] = logical;
+            env->unbanked_sfr_unknown_value[slot] =
+                value & width_mask(bits);
+            env->unbanked_sfr_unknown_sp[slot] =
+                env->gpr[DMCU_SP] & MASK16;
+            env->unbanked_sfr_unknown_fp[slot] =
+                env->gpr[DMCU_FP] & MASK16;
+            env->unbanked_sfr_unknown_ds0[slot] =
+                env->sfr[DMCU_SFR_DS0] & 0x01ffu;
+            env->unbanked_sfr_unknown_ds1[slot] =
+                env->sfr[DMCU_SFR_DS1] & 0x01ffu;
+            env->unbanked_sfr_unknown_bits[slot] = bits;
+            env->unbanked_sfr_unknown_in_interrupt[slot] =
+                env->in_interrupt;
+        }
+    }
+    /* Vendor code also reaches evidenced hardware through bank translation
+     * (for example logical 7100 with DS0=1 aliases physical F100).  Inventory
+     * that physical Fxxx window separately from IGNDS.  Unmodelled hits are
+     * candidates, not an assertion that every Fxxx RAM byte is a register. */
+    if (!env->ignore_ds_count && actual_physical >= 0x00f000u &&
+        actual_physical < 0x010000u) {
+        uint32_t end = actual_physical + bits / 8u;
+        uint64_t sequence = env->banked_fxxx_write_count++;
+
+        env->banked_fxxx_write_bucket[
+            (actual_physical >> 8) & 0x0fu]++;
+        if (!dmcu_np560_sfr_range_is_modelled(actual_physical, end)) {
+            uint64_t unknown = env->banked_fxxx_unknown_write_count++;
+            uint32_t slot = unknown % DMCU_BANKED_FXXX_WRITE_TRACE_SLOTS;
+
+            env->banked_fxxx_unknown_sequence[slot] = sequence;
+            env->banked_fxxx_unknown_pc[slot] = instruction_pc;
+            env->banked_fxxx_unknown_logical[slot] = addr & MASK16;
+            env->banked_fxxx_unknown_physical[slot] =
+                actual_physical & MASK16;
+            env->banked_fxxx_unknown_value[slot] =
+                value & width_mask(bits);
+            env->banked_fxxx_unknown_sp[slot] =
+                env->gpr[DMCU_SP] & MASK16;
+            env->banked_fxxx_unknown_fp[slot] =
+                env->gpr[DMCU_FP] & MASK16;
+            env->banked_fxxx_unknown_ds0[slot] =
+                env->sfr[DMCU_SFR_DS0] & 0x01ffu;
+            env->banked_fxxx_unknown_ds1[slot] =
+                env->sfr[DMCU_SFR_DS1] & 0x01ffu;
+            env->banked_fxxx_unknown_bits[slot] = bits;
+            env->banked_fxxx_unknown_in_interrupt[slot] =
+                env->in_interrupt;
+        }
+    }
+
+    trace_npe_literal_data_access(env, addr, actual_physical, value, bits,
+                                  true);
+    trace_npe_game_table_write(env, actual_physical, value, bits);
+    trace_npe_game_grid_write(env, actual_physical, value, bits);
+    trace_npe_game_state_write(env, addr, actual_physical, value, bits);
+    trace_npe_game_control_write(env, addr, actual_physical, value, bits);
+    npe_game_data_write_slot = trace_npe_game_data_write_begin(
+        env, addr, actual_physical, value, bits);
+
+    trace_npe_resource_check_error_write(
+        env, actual_physical, value, bits);
+    trace_npe_stream_global_write(env, actual_physical, value, bits);
+
+    /* The operation-one controller calls linked 29:CE22.  Its recovered
+     * source-46 action routine is installed through the data/code RAM alias,
+     * but a later broad publish can replace precisely the CE22..D0B9 prefix
+     * while leaving the adjacent D0BA UI initializer intact.  Keep a ring of
+     * the final stores and their caller frames.  This is observer-only: the
+     * pending guest write and all architectural state remain untouched. */
+    if (actual_physical < 0x29d0bau &&
+        actual_physical + bits / 8u > 0x29ce22u) {
+        uint32_t sequence = env->npe_operation_one_action_write_count;
+        uint32_t slot = sequence %
+                        DMCU_NPE_OPERATION_ONE_ACTION_WRITE_SLOTS;
+        uint16_t frame = env->gpr[DMCU_FP] & MASK16;
+        unsigned depth;
+
+        if (env->npe_operation_one_action_write_count != UINT32_MAX) {
+            env->npe_operation_one_action_write_count++;
+        }
+        env->npe_operation_one_action_write_pc[slot] = instruction_pc;
+        env->npe_operation_one_action_write_address[slot] =
+            actual_physical & MASK24;
+        env->npe_operation_one_action_write_old[slot] =
+            (bits == 8 ?
+             address_space_ldub(&address_space_memory, actual_physical,
+                                MEMTXATTRS_UNSPECIFIED, NULL) :
+             address_space_lduw_le(&address_space_memory, actual_physical,
+                                   MEMTXATTRS_UNSPECIFIED, NULL)) &
+            width_mask(bits);
+        env->npe_operation_one_action_write_new[slot] =
+            value & width_mask(bits);
+        env->npe_operation_one_action_write_bits[slot] = bits;
+        env->npe_operation_one_action_write_sp[slot] =
+            env->gpr[DMCU_SP] & MASK16;
+        env->npe_operation_one_action_write_fp[slot] = frame;
+        for (depth = 0;
+             depth < DMCU_NPE_OPERATION_ONE_ACTION_WRITE_FRAMES && frame;
+             depth++) {
+            uint16_t parent = internal_data_read(frame, 16);
+            uint16_t cs = internal_data_read((frame + 2u) & MASK16, 16);
+            uint16_t pc = internal_data_read((frame + 4u) & MASK16, 16);
+
+            env->npe_operation_one_action_write_frames[slot][depth] =
+                ((cs & 0xffu) << 16) | pc;
+            if (!parent || parent == frame) {
+                break;
+            }
+            frame = parent;
+        }
+    }
+
+    /* The original 48:9178 initializer publishes four far object pointers in
+     * A4:5420/24/40/78.  Trace only those pointer words: tracing the gaps in
+     * the enclosing global block allowed unrelated clears to exhaust the
+     * bounded log before a later producer could run.  This observer does not
+     * modify the pending guest store. */
+    if (((actual_physical < 0x525428u &&
+          actual_physical + bits / 8u > 0x525420u) ||
+         (actual_physical < 0x525444u &&
+          actual_physical + bits / 8u > 0x525440u) ||
+         (actual_physical < 0x52547cu &&
+          actual_physical + bits / 8u > 0x525478u)) &&
+        npe_global_context_writes < 128u) {
+        qemu_log_mask(
+            LOG_UNIMP,
+            "DMCU NPE global context write #%u by %02x:%04x "
+            "logical=%04x physical=%06x value=%04x bits=%d "
+            "sp=%04x fp=%04x ds=%03x,%03x\n",
+            ++npe_global_context_writes,
+            dmcu_code_segment(instruction_pc), dmcu_code_pc(instruction_pc),
+            addr & MASK16, actual_physical & MASK24,
+            value & width_mask(bits), bits,
+            env->gpr[DMCU_SP] & MASK16, env->gpr[DMCU_FP] & MASK16,
+            env->sfr[DMCU_SFR_DS0] & 0x1ff,
+            env->sfr[DMCU_SFR_DS1] & 0x1ff);
+    }
+
+    /* Observe every guest store overlapping the sector probe's far callback
+     * at A2:29B4..29B7.  The eventual transfer into 5F:2766 proves that this
+     * field changes during the launch path; recording the pending store and
+     * old backing words names the producer while leaving the store intact. */
+    if (actual_physical < 0x5129b8u &&
+        actual_physical + bits / 8u > 0x5129b4u &&
+        storage_probe_callback_writes < 128u) {
+        uint16_t old_hi = address_space_lduw_le(
+            &address_space_memory, 0x5129b4u,
+            MEMTXATTRS_UNSPECIFIED, NULL);
+        uint16_t old_lo = address_space_lduw_le(
+            &address_space_memory, 0x5129b6u,
+            MEMTXATTRS_UNSPECIFIED, NULL);
+
+        qemu_log_mask(
+            LOG_UNIMP,
+            "DMCU storage probe callback write #%u by %02x:%04x "
+            "logical=%04x physical=%06x value=%04x bits=%d "
+            "old=%04x:%04x sp=%04x fp=%04x ds=%03x,%03x\n",
+            storage_probe_callback_writes + 1u,
+            dmcu_code_segment(instruction_pc), dmcu_code_pc(instruction_pc),
+            addr & MASK16, actual_physical & MASK24,
+            value & width_mask(bits), bits, old_hi, old_lo,
+            env->gpr[DMCU_SP] & MASK16, env->gpr[DMCU_FP] & MASK16,
+            env->sfr[DMCU_SFR_DS0] & 0x1ff,
+            env->sfr[DMCU_SFR_DS1] & 0x1ff);
+        storage_probe_callback_writes++;
+    }
+
+    /* The NPE runtime's state dispatcher at 2B:087E indexes six near-PC
+     * words from data RAM 0E:08A0.  Observe every guest write to that exact
+     * table from reset so initialization that precedes the status-2 loader
+     * handoff is not missed.  The observer never changes the pending store. */
+    if (actual_physical < 0x0e08acu &&
+        actual_physical + bits / 8u > 0x0e08a0u) {
+        env->npe_state_table_write_count++;
+        if (!env->npe_state_table_first_write_valid) {
+            env->npe_state_table_first_write_valid = true;
+            env->npe_state_table_first_write_pc = instruction_pc;
+            env->npe_state_table_first_write_address = actual_physical;
+            env->npe_state_table_first_write_value = value & width_mask(bits);
+            env->npe_state_table_first_write_bits = bits;
+        }
+        env->npe_state_table_last_write_pc = instruction_pc;
+        env->npe_state_table_last_write_address = actual_physical;
+        env->npe_state_table_last_write_value = value & width_mask(bits);
+        env->npe_state_table_last_write_bits = bits;
+    }
+
+    /* The status-2 NPE loader owns error state 52:7A3C.  Retain its first
+     * write and first nonzero write after the exact 2F:B726 handoff.  This
+     * observer runs before the pending store and never alters guest state. */
+    if (env->npe_loader_control_trace_active &&
+        actual_physical < 0x527a3eu &&
+        actual_physical + bits / 8u > 0x527a3cu) {
+        uint16_t old_word = address_space_lduw_le(
+            &address_space_memory, 0x527a3cu,
+            MEMTXATTRS_UNSPECIFIED, NULL);
+        uint16_t new_word = bits == 16 && actual_physical == 0x527a3cu ?
+            value & MASK16 : old_word;
+
+        if (bits == 8) {
+            unsigned shift = (actual_physical - 0x527a3cu) * 8u;
+            new_word = (old_word & ~(0xffu << shift)) |
+                       ((value & 0xffu) << shift);
+        }
+        if (!env->npe_loader_error_first_write_valid) {
+            env->npe_loader_error_first_write_valid = true;
+            env->npe_loader_error_first_write_pc = instruction_pc;
+            env->npe_loader_error_first_write_old = old_word;
+            env->npe_loader_error_first_write_new = new_word;
+            env->npe_loader_error_first_write_bits = bits;
+        }
+        if (!env->npe_loader_error_first_nonzero_valid && new_word != 0u) {
+            env->npe_loader_error_first_nonzero_valid = true;
+            env->npe_loader_error_first_nonzero_pc = instruction_pc;
+            env->npe_loader_error_first_nonzero_old = old_word;
+            env->npe_loader_error_first_nonzero_new = new_word;
+            env->npe_loader_error_first_nonzero_bits = bits;
+        }
+    }
+
+    /* Pair the source observer with the exact executable-overlay target.
+     * This records only the pending guest store and never modifies it. */
+    if (actual_physical >= 0x299746u && actual_physical < 0x2999eau &&
+        operation_context_destination_writes < 32u) {
+        qemu_log_mask(
+            LOG_UNIMP,
+            "DMCU operation context destination write #%u pc=%02x:%04x "
+            "logical=%04x physical=%06x value=%04x bits=%d "
+            "DS0=%03x DS1=%03x\n",
+            ++operation_context_destination_writes,
+            dmcu_code_segment(instruction_pc), dmcu_code_pc(instruction_pc),
+            addr & MASK16, actual_physical & MASK24,
+            value & width_mask(bits), bits,
+            env->sfr[DMCU_SFR_DS0] & 0x1ff,
+            env->sfr[DMCU_SFR_DS1] & 0x1ff);
+    }
+
+    /* Resident 02:0FB6 consumes three writable UI records and a twenty-row
+     * operation configuration table in external data RAM.  Count every guest
+     * store (including same-value boot clears), but retain only value-changing
+     * stores in a bounded ring so the bulk zero loop cannot hide the actual
+     * application initializer.  The final two words are outputs of 02:0FB6
+     * and are tracked separately from its inputs.  This observer executes
+     * before the pending store and never changes guest-visible state. */
+    {
+        static const uint32_t range_start[DMCU_OPERATION_UI_DATA_RANGES] = {
+            0x5269d2u, 0x5278a2u, 0x527934u,
+        };
+        static const uint32_t range_end[DMCU_OPERATION_UI_DATA_RANGES] = {
+            0x526b8eu, 0x52791au, 0x527938u,
+        };
+        uint32_t bytes = bits / 8u;
+        unsigned range;
+
+        for (range = 0; range < DMCU_OPERATION_UI_DATA_RANGES; range++) {
+            if (actual_physical < range_end[range] &&
+                actual_physical + bytes > range_start[range]) {
+                uint32_t old_value = bits == 8 ?
+                    address_space_ldub(&address_space_memory, actual_physical,
+                                       MEMTXATTRS_UNSPECIFIED, NULL) :
+                    address_space_lduw_le(&address_space_memory,
+                                          actual_physical,
+                                          MEMTXATTRS_UNSPECIFIED, NULL);
+                uint32_t masked_old = old_value & width_mask(bits);
+                uint32_t masked_new = value & width_mask(bits);
+
+                env->operation_ui_data_write_count[range]++;
+                if (masked_old != masked_new) {
+                    uint64_t event = env->operation_ui_data_trace_sequence++;
+                    uint32_t slot = event %
+                        DMCU_OPERATION_UI_DATA_WRITE_TRACE_SLOTS;
+
+                    env->operation_ui_data_change_count[range]++;
+                    env->operation_ui_data_trace_event[slot] = event;
+                    env->operation_ui_data_trace_pc[slot] = instruction_pc;
+                    env->operation_ui_data_trace_address[slot] =
+                        actual_physical & MASK24;
+                    env->operation_ui_data_trace_logical[slot] =
+                        addr & MASK16;
+                    env->operation_ui_data_trace_old[slot] = masked_old;
+                    env->operation_ui_data_trace_new[slot] = masked_new;
+                    env->operation_ui_data_trace_sp[slot] =
+                        env->gpr[DMCU_SP] & MASK16;
+                    env->operation_ui_data_trace_fp[slot] =
+                        env->gpr[DMCU_FP] & MASK16;
+                    env->operation_ui_data_trace_ds0[slot] =
+                        env->sfr[DMCU_SFR_DS0] & 0x01ffu;
+                    env->operation_ui_data_trace_ds1[slot] =
+                        env->sfr[DMCU_SFR_DS1] & 0x01ffu;
+                    for (unsigned reg = 0; reg < 4; reg++) {
+                        env->operation_ui_data_trace_gpr[slot][reg] =
+                            env->gpr[reg] & MASK16;
+                    }
+                    env->operation_ui_data_trace_bits[slot] = bits;
+                    env->operation_ui_data_trace_range[slot] = range;
+                    env->operation_ui_data_trace_in_interrupt[slot] =
+                        env->in_interrupt;
+                }
+                break;
+            }
+        }
+    }
+
+    /* A general register can address the low internal SRAM through the
+     * translated data bus, so stack-frame corruption is not necessarily a
+     * pointer_write/internal_data_write operation.  Observe the actual low
+     * physical backing before the pending guest store. */
+    if (env->start_page_renderer_trace_active &&
+        actual_physical < 0x10000u) {
+        uint32_t old_value = bits == 8 ?
+            address_space_ldub(&address_space_memory, actual_physical,
+                               MEMTXATTRS_UNSPECIFIED, NULL) :
+            address_space_lduw_le(&address_space_memory, actual_physical,
+                                  MEMTXATTRS_UNSPECIFIED, NULL);
+
+        dmcu_start_page_return_record_write(
+            env, actual_physical, old_value, value, bits, 1, instruction_pc);
+    }
+    if (env->npe_resource_return_active_slot &&
+        env->npe_resource_return_active_slot <=
+            DMCU_NPE_RESOURCE_RETURN_TRACE_SLOTS) {
+        uint32_t resource_slot =
+            env->npe_resource_return_active_slot - 1u;
+        uint32_t resource_base =
+            env->npe_resource_return_frame_base[resource_slot];
+        uint32_t resource_width = bits / 8u;
+
+        if (actual_physical < resource_base + 4u &&
+            actual_physical + resource_width > resource_base) {
+            /* Only the exact active return-frame overlap is sampled.
+             * Reading arbitrary low translated addresses merely to feed an
+             * inactive observer could touch read-sensitive MMIO. */
+            uint32_t old_value = bits == 8 ?
+                address_space_ldub(&address_space_memory, actual_physical,
+                                   MEMTXATTRS_UNSPECIFIED, NULL) :
+                address_space_lduw_le(&address_space_memory, actual_physical,
+                                      MEMTXATTRS_UNSPECIFIED, NULL);
+
+            dmcu_npe_resource_return_record_write(
+                env, actual_physical, old_value, value, bits, 1,
+                instruction_pc);
+        }
+    }
+
+    /* Keep bounded, read-only provenance for the complete 30:E662..E73D
+     * Start-context function.  This runs before the pending guest store and
+     * never changes its address, value, or ordering. */
+    if (actual_physical < 0x30e73eu &&
+        actual_physical + bits / 8u > 0x30e662u) {
+        uint32_t old_value = bits == 8 ?
+            address_space_ldub(&address_space_memory, actual_physical,
+                               MEMTXATTRS_UNSPECIFIED, NULL) :
+            address_space_lduw_le(&address_space_memory, actual_physical,
+                                  MEMTXATTRS_UNSPECIFIED, NULL);
+        uint64_t sequence = env->start_context_code_write_count++;
+        uint32_t slot = sequence % DMCU_START_CONTEXT_CODE_WRITE_SLOTS;
+
+        if (sequence == 0) {
+            env->start_context_code_first_pc = instruction_pc;
+            env->start_context_code_first_address = actual_physical & MASK24;
+            env->start_context_code_first_old = old_value & MASK16;
+            env->start_context_code_first_new = value & MASK16;
+            env->start_context_code_first_bits = bits;
+        }
+        env->start_context_code_write_pc[slot] = instruction_pc;
+        env->start_context_code_write_address[slot] =
+            actual_physical & MASK24;
+        env->start_context_code_write_old[slot] = old_value & MASK16;
+        env->start_context_code_write_new[slot] = value & MASK16;
+        env->start_context_code_write_ds0[slot] =
+            env->sfr[DMCU_SFR_DS0] & 0x1ff;
+        env->start_context_code_write_ds1[slot] =
+            env->sfr[DMCU_SFR_DS1] & 0x1ff;
+        env->start_context_code_write_bits[slot] = bits;
+    }
+
+    /* Pair the read-side event-ring provenance above with every bounded
+     * guest write, including same-value stores.  The latter matters because
+     * a dequeue can clear an already-zero slot while only changing the ring
+     * count or cursor elsewhere in the structure. */
+    if (foreground_event_queue_writes < 512u &&
+        actual_physical >= 0x511f90u && actual_physical < 0x5120f0u) {
+        uint32_t old_value = bits == 8 ?
+            address_space_ldub(&address_space_memory, actual_physical,
+                               MEMTXATTRS_UNSPECIFIED, NULL) :
+            address_space_lduw_le(&address_space_memory, actual_physical,
+                                  MEMTXATTRS_UNSPECIFIED, NULL);
+
+        qemu_log_mask(
+            LOG_UNIMP,
+            "DMCU foreground event queue write #%u pc=%02x:%04x "
+            "logical=%04x physical=%06x old=%04x new=%04x bits=%d "
+            "DS0=%03x DS1=%03x SP=%04x FP=%04x "
+            "R0=%04x R1=%04x R2=%04x R3=%04x\n",
+            foreground_event_queue_writes + 1u,
+            dmcu_code_segment(instruction_pc), dmcu_code_pc(instruction_pc),
+            addr & MASK16, actual_physical & MASK24,
+            old_value & width_mask(bits), value & width_mask(bits), bits,
+            env->sfr[DMCU_SFR_DS0] & 0x1ff,
+            env->sfr[DMCU_SFR_DS1] & 0x1ff,
+            env->gpr[DMCU_SP] & MASK16, env->gpr[DMCU_FP] & MASK16,
+            env->gpr[0] & MASK16, env->gpr[1] & MASK16,
+            env->gpr[2] & MASK16, env->gpr[3] & MASK16);
+        foreground_event_queue_writes++;
+    }
 
     if (clock_format_output_matches(env, actual_physical, bits, 1)) {
         uint32_t old_value = bits == 8 ?
@@ -1758,6 +4130,22 @@ static inline void translated_data_write(CPUDMCUState *env, uint32_t addr,
 
     trace_operation_object_write(env, actual_physical, value, bits,
                                  "data");
+    trace_start_object_write(
+        env, actual_physical,
+        bits == 8 ?
+            address_space_ldub(&address_space_memory, actual_physical,
+                               MEMTXATTRS_UNSPECIFIED, NULL) :
+            address_space_lduw_le(&address_space_memory, actual_physical,
+                                  MEMTXATTRS_UNSPECIFIED, NULL),
+        value, bits, 1);
+    trace_npe_render_object_write(
+        env, actual_physical,
+        bits == 8 ?
+            address_space_ldub(&address_space_memory, actual_physical,
+                               MEMTXATTRS_UNSPECIFIED, NULL) :
+            address_space_lduw_le(&address_space_memory, actual_physical,
+                                  MEMTXATTRS_UNSPECIFIED, NULL),
+        value, bits, 1);
 
     /*
      * A2:28FA/28FC supplies the far record pointer consumed by the indirect
@@ -2217,7 +4605,7 @@ static inline void translated_data_write(CPUDMCUState *env, uint32_t addr,
 
     if (env->in_interrupt && env->interrupt_frame_watch_active &&
         actual_physical <
-            (env->interrupt_frame_base & MASK16) + 6u &&
+            (env->interrupt_frame_base & MASK16) + env->interrupt_frame_size &&
         actual_physical + bits / 8 >
             (env->interrupt_frame_base & MASK16)) {
         uint32_t old_value = bits == 8 ?
@@ -2243,8 +4631,8 @@ static inline void translated_data_write(CPUDMCUState *env, uint32_t addr,
         trace_interrupt_foreground_fp_write(
             env, actual_physical, old_value, value, bits);
     }
-    if (env->in_interrupt && actual_physical < 0x000004d8u &&
-        actual_physical + bits / 8 > 0x000004d6u) {
+    if (env->in_interrupt && actual_physical < 0x000004d2u &&
+        actual_physical + bits / 8 > 0x000004d0u) {
         uint32_t old_value = bits == 8 ?
             address_space_ldub(&address_space_memory, actual_physical,
                                MEMTXATTRS_UNSPECIFIED, NULL) :
@@ -2499,6 +4887,35 @@ static inline void translated_data_write(CPUDMCUState *env, uint32_t addr,
         env->file_record_overlay_last_bits = bits;
     }
 
+    /* Track every guest write overlapping the exact 0x58-byte comparison
+     * adapter window.  This does not alter the store.  First/last writer and
+     * the live words reported by the machine state distinguish a loader that
+     * skipped 4F:A922 -> 32:A922 from a correct early install subsequently
+     * replaced by a broad application publish. */
+    if (actual_physical < 0x32a97au &&
+        actual_physical + bits / 8u > 0x32a922u) {
+        uint16_t old_value = bits == 8 ?
+            address_space_ldub(&address_space_memory, actual_physical,
+                               MEMTXATTRS_UNSPECIFIED, NULL) :
+            address_space_lduw_le(&address_space_memory, actual_physical,
+                                  MEMTXATTRS_UNSPECIFIED, NULL);
+
+        if (!env->far_compare_overlay_writes) {
+            env->far_compare_overlay_first_pc = env->pc & MASK24;
+            env->far_compare_overlay_first_address =
+                actual_physical & MASK24;
+            env->far_compare_overlay_first_old = old_value;
+            env->far_compare_overlay_first_value = value & width_mask(bits);
+            env->far_compare_overlay_first_bits = bits;
+        }
+        env->far_compare_overlay_writes++;
+        env->far_compare_overlay_last_pc = env->pc & MASK24;
+        env->far_compare_overlay_last_address = actual_physical & MASK24;
+        env->far_compare_overlay_last_old = old_value;
+        env->far_compare_overlay_last_value = value & width_mask(bits);
+        env->far_compare_overlay_last_bits = bits;
+    }
+
     /* The 27:81C8 resource-storage recovery overlay is correct at entry but
      * its AJMP at 27:81E4 can later turn into resource bytes.  Preserve the
      * first installer and most recent writer of that exact word so a data-bus
@@ -2524,6 +4941,35 @@ static inline void translated_data_write(CPUDMCUState *env, uint32_t addr,
         env->resource_recovery_word_last_old = old_word;
         env->resource_recovery_word_last_value = value & width_mask(bits);
         env->resource_recovery_word_last_bits = bits;
+    }
+
+    /* Track the exact source-49 event-state handler at live 2C:D350.  The
+     * initial application loader installs it, but a later overlay phase may
+     * reuse the same destination.  First/last writer evidence distinguishes
+     * a skipped resident exchange from a successful copy that was replaced;
+     * no write or instruction fetch is changed. */
+    if (actual_physical < 0x2cd530u &&
+        actual_physical + bits / 8u > 0x2cd350u) {
+        uint16_t old_value = bits == 8 ?
+            address_space_ldub(&address_space_memory, actual_physical,
+                               MEMTXATTRS_UNSPECIFIED, NULL) :
+            address_space_lduw_le(&address_space_memory, actual_physical,
+                                  MEMTXATTRS_UNSPECIFIED, NULL);
+
+        if (!env->event_state_overlay_writes) {
+            env->event_state_overlay_first_pc = env->pc & MASK24;
+            env->event_state_overlay_first_address =
+                actual_physical & MASK24;
+            env->event_state_overlay_first_old = old_value;
+            env->event_state_overlay_first_value = value & width_mask(bits);
+            env->event_state_overlay_first_bits = bits;
+        }
+        env->event_state_overlay_writes++;
+        env->event_state_overlay_last_pc = env->pc & MASK24;
+        env->event_state_overlay_last_address = actual_physical & MASK24;
+        env->event_state_overlay_last_old = old_value;
+        env->event_state_overlay_last_value = value & width_mask(bits);
+        env->event_state_overlay_last_bits = bits;
     }
 
     if ((env->pc & MASK24) >= 0x065b00u &&
@@ -2698,6 +5144,43 @@ static inline void translated_data_write(CPUDMCUState *env, uint32_t addr,
     }
 
     /*
+     * The relocated 3D:F928 storage-sector probe treats 51:29B4/29B6 as an
+     * optional far callback.  The vendor initializer deliberately publishes
+     * 0000:0000 there, but a failing NPE launch later observes a data-looking
+     * nonzero target and enters it through the probe's original computed
+     * RETS call sequence.  Retain the first value-changing guest writes so we
+     * can identify the producer without fixing the callback, suppressing the
+     * call, or changing normal RAM semantics.
+     */
+    if (actual_physical < 0x005129b8u &&
+        actual_physical + bits / 8 > 0x005129b4u &&
+        storage_callback_writes < 128) {
+        uint32_t old_value = bits == 8 ?
+            address_space_ldub(&address_space_memory, actual_physical,
+                               MEMTXATTRS_UNSPECIFIED, NULL) :
+            address_space_lduw_le(&address_space_memory, actual_physical,
+                                  MEMTXATTRS_UNSPECIFIED, NULL);
+
+        if ((old_value & width_mask(bits)) !=
+            (value & width_mask(bits))) {
+            qemu_log_mask(LOG_UNIMP,
+                          "DMCU storage callback write #%u %06x "
+                          "old=%04x new=%04x bits=%d at %02x:%04x "
+                          "logical=%04x DS0=%03x DS1=%03x sp=%04x fp=%04x\n",
+                          storage_callback_writes + 1, actual_physical,
+                          old_value & width_mask(bits),
+                          value & width_mask(bits), bits,
+                          dmcu_code_segment(env->pc),
+                          dmcu_code_pc(env->pc), addr & MASK16,
+                          env->sfr[DMCU_SFR_DS0] & 0x1ff,
+                          env->sfr[DMCU_SFR_DS1] & 0x1ff,
+                          env->gpr[DMCU_SP] & MASK16,
+                          env->gpr[DMCU_FP] & MASK16);
+            storage_callback_writes++;
+        }
+    }
+
+    /*
      * The storage registry publishes a 0x26-byte-stride record array rooted
      * at 51:27A0.  The current failing path reaches record 0 with a valid
      * driver-object pointer at +0x22, but that object's +0x06 callback stays
@@ -2801,6 +5284,53 @@ static inline void translated_data_write(CPUDMCUState *env, uint32_t addr,
      * on this external bus, so report the actual RAM byte address rather than
      * the pre-lane-swap logical address.  This is diagnostic-only and does
      * not alter the guest-visible write. */
+    if (actual_physical == 0x512250u) {
+        uint32_t old_value = bits == 8 ?
+            address_space_ldub(&address_space_memory, actual_physical,
+                               MEMTXATTRS_UNSPECIFIED, NULL) :
+            address_space_lduw_le(&address_space_memory, actual_physical,
+                                  MEMTXATTRS_UNSPECIFIED, NULL);
+
+        if ((old_value & width_mask(bits)) !=
+            (value & width_mask(bits))) {
+            unsigned slot = env->resource_count_trace_count %
+                            DMCU_RESOURCE_COUNT_TRACE_SLOTS;
+            uint16_t frame = env->gpr[DMCU_FP] & MASK16;
+            unsigned frame_index;
+            unsigned index;
+
+            env->resource_count_trace_pc[slot] = env->pc & MASK24;
+            env->resource_count_trace_old[slot] =
+                old_value & width_mask(bits);
+            env->resource_count_trace_new[slot] = value & width_mask(bits);
+            env->resource_count_trace_bits[slot] = bits;
+            env->resource_count_trace_sp[slot] =
+                env->gpr[DMCU_SP] & MASK16;
+            env->resource_count_trace_fp[slot] = frame;
+            for (index = 0; index < 4; index++) {
+                env->resource_count_trace_gpr[slot][index] =
+                    env->gpr[index] & MASK16;
+            }
+            memset(env->resource_count_trace_chain[slot], 0,
+                   sizeof(env->resource_count_trace_chain[slot]));
+            for (frame_index = 0;
+                 frame_index < DMCU_RESOURCE_COUNT_TRACE_FRAMES && frame;
+                 frame_index++) {
+                uint16_t *snapshot =
+                    env->resource_count_trace_chain[slot][frame_index];
+
+                snapshot[0] = frame;
+                for (index = 1;
+                     index < DMCU_RESOURCE_COUNT_TRACE_FRAME_WORDS;
+                     index++) {
+                    snapshot[index] = internal_data_read(
+                        (frame + (index - 1u) * 2u) & MASK16, 16);
+                }
+                frame = snapshot[1];
+            }
+            env->resource_count_trace_count++;
+        }
+    }
     if ((actual_physical >= 0x5128d6 && actual_physical < 0x5128dc) ||
         (actual_physical >= 0x512a80 && actual_physical < 0x512a90) ||
         (actual_physical >= 0x512aaa && actual_physical < 0x512aac) ||
@@ -2814,6 +5344,14 @@ static inline void translated_data_write(CPUDMCUState *env, uint32_t addr,
             address_space_lduw_le(&address_space_memory, actual_physical,
                                   MEMTXATTRS_UNSPECIFIED, NULL);
 
+        /* Count every guest write, including a repeated value.  A toggled
+         * status key deliberately writes the same 0x8C candidate on its next
+         * press, so a value-change-only counter would miss the second edge. */
+        if (actual_physical == 0x5128d8u && bits == 16) {
+            env->matrix_candidate_writes++;
+            env->matrix_candidate_pc = env->pc & MASK24;
+            env->matrix_candidate_last = value & MASK16;
+        }
         if ((env->pc & MASK24) == 0x28f6deu &&
             actual_physical == 0x5128dau && bits == 16) {
             env->matrix_event_maps++;
@@ -2822,6 +5360,11 @@ static inline void translated_data_write(CPUDMCUState *env, uint32_t addr,
         }
         if ((old_value & width_mask(bits)) !=
             (value & width_mask(bits))) {
+            /* 28:F4A4 stores the table-mapped firmware event in A2:28D8
+             * before deciding whether it is an ordinary 28:F6DE event or a
+             * locally consumed status key such as 0x8C.  Retain this bounded
+             * edge independently from matrix_event_maps so Web probes do not
+             * misclassify an intentional consumer as a lost physical key. */
             if (actual_physical >= 0x52455cu &&
                 actual_physical < 0x524572u) {
                 qemu_log_mask(
@@ -2852,6 +5395,18 @@ static inline void translated_data_write(CPUDMCUState *env, uint32_t addr,
             if (actual_physical == 0x512aaau) {
                 uint16_t frame = env->gpr[DMCU_FP] & MASK16;
                 unsigned int index;
+
+                /* State 0x78 is the recovered Game World operation.  Arm a
+                 * fresh, observation-only glyph trace at the state boundary
+                 * so it includes the progress message drawn before the NPE
+                 * directory page reaches the NAND buffer. */
+                if (bits == 16 && (value & MASK16) == 0x0078u) {
+                    env->npe_glyph_trace_count = 0;
+                    env->npe_glyph_trace_armed = true;
+                    env->npe_far_copy_trace_count = 0;
+                    env->npe_control_trace_count = 0;
+                    env->npe_control_trace_frozen = false;
+                }
 
                 env->application_state_write_count++;
                 env->application_state_write_pc = env->pc & MASK24;
@@ -2903,7 +5458,70 @@ static inline void translated_data_write(CPUDMCUState *env, uint32_t addr,
             env->selector_state_trace_new[selector_slot] =
                 value & width_mask(bits);
             env->selector_state_trace_bits[selector_slot] = bits;
+            env->selector_state_trace_sp[selector_slot] =
+                env->gpr[DMCU_SP] & MASK16;
+            env->selector_state_trace_fp[selector_slot] =
+                env->gpr[DMCU_FP] & MASK16;
+            env->selector_state_trace_ds0[selector_slot] =
+                env->sfr[DMCU_SFR_DS0] & 0x1ff;
+            env->selector_state_trace_ds1[selector_slot] =
+                env->sfr[DMCU_SFR_DS1] & 0x1ff;
+            for (unsigned int register_index = 0;
+                 register_index < 4; register_index++) {
+                env->selector_state_trace_gpr[selector_slot][register_index] =
+                    env->gpr[register_index] & MASK16;
+            }
+            {
+                static const uint16_t local_offsets[16] = {
+                    0xff76, 0xff78, 0xffdc, 0xffe4,
+                    0xffe6, 0xfffa, 0xfffc, 0xfffe,
+                    0xffc4, 0xffc6, 0xff8e, 0xff90,
+                    0xffa0, 0xffd2, 0xff9e, 0xff96,
+                };
+                uint16_t frame = env->gpr[DMCU_FP] & MASK16;
+
+                for (unsigned int local_index = 0;
+                     local_index < ARRAY_SIZE(local_offsets); local_index++) {
+                    env->selector_state_trace_locals[selector_slot][local_index] =
+                        internal_data_read(
+                            (frame + local_offsets[local_index]) & MASK16, 16);
+                }
+                for (unsigned int frame_index = 0; frame_index < 12;
+                     frame_index++) {
+                    env->selector_state_trace_frame[selector_slot][frame_index] =
+                        internal_data_read(
+                            (frame + frame_index * 2u) & MASK16, 16);
+                }
+            }
             env->selector_state_trace_count++;
+        }
+    }
+
+    /* A2:2250 is the exact exit gate tested at 20:3372 by the foreground
+     * desktop loop.  B0 is delivered through a second resident task, so a
+     * last-value-only snapshot cannot distinguish "never requested exit"
+     * from "set and immediately cleared".  Retain every value-changing
+     * guest write without altering the store or the scheduling path. */
+    if (actual_physical < 0x512252u &&
+        actual_physical + bits / 8u > 0x512250u) {
+        uint32_t old_value = bits == 8 ?
+            address_space_ldub(&address_space_memory, actual_physical,
+                               MEMTXATTRS_UNSPECIFIED, NULL) :
+            address_space_lduw_le(&address_space_memory, actual_physical,
+                                  MEMTXATTRS_UNSPECIFIED, NULL);
+
+        if ((old_value & width_mask(bits)) !=
+            (value & width_mask(bits))) {
+            uint32_t slot = env->root_exit_state_trace_count %
+                            DMCU_ROOT_EXIT_STATE_TRACE_SLOTS;
+
+            env->root_exit_state_trace_pc[slot] = env->pc & MASK24;
+            env->root_exit_state_trace_old[slot] =
+                old_value & width_mask(bits);
+            env->root_exit_state_trace_new[slot] =
+                value & width_mask(bits);
+            env->root_exit_state_trace_bits[slot] = bits;
+            env->root_exit_state_trace_count++;
         }
     }
 
@@ -3202,6 +5820,19 @@ static inline void translated_data_write(CPUDMCUState *env, uint32_t addr,
                       env->sfr[DMCU_SFR_DS1] & 0x1ff);
     }
 
+    if (bits == 16 &&
+        (actual_physical == 0x525598u || actual_physical == 0x52559au)) {
+        unsigned slot = (actual_physical - 0x525598u) >> 1;
+
+        env->vma03_object_pointer_writes++;
+        env->vma03_object_pointer_write_pc =
+            env->current_instruction_pc & MASK24;
+        env->vma03_object_pointer_old[slot] =
+            address_space_lduw_le(&address_space_memory, actual_physical,
+                                  MEMTXATTRS_UNSPECIFIED, NULL);
+        env->vma03_object_pointer_new[slot] = value & MASK16;
+    }
+
     /*
      * Object zero is the first storage object rejected by 50:B0B2.  Its
      * descriptor points at 50:02A6 (backing/template state) and 50:0806
@@ -3284,6 +5915,46 @@ static inline void translated_data_write(CPUDMCUState *env, uint32_t addr,
     } else {
         cpu_stw_data(env, backing_addr, value);
     }
+    if (transition_gate_write) {
+        uint32_t sequence = env->npe_transition_gate_writes++;
+        uint32_t slot = sequence % DMCU_NPE_TRANSITION_GATE_SLOTS;
+
+        env->npe_transition_gate_write_pc[slot] = instruction_pc;
+        env->npe_transition_gate_write_logical[slot] = addr & MASK16;
+        env->npe_transition_gate_write_physical[slot] =
+            actual_physical & MASK24;
+        env->npe_transition_gate_write_value[slot] =
+            value & width_mask(bits);
+        env->npe_transition_gate_write_old[slot] = transition_gate_old;
+        env->npe_transition_gate_write_new[slot] = address_space_lduw_le(
+            &address_space_memory, 0x50b87au,
+            MEMTXATTRS_UNSPECIFIED, NULL);
+        env->npe_transition_gate_write_ds0[slot] =
+            env->sfr[DMCU_SFR_DS0] & 0x01ffu;
+        env->npe_transition_gate_write_ds1[slot] =
+            env->sfr[DMCU_SFR_DS1] & 0x01ffu;
+        env->npe_transition_gate_write_bits[slot] = bits;
+    }
+    /* 29:CE22..CFFF occupies the suffix of a full 2-KiB code-page RAMBlock.
+     * Mirror the real guest data-bus store into that executable page.  The
+     * D000..D34F tail directly aliases the shared publisher RAM and needs no
+     * mirror.  This is architectural overlay coherence, not an observer or
+     * ROM service replacement. */
+    if (actual_physical >= 0x29ce22u &&
+        actual_physical < 0x29d000u) {
+        AddressSpace *code_as = cpu_get_address_space(
+            env_cpu(env), DMCU_AS_CODE);
+
+        if (bits == 8) {
+            address_space_stb(code_as, actual_physical, value,
+                              MEMTXATTRS_UNSPECIFIED, NULL);
+        } else {
+            address_space_stw_le(code_as, actual_physical, value,
+                                 MEMTXATTRS_UNSPECIFIED, NULL);
+        }
+    }
+    trace_npe_game_data_write_end(env, npe_game_data_write_slot,
+                                  actual_physical, bits);
     trace_outer_context_data(env, addr, value, bits, true);
 }
 
@@ -3450,7 +6121,45 @@ static inline void internal_data_write(uint32_t addr, uint32_t value,
         bits == 8 ? ldub_p(physical) : lduw_le_p(physical),
         value, bits, 0);
 
+    /* The current B0 manager path eventually pops 16:0030 from the two
+     * internal-SRAM words at 0C36/0C38 even though no instruction in
+     * 16:0000..002F executed.  Retain the last writes to those exact words
+     * so the guest producer of the synthetic continuation can be identified
+     * without changing the stack or the return itself. */
+    if (backing < 0x0c3au && backing + width > 0x0c36u) {
+        uint32_t sequence = env->resident16_return_trace_count++;
+        uint32_t slot =
+            sequence % DMCU_RESIDENT16_RETURN_TRACE_SLOTS;
+
+        env->resident16_return_trace_pc[slot] =
+            env->current_instruction_pc & MASK24;
+        env->resident16_return_trace_address[slot] = backing & MASK16;
+        env->resident16_return_trace_old[slot] =
+            (bits == 8 ? ldub_p(physical) : lduw_le_p(physical)) &
+            width_mask(bits);
+        env->resident16_return_trace_new[slot] =
+            value & width_mask(bits);
+        env->resident16_return_trace_sp[slot] =
+            env->gpr[DMCU_SP] & MASK16;
+        env->resident16_return_trace_fp[slot] =
+            env->gpr[DMCU_FP] & MASK16;
+        env->resident16_return_trace_bits[slot] = bits;
+        env->resident16_return_trace_in_irq[slot] = env->in_interrupt;
+    }
+
     trace_operation_object_write(env, logical, value, bits, "internal");
+    trace_start_object_write(
+        env, backing, bits == 8 ? ldub_p(physical) : lduw_le_p(physical),
+        value, bits, 0);
+    trace_npe_render_object_write(
+        env, backing, bits == 8 ? ldub_p(physical) : lduw_le_p(physical),
+        value, bits, 0);
+    dmcu_start_page_return_record_write(
+        env, backing, bits == 8 ? ldub_p(physical) : lduw_le_p(physical),
+        value, bits, 0, env->current_instruction_pc);
+    dmcu_npe_resource_return_record_write(
+        env, backing, bits == 8 ? ldub_p(physical) : lduw_le_p(physical),
+        value, bits, 0, env->current_instruction_pc);
 
     if (env->application_init_frame_watch_active &&
         backing < (env->application_init_frame_base & MASK16) + 6u &&
@@ -3541,7 +6250,8 @@ static inline void internal_data_write(uint32_t addr, uint32_t value,
     }
 
     if (env->in_interrupt && env->interrupt_frame_watch_active &&
-        backing < (env->interrupt_frame_base & MASK16) + 6u &&
+        backing < (env->interrupt_frame_base & MASK16) +
+                  env->interrupt_frame_size &&
         backing + width > (env->interrupt_frame_base & MASK16)) {
         uint32_t old_value = bits == 8 ?
             ldub_p(physical) : lduw_le_p(physical);
@@ -3559,8 +6269,8 @@ static inline void internal_data_write(uint32_t addr, uint32_t value,
         trace_interrupt_foreground_fp_write(
             env, backing, old_value, value, bits);
     }
-    if (env->in_interrupt && logical < 0x04d8u &&
-        logical + width > 0x04d6u) {
+    if (env->in_interrupt && logical < 0x04d2u &&
+        logical + width > 0x04d0u) {
         uint32_t old_value = bits == 8 ?
             ldub_p(physical) : lduw_le_p(physical);
 
@@ -3638,11 +6348,7 @@ static inline void internal_data_write(uint32_t addr, uint32_t value,
         env->event_frame_write_fp = env->gpr[DMCU_FP] & MASK16;
     }
 
-    if (bits == 8) {
-        stb_p(physical, value);
-    } else {
-        stw_le_p(physical, value);
-    }
+    dmcu_internal_memory_write(cpu, logical, value, bits);
 }
 
 static inline bool is_stack_pointer(unsigned reg)
@@ -3650,17 +6356,153 @@ static inline bool is_stack_pointer(unsigned reg)
     return reg == DMCU_FP || reg == DMCU_SP;
 }
 
+static uint32_t pointer_modifier(CPUDMCUState *env, unsigned reg)
+{
+    switch (reg) {
+    case 8: return env->sfr[DMCU_SFR_XM0] & MASK16;
+    case 10: return env->sfr[DMCU_SFR_XM2] & MASK16;
+    case 14: return env->sfr[DMCU_SFR_YM2] & MASK16;
+    default: return 0; /* Other modifier mappings are still unverified. */
+    }
+}
+
+static bool pointer_circular_valid(CPUDMCUState *env, unsigned reg,
+                                   uint32_t addr)
+{
+    uint32_t length = pointer_modifier(env, reg), span = 1;
+
+    while (span < length) {
+        span <<= 1;
+    }
+    return length != 0xffff &&
+           (!length || (addr & (span - 1)) < length);
+}
+
+static uint32_t pointer_postincrement(CPUDMCUState *env, unsigned reg,
+                                     uint32_t addr, int32_t increment)
+{
+    /* Resolve this before operand/register writes. CN1916884A pp.16-17
+     * puts indirect addressing and postincrement in operand fetch, before
+     * result writeback. An operand can alias its own modifier SFR. Keep
+     * the calculated address locally until the instruction commits it. */
+    uint32_t length = pointer_modifier(env, reg);
+    uint32_t span = 1, base;
+    int32_t offset;
+
+    addr &= MASK16;
+    if (!length) {
+        return (addr + increment) & MASK16;
+    }
+    /* CN1916884A fig. 10: length is in bytes, base is aligned to the
+     * smallest containing power of two. Original audio uses length 0600
+     * at base 1000, so 15ff++ returns to 1000, not 1600 or 1200.
+     * X2/Y2 use the same rule. Other modifier mappings and bit reversal
+     * remain unimplemented; memory MAC rejects those unknown forms. */
+    while (span < length) {
+        span <<= 1;
+    }
+    base = addr & ~(span - 1);
+    offset = ((int32_t)(addr - base) + increment) % (int32_t)length;
+    if (offset < 0) {
+        offset += length;
+    }
+    return (base + offset) & MASK16;
+}
+
+static uint32_t instruction_agu_pointer_mask(uint8_t op, uint8_t arg)
+{
+    unsigned dr = arg >> 4, sr = arg & 15;
+
+    if ((op >> 4 == 2 || op >> 4 == 3) && (op & 15) <= 7) {
+        return 1u << (8 + (arg & 7));
+    }
+    switch (op) {
+    case 0x0a: case 0x0b: case 0x1a: case 0x1b:
+    case 0x2c: case 0x2d: case 0x3c: case 0x3d:
+        return 1u << dr;
+    case 0x28: case 0x29: case 0x38: case 0x39:
+        return 1u << sr;
+    case 0x2a: case 0x2b: case 0x3a: case 0x3b:
+    case 0x5a: case 0x5b:
+        return (1u << dr) | (1u << sr);
+    case 0x8a: case 0x8b:
+        return arg <= 15 ? 1u << arg : 0;
+    case 0x1e:
+        return dr <= 7 && (dr & 1) ? 1u << sr : 0;
+    default:
+        /* [--Rn] and [Rn+immediate] explicitly bypass AGU (fig. 9). */
+        return 0;
+    }
+}
+
+static inline bool is_y_pointer(unsigned reg)
+{
+    return reg >= 12 && reg <= 14;
+}
+
+static bool instruction_y_addresses_valid(CPUDMCUState *env, uint8_t op,
+                                          uint8_t arg, uint16_t ext)
+{
+    uint32_t pointers = instruction_agu_pointer_mask(op, arg);
+    unsigned bytes;
+
+    /* Fig. 9 includes predecrement and displacement forms in the Y-only
+     * address space even though they bypass circular/bit-reversal AGU. */
+    switch (op) {
+    case 0x58: case 0x59:
+        pointers |= 1u << (arg >> 4);
+        break;
+    case 0x6a: case 0x6b: case 0x78: case 0x79:
+        pointers |= 1u << (arg & 15);
+        break;
+    }
+    if (!(pointers & 0x7000u)) {
+        return true;
+    }
+    if ((op >> 4 == 2 || op >> 4 == 3) && (op & 15) <= 7) {
+        bytes = op >> 4 == 2 ? 1 : 2;
+    } else if (op == 0x1e || op == 0x2c || op == 0x2d ||
+               op == 0x3c || op == 0x3d) {
+        bytes = 2;
+    } else {
+        bytes = op & 1 ? 1 : 2;
+    }
+    for (unsigned reg = 12; reg <= 14; reg++) {
+        uint32_t addr = env->gpr[reg];
+
+        if (!(pointers & (1u << reg))) {
+            continue;
+        }
+        if (op == 0x58 || op == 0x59) {
+            addr -= bytes;
+        } else if (op == 0x6a || op == 0x6b || op == 0x78 || op == 0x79) {
+            addr += ext;
+        }
+        addr &= MASK16;
+        if (addr < 0x8000 || addr + bytes > 0xc000) {
+            /* Outside the documented Y-RAM range: do not silently access
+             * an external bank or mutate a pointer before reporting it.
+             * Hardware EXR delivery for invalid addresses remains unknown. */
+            return false;
+        }
+    }
+    return true;
+}
+
 static inline uint32_t pointer_read(CPUDMCUState *env, unsigned reg,
                                     uint32_t addr, int bits)
 {
-    return is_stack_pointer(reg) ? internal_data_read(addr, bits) :
-                                   translated_data_read(env, addr, bits);
+    /* CN1916884A figs. 2/5/9: Y0..Y2 access internal Y-RAM regardless of
+     * DS0/DS1. Ordinary loads/stores must agree with the MAC Y operand. */
+    return is_stack_pointer(reg) || is_y_pointer(reg) ?
+           internal_data_read(addr, bits) :
+           translated_data_read(env, addr, bits);
 }
 
 static inline void pointer_write(CPUDMCUState *env, unsigned reg,
                                  uint32_t addr, uint32_t value, int bits)
 {
-    if (is_stack_pointer(reg)) {
+    if (is_stack_pointer(reg) || is_y_pointer(reg)) {
         internal_data_write(addr, value, bits);
     } else {
         translated_data_write(env, addr, value, bits);
@@ -3820,18 +6662,50 @@ static inline uint32_t near_pc(uint32_t pc, uint32_t low)
 static inline uint32_t bit_read(CPUDMCUState *env, uint32_t addr,
                                 unsigned bitno)
 {
-    /* bitoff 00..7F names SFR 80..FF; 70..7F therefore maps R0..R15. */
-    return (sfr_read(env, (addr | 0x80) & 0xff, 16) >>
+    /* Low peripheral bit addresses name the same direct SFR.  In particular
+     * the original Timer2 waiter writes REG[53] then polls BIT[53].0;
+     * mapping all low addresses through | 80 incorrectly polls D3 instead.
+     * Only the compact 70..7F GPR bit aliases select F0..FF (see the original
+     * PLL control routine's BIT[70] operations on R0). High bit addresses
+     * select the 128 words of DPRAM, not direct SFR[80..FF]. CN1916884A
+     * fig. 2 locates that RAM at F000..F0FF; original 24:97F6 writes F01C
+     * and 24:9A48..9AAC tests BIT[8E] to select the same timer routes. */
+    unsigned reg = addr & 0xff;
+
+    if (reg >= 0x80) {
+        return (internal_data_read(0xf000 + 2 * (reg - 0x80), 16) >>
+                (bitno & 15)) & 1;
+    }
+    if (reg >= 0x70 && reg < 0x80) {
+        reg |= 0x80;
+    }
+    return (sfr_read(env, reg, 16) >>
             (bitno & 15)) & 1;
 }
 
 static inline void bit_write(CPUDMCUState *env, uint32_t addr,
                              unsigned bitno, bool value)
 {
-    unsigned reg = (addr | 0x80) & 0xff;
-    uint32_t current = sfr_read(env, reg, 16);
+    unsigned reg = addr & 0xff;
+    uint32_t current;
     uint32_t mask = 1u << (bitno & 15);
 
+    if (reg >= 0x80) {
+        uint32_t address = 0xf000 + 2 * (reg - 0x80);
+
+        current = internal_data_read(address, 16);
+        internal_data_write(address, value ? current | mask : current & ~mask,
+                            16);
+        return;
+    }
+    if (reg >= 0x70 && reg < 0x80) {
+        reg |= 0x80;
+    }
+    /* Hold across the complete bit RMW, not just its individual read and
+     * write calls. Device ticks may update another bit (notably ICR.RQ). */
+    g_autoptr(IOThreadLockAuto) bit_device_lock = dmcu_sfr_has_timing(reg) ?
+        qemu_iothread_auto_lock(__FILE__, __LINE__) : NULL;
+    current = sfr_read(env, reg, 16);
     sfr_write(env, reg, value ? current | mask : current & ~mask, 16);
 }
 
@@ -3856,13 +6730,51 @@ static void unsupported(CPUDMCUState *env, uint32_t pc, uint16_t word)
     env->pc = pc & MASK24;
     if (first) {
         env->control_trace_frozen = true;
-        qemu_log_mask(LOG_UNIMP,
-                      "DMCU unsupported instruction %04x at %02x:%04x\n",
-                      word, dmcu_code_segment(pc), dmcu_code_pc(pc));
+        if (env->unsupported_repeat_reason) {
+            qemu_log_mask(LOG_UNIMP,
+                          "DMCU unimplemented IREP exception (%s): "
+                          "%04x at %02x:%04x; no instruction side effects\n",
+                          env->unsupported_repeat_reason == 1 ?
+                          "forbidden REP target" : "repeat in service mode",
+                          word, dmcu_code_segment(pc), dmcu_code_pc(pc));
+        } else {
+            qemu_log_mask(LOG_UNIMP,
+                          "DMCU unsupported instruction %04x at %02x:%04x\n",
+                          word, dmcu_code_segment(pc), dmcu_code_pc(pc));
+        }
     }
     cs->halted = 1;
     cs->exception_index = EXCP_HLT;
     cpu_loop_exit(cs);
+}
+
+static bool is_repeat_instruction(uint16_t word)
+{
+    unsigned op = word >> 8;
+    unsigned arg = word & 0xff;
+
+    return word == 0xbf00 || (op == 0xcf && arg < 16) ||
+           op == 0xae || (op == 0xaf && arg < 16);
+}
+
+/* CN1916884A PDF p120: the SINGLE instruction repeated by REP cannot be
+ * a branch (including an untaken conditional), call/return, TRAP, another
+ * REP/REPB, CRIT, LINK or UNLINK. This is not a blanket ban on instructions
+ * inside a REPB block: original drawing code uses REP within that block.
+ * Reserved encodings remain separate unsupported-instruction boundaries.
+ */
+static bool forbidden_rep_target(uint16_t word)
+{
+    unsigned op = word >> 8;
+    unsigned arg = word & 0xff;
+
+    return is_repeat_instruction(word) || op == 0x0f ||
+           ((op == 0xac || op == 0xbc) && arg < 16) ||
+           op == 0xad || op == 0xbd || op == 0xcc || op == 0xcd ||
+           op == 0xce || (op >= 0xd0 && op <= 0xde) ||
+           (op >= 0x9a && op <= 0x9d) ||
+           (op == 0xc6 && (arg == 0 || arg == 0x10 || arg == 0x20)) ||
+           (op == 0x3f && arg <= 3) || op == 0x2e || word == 0x2f00;
 }
 
 static bool exec_alu(CPUDMCUState *env, uint8_t op, uint8_t arg,
@@ -3878,6 +6790,13 @@ static bool exec_alu(CPUDMCUState *env, uint8_t op, uint8_t arg,
     if (operation > 7) {
         return false;
     }
+    /* Direct immediate SFR ALU is one instruction transaction. Do not
+     * carry BQL into cpu_ld/st of a memory operand: TCG MMIO dispatch owns
+     * that lock and does not permit recursive acquisition. Such aliases
+     * still use the synchronized register read/write boundaries. */
+    g_autoptr(IOThreadLockAuto) alu_device_lock =
+        ((hi == 6 || hi == 7) && dmcu_sfr_has_timing(arg)) ?
+        qemu_iothread_auto_lock(__FILE__, __LINE__) : NULL;
     byte_mode = hi == 0 || hi == 2 || hi == 4 ||
                 hi == 6 || hi == 8 || hi == 10;
     bits = byte_mode ? 8 : 16;
@@ -3890,12 +6809,15 @@ static bool exec_alu(CPUDMCUState *env, uint8_t op, uint8_t arg,
     } else if (hi == 2 || hi == 3) {
         unsigned ptrreg = 8 + (arg & 7);
         uint32_t ptr = env->gpr[ptrreg];
+        uint32_t next = arg & 8 ?
+            pointer_postincrement(env, ptrreg, ptr, bits / 8) : ptr;
+
         dst_kind = DST_GPR;
         dst = arg >> 4;
         left = reg_read(env, dst, bits);
         right = pointer_read(env, ptrreg, ptr, bits);
         if (arg & 8) {
-            env->gpr[ptrreg] = (ptr + bits / 8) & MASK16;
+            env->gpr[ptrreg] = next;
         }
     } else if (hi == 4 || hi == 5) {
         dst_kind = DST_GPR;
@@ -3939,7 +6861,7 @@ static bool exec_move(CPUDMCUState *env, uint8_t op, uint8_t arg,
 {
     int bits;
     unsigned dr, sr;
-    uint32_t ptr, value;
+    uint32_t ptr, value, next;
 
     switch (op) {
     case 0x08: case 0x09:
@@ -3959,8 +6881,9 @@ static bool exec_move(CPUDMCUState *env, uint8_t op, uint8_t arg,
         bits = op == 0x1b ? 8 : 16;
         dr = arg >> 4;
         ptr = env->gpr[dr];
+        next = pointer_postincrement(env, dr, ptr, bits / 8);
         pointer_write(env, dr, ptr, reg_read(env, arg, bits), bits);
-        env->gpr[dr] = (ptr + bits / 8) & MASK16;
+        env->gpr[dr] = next;
         return true;
     case 0x28: case 0x29:
         bits = op == 0x29 ? 8 : 16;
@@ -3979,17 +6902,24 @@ static bool exec_move(CPUDMCUState *env, uint8_t op, uint8_t arg,
         bits = op == 0x39 ? 8 : 16;
         sr = arg & 15;
         ptr = env->gpr[sr];
-        reg_write(env, arg >> 4, pointer_read(env, sr, ptr, bits), bits);
-        env->gpr[sr] = (ptr + bits / 8) & MASK16;
+        next = pointer_postincrement(env, sr, ptr, bits / 8);
+        value = pointer_read(env, sr, ptr, bits);
+        /* AGU update belongs to operand fetch; the loaded destination is
+         * written afterwards. Original 08:2FF4 deliberately uses R7 both
+         * ways to load the final audio-clock table field. RB destinations
+         * may also alias one byte of the incremented word pointer. */
+        env->gpr[sr] = next;
+        reg_write(env, arg >> 4, value, bits);
         return true;
     case 0x3a: case 0x3b:
         bits = op == 0x3b ? 8 : 16;
         sr = arg & 15;
         ptr = env->gpr[sr];
+        next = pointer_postincrement(env, sr, ptr, bits / 8);
         dr = arg >> 4;
         pointer_write(env, dr, env->gpr[dr],
                       pointer_read(env, sr, ptr, bits), bits);
-        env->gpr[sr] = (ptr + bits / 8) & MASK16;
+        env->gpr[sr] = next;
         return true;
     case 0x48: case 0x49:
         reg_write(env, arg >> 4, arg & 15, op == 0x49 ? 8 : 16);
@@ -4000,15 +6930,25 @@ static bool exec_move(CPUDMCUState *env, uint8_t op, uint8_t arg,
         env->gpr[dr] = (env->gpr[dr] - bits / 8) & MASK16;
         pointer_write(env, dr, env->gpr[dr], reg_read(env, arg, bits), bits);
         return true;
-    case 0x5a: case 0x5b:
+    case 0x5a: case 0x5b: {
+        uint32_t dptr, sptr, dnext, snext;
+
         bits = op == 0x5b ? 8 : 16;
         dr = arg >> 4;
         sr = arg & 15;
-        pointer_write(env, dr, env->gpr[dr],
-                      pointer_read(env, sr, env->gpr[sr], bits), bits);
-        env->gpr[dr] = (env->gpr[dr] + bits / 8) & MASK16;
-        env->gpr[sr] = (env->gpr[sr] + bits / 8) & MASK16;
+        dptr = env->gpr[dr];
+        sptr = env->gpr[sr];
+        dnext = pointer_postincrement(env, dr, dptr, bits / 8);
+        /* Retain the existing double update when both operands name the
+         * same pointer. Its hardware conflict semantics remain unverified. */
+        snext = pointer_postincrement(env, sr, dr == sr ? dnext : sptr,
+                                     bits / 8);
+        value = pointer_read(env, sr, sptr, bits);
+        pointer_write(env, dr, dptr, value, bits);
+        env->gpr[dr] = dnext;
+        env->gpr[sr] = snext;
         return true;
+    }
     case 0x68: case 0x69:
         sfr_write(env, arg, ext, op == 0x69 ? 8 : 16);
         return true;
@@ -4065,7 +7005,7 @@ static bool exec_shift(CPUDMCUState *env, uint8_t op, uint8_t arg)
     uint32_t carry = 0;
     bool overflow = false;
     bool mem = false;
-    uint32_t addr = 0;
+    uint32_t addr = 0, next = 0;
 
     switch (op) {
     case 0x0c: kind = SH_SL; count = sext8(reg_read(env, arg, 8)); break;
@@ -4090,6 +7030,7 @@ static bool exec_shift(CPUDMCUState *env, uint8_t op, uint8_t arg)
     }
     if (mem) {
         addr = env->gpr[dr];
+        next = pointer_postincrement(env, dr, addr, 2);
         value = pointer_read(env, dr, addr, 16);
     }
     if (count < 0) {
@@ -4146,7 +7087,12 @@ static bool exec_shift(CPUDMCUState *env, uint8_t op, uint8_t arg)
     if (kind == SH_SLOSB || kind == SH_SROSB) {
         /* OSB instructions consume the prior SB even when count is zero. */
         value |= incoming_shift_buffer;
-    } else if (kind == SH_SL || kind == SH_SR || kind == SH_ASR) {
+    } else if (kind == SH_SL || kind == SH_SR || kind == SH_ASR ||
+               kind == SH_ASL) {
+        /* ASR initializes SB before dispatching a negative count to ASL
+         * (CN1916884A pp. 57-58). ASL does not collect shifted bits into
+         * SB, but must not leak a preceding instruction's buffer into a
+         * later SLOSB/SROSB operation. */
         env->shift_buffer = outgoing_shift_buffer;
     }
     if (kind == SH_ASL && overflow) {
@@ -4159,11 +7105,23 @@ static bool exec_shift(CPUDMCUState *env, uint8_t op, uint8_t arg)
              kind == SH_ROL || kind == SH_ROR ? false : overflow);
     if (mem) {
         pointer_write(env, dr, addr, value, 16);
-        env->gpr[dr] = (addr + 2) & MASK16;
+        env->gpr[dr] = next;
     } else {
         env->gpr[dr] = value;
     }
     return true;
+}
+
+static void bit_binary_flags(CPUDMCUState *env, uint32_t left, uint32_t right)
+{
+    /* CN1916884A pp.71/73/76/78: BAND, BOR, BXOR and BCMP all
+     * describe the two original input bits, not the stored result or a
+     * one-bit subtraction. In particular equal 1 bits yield C=V=1,
+     * Z=N=0. Capture both inputs before changing PSR or the destination. */
+    set_flag(env, DMCU_PSW_Z, !(left | right));
+    set_flag(env, DMCU_PSW_C, left & right);
+    set_flag(env, DMCU_PSW_N, left ^ right);
+    set_flag(env, DMCU_PSW_V, left | right);
 }
 
 static bool exec_bit(CPUDMCUState *env, uint8_t op, uint8_t arg,
@@ -4185,7 +7143,7 @@ static bool exec_bit(CPUDMCUState *env, uint8_t op, uint8_t arg,
         left = bit_read(env, za, zb);
         right = bit_read(env, qa, qb);
         if (op == 0x8d) {
-            alu_sub(env, left, right, 0, 1, false);
+            bit_binary_flags(env, left, right);
             return true;
         }
         if (op == 0x6c) { result = left | right; }
@@ -4193,7 +7151,11 @@ static bool exec_bit(CPUDMCUState *env, uint8_t op, uint8_t arg,
         else if (op == 0x7c) { result = right; }
         else if (op == 0x7d) { result = !right; }
         else { result = left & right; }
-        logic_flags(env, result, 1);
+        if (op == 0x7c || op == 0x7d) {
+            logic_flags(env, result, 1);
+        } else {
+            bit_binary_flags(env, left, right);
+        }
         /* A bit write to PSR (for example BMOV C,R1.15) wins over the
          * instruction's ordinary flag side effects, matching compiler use. */
         bit_write(env, za, zb, result);
@@ -4206,6 +7168,42 @@ static bool exec_bit(CPUDMCUState *env, uint8_t op, uint8_t arg,
 static uint16_t rom_argument(CPUDMCUState *env, unsigned index)
 {
     return internal_data_read(env->gpr[DMCU_SP] + index * 2, 16);
+}
+
+static uint8_t trace_resource_output_byte(uint16_t high, uint16_t low)
+{
+    uint32_t address = (((uint32_t)high << 16) | low) & MASK24;
+
+    if (high == 0) {
+        return internal_data_read(low, 8) & 0xffu;
+    }
+    return address_space_ldub(&address_space_memory, address ^ 1u,
+                              MEMTXATTRS_UNSPECIFIED, NULL);
+}
+
+static uint16_t trace_resource_far_word(uint16_t high, uint16_t low)
+{
+    uint32_t address = (((uint32_t)high << 16) | low) & MASK24;
+
+    if (high == 0) {
+        return internal_data_read(low, 16) & 0xffffu;
+    }
+    return address_space_lduw_le(&address_space_memory, address,
+                                 MEMTXATTRS_UNSPECIFIED, NULL);
+}
+
+static uint32_t npe_stream_position(uint32_t stream)
+{
+    if (!stream) {
+        return 0;
+    }
+
+    return ((uint32_t)address_space_lduw_le(
+                &address_space_memory, (stream + 0x28u) & MASK24,
+                MEMTXATTRS_UNSPECIFIED, NULL) << 16) |
+           address_space_lduw_le(
+                &address_space_memory, (stream + 0x2au) & MASK24,
+                MEMTXATTRS_UNSPECIFIED, NULL);
 }
 
 static void trace_resource_io_call(CPUDMCUState *env, uint32_t from,
@@ -4234,7 +7232,7 @@ static void trace_resource_io_call(CPUDMCUState *env, uint32_t from,
     env->resource_io_shift[slot] = shift;
     env->resource_io_window[slot] = address_space_lduw_le(
         &address_space_memory, 0x005128e0u, MEMTXATTRS_UNSPECIFIED, NULL);
-    /* Only 25:206E consumes A2:28E0.  The lower 2D:261C and 2C:2EBA
+    /* Only 25:206E consumes A2:28E0.  The lower 5F:261C and 2C:2EBA
      * storage layers are also included in the general trace, but their calls
      * remain valid while the application-level byte window is zero. */
     if (target == 0x25206eu && !env->resource_io_window[slot]) {
@@ -4261,6 +7259,128 @@ static void trace_resource_io_call(CPUDMCUState *env, uint32_t from,
     }
     env->resource_io_logical_block[slot] = logical_block;
     env->resource_io_map_slot[slot] = map_slot;
+}
+
+/* Keep the NPE loader's storage/copy evidence independent of RESOURCE_IO.
+ * The latter deliberately freezes after the desktop resource pipeline, while
+ * these bounded rings are reset for each exact mode-2 NPE launch.  This is a
+ * read-only observer: none of the captured fields is consumed by the guest. */
+static void trace_npe_loader_memory_call(CPUDMCUState *env, uint32_t from,
+                                         uint32_t target)
+{
+    uint32_t slot;
+    unsigned argument;
+
+    if (target == dmcu_code_address(0x2d, 0x261c)) {
+        slot = env->npe_file_read_trace_count %
+               DMCU_NPE_FILE_READ_TRACE_SLOTS;
+        env->npe_file_read_trace_from[slot] = from & MASK24;
+        env->npe_file_read_trace_sp[slot] = env->gpr[DMCU_SP] & MASK16;
+        env->npe_file_read_trace_fp[slot] = env->gpr[DMCU_FP] & MASK16;
+        for (argument = 0; argument < 6; argument++) {
+            env->npe_file_read_trace_args[slot][argument] =
+                rom_argument(env, argument);
+        }
+        env->npe_file_read_trace_error[slot] = address_space_lduw_le(
+            &address_space_memory, 0x527a3cu,
+            MEMTXATTRS_UNSPECIFIED, NULL);
+        env->npe_file_read_trace_file_error[slot] = address_space_lduw_le(
+            &address_space_memory, 0x512ae0u,
+            MEMTXATTRS_UNSPECIFIED, NULL);
+        env->npe_file_read_trace_application_state[slot] =
+            address_space_lduw_le(&address_space_memory, 0x527a08u,
+                                  MEMTXATTRS_UNSPECIFIED, NULL);
+        env->npe_file_read_trace_count++;
+        return;
+    }
+
+    /* 1C:CCD4 ultimately services a stream read with exact far-copy helper
+     * 2E:4572.  Retain the calls whose destination overlaps the NPE game
+     * object table or grid-state block before the shared far-copy ring can be
+     * overwritten by subsequent rendering.  Source bytes are sampled before
+     * the copy and never fed back to the guest. */
+    if (target == dmcu_code_address(0x2e, 0x4572) &&
+        env->npe_game_table_io_active) {
+        uint32_t destination = ((uint32_t)rom_argument(env, 0) << 16) |
+                               rom_argument(env, 1);
+        uint32_t source = ((uint32_t)rom_argument(env, 2) << 16) |
+                          rom_argument(env, 3);
+        uint32_t length = ((uint32_t)rom_argument(env, 4) << 16) |
+                          rom_argument(env, 5);
+        const uint32_t table_start = 0x526ca2u;
+        const uint32_t table_end = table_start + 20u * 14u;
+        const uint32_t grid_start = 0x52783au;
+        const uint32_t grid_end = grid_start + 14u;
+
+        if ((destination < table_end &&
+             destination + length > table_start) ||
+            (destination < grid_end &&
+             destination + length > grid_start)) {
+            uint32_t sequence = env->npe_game_table_copy_count++;
+            uint32_t table_slot = sequence %
+                                  DMCU_NPE_GAME_TABLE_COPY_SLOTS;
+            uint32_t io_slot = env->npe_game_table_io_current_slot;
+            uint32_t stream = io_slot < DMCU_NPE_GAME_TABLE_IO_SLOTS ?
+                env->npe_game_table_io_stream[io_slot] & MASK24 : 0u;
+            unsigned sample;
+
+            env->npe_game_table_copy_from[table_slot] = from & MASK24;
+            env->npe_game_table_copy_destination[table_slot] =
+                destination & MASK24;
+            env->npe_game_table_copy_source[table_slot] = source & MASK24;
+            env->npe_game_table_copy_length[table_slot] = length;
+            env->npe_game_table_copy_stream_position[table_slot] = stream ?
+                (((uint32_t)address_space_lduw_le(
+                    &address_space_memory, (stream + 0x28u) & MASK24,
+                    MEMTXATTRS_UNSPECIFIED, NULL) << 16) |
+                 address_space_lduw_le(
+                    &address_space_memory, (stream + 0x2au) & MASK24,
+                    MEMTXATTRS_UNSPECIFIED, NULL)) : 0u;
+            env->npe_game_table_copy_cache_position[table_slot] =
+                ((uint32_t)address_space_lduw_le(
+                    &address_space_memory, 0x5127bcu,
+                    MEMTXATTRS_UNSPECIFIED, NULL) << 16) |
+                address_space_lduw_le(
+                    &address_space_memory, 0x5127beu,
+                    MEMTXATTRS_UNSPECIFIED, NULL);
+            for (sample = 0;
+                 sample < DMCU_NPE_GAME_TABLE_COPY_SAMPLE_BYTES;
+                 sample++) {
+                env->npe_game_table_copy_sample[table_slot][sample] =
+                    sample < length ? address_space_ldub(
+                        &address_space_memory,
+                        ((source + sample) & MASK24) ^ 1u,
+                        MEMTXATTRS_UNSPECIFIED, NULL) : 0;
+            }
+        }
+    }
+
+    if (env->npe_control_trace_phase == 0u &&
+        !env->npe_modal_control_trace_pending &&
+        !env->npe_glyph_trace_armed &&
+        !env->npe_game_table_io_active) {
+        return;
+    }
+
+    if (target == dmcu_code_address(0x2e, 0x4572)) {
+        slot = env->npe_far_copy_trace_count %
+               DMCU_NPE_FAR_COPY_TRACE_SLOTS;
+        env->npe_far_copy_trace_from[slot] = from & MASK24;
+        env->npe_far_copy_trace_interrupts[slot] = env->interrupt_entries;
+        env->npe_far_copy_trace_sp[slot] = env->gpr[DMCU_SP] & MASK16;
+        env->npe_far_copy_trace_fp[slot] = env->gpr[DMCU_FP] & MASK16;
+        for (argument = 0; argument < 6; argument++) {
+            env->npe_far_copy_trace_args[slot][argument] =
+                rom_argument(env, argument);
+        }
+        env->npe_far_copy_trace_error[slot] = address_space_lduw_le(
+            &address_space_memory, 0x527a3cu,
+            MEMTXATTRS_UNSPECIFIED, NULL);
+        env->npe_far_copy_trace_file_error[slot] = address_space_lduw_le(
+            &address_space_memory, 0x512ae0u,
+            MEMTXATTRS_UNSPECIFIED, NULL);
+        env->npe_far_copy_trace_count++;
+    }
 }
 
 enum {
@@ -4346,10 +7466,612 @@ static void trace_userinfo_flow(CPUDMCUState *env, uint8_t event,
         trace_userinfo_descriptor_byte(handle_hi, handle_lo, 0x15u) : 0xffu;
 }
 
+static inline void trace_npe_format_increment(uint32_t *counter)
+{
+    if (*counter != UINT32_MAX) {
+        (*counter)++;
+    }
+}
+
+/* Observe the exact v752 NPE_FORMAT_DISPATCH control path without changing
+ * any guest register, flag, memory, or control-flow decision.  The state is
+ * deliberately fixed-size: three memcmp return slots, three legacy service
+ * counters, two legacy call-site counters, and scalar edge counters. */
+static void trace_npe_format_dispatch(CPUDMCUState *env, uint32_t from,
+                                      uint32_t target, uint32_t sequential)
+{
+    static const uint32_t memcmp_return_target[
+        DMCU_NPE_FORMAT_MEMCMP_SLOTS] = {
+        0x1b7b2au, 0x1b7b56u, 0x1b7b82u,
+    };
+    static const uint32_t memcmp_call_pc[DMCU_NPE_FORMAT_MEMCMP_SLOTS] = {
+        /* The first call now tail-enters from the lifecycle-bound guest
+         * literal installer; SP+4 still begins the original six arguments. */
+        0x066b4cu, 0x1b7b52u, 0x1b7b7eu,
+    };
+    static const uint32_t legacy_service_target[3] = {
+        0x530020u, 0x530024u, 0x530028u,
+    };
+    static const uint32_t legacy_path_pc[2] = {
+        0x1b7e8au, 0x1b7ea2u,
+    };
+    uint32_t pc = from & MASK24;
+    uint32_t next = target & MASK24;
+    unsigned slot;
+
+    if (env->in_interrupt) {
+        return;
+    }
+
+    if (pc == 0x1b7a20u) {
+        env->npe_format_dispatch_active = true;
+        env->npe_format_dispatch_followup_active = false;
+        env->npe_format_dispatch_followup_steps = 0;
+        trace_npe_format_increment(&env->npe_format_dispatch_entries);
+        env->npe_format_literal_wrapper_calls = 0;
+        env->npe_format_literal_copy_calls = 0;
+        env->npe_format_literal_copy_returns = 0;
+        env->npe_format_literal_tail_calls = 0;
+        env->npe_literal_data_dispatch_read_base =
+            env->npe_literal_data_reads;
+        env->npe_literal_data_dispatch_write_base =
+            env->npe_literal_data_writes;
+        env->npe_format_field_calls = 0;
+        env->npe_format_field_returns = 0;
+        env->npe_format_field_return_r0 = 0;
+        memset(env->npe_format_memcmp_returns, 0,
+               sizeof(env->npe_format_memcmp_returns));
+        memset(env->npe_format_memcmp_result, 0,
+               sizeof(env->npe_format_memcmp_result));
+        memset(env->npe_format_memcmp_args, 0,
+               sizeof(env->npe_format_memcmp_args));
+        memset(env->npe_format_memcmp_pointer_valid, 0,
+               sizeof(env->npe_format_memcmp_pointer_valid));
+        memset(env->npe_format_memcmp_sample, 0,
+               sizeof(env->npe_format_memcmp_sample));
+        env->npe_format_status_site_hits = 0;
+        env->npe_format_status2_hits = 0;
+        env->npe_format_status_value = 0;
+        env->npe_format_dispatch_returns = 0;
+        env->npe_format_dispatch_return_target = 0;
+        env->npe_format_dispatch_return_r0 = 0;
+        env->npe_format_router_b6de_hits = 0;
+        env->npe_format_router_b6de_r0 = 0;
+        env->npe_format_mode2_calls = 0;
+        memset(env->npe_format_legacy_service_calls, 0,
+               sizeof(env->npe_format_legacy_service_calls));
+        memset(env->npe_format_legacy_path_calls, 0,
+               sizeof(env->npe_format_legacy_path_calls));
+    }
+
+    if (env->npe_format_dispatch_active) {
+        if (pc == 0x1b7b26u && next == 0x066b20u) {
+            trace_npe_format_increment(
+                &env->npe_format_literal_wrapper_calls);
+        }
+        if (pc == 0x066b42u && next == 0x0843a6u) {
+            trace_npe_format_increment(&env->npe_format_literal_copy_calls);
+        }
+        if (pc == 0x084418u && next == 0x066b46u) {
+            trace_npe_format_increment(
+                &env->npe_format_literal_copy_returns);
+        }
+        if (pc == 0x066b4cu && next == 0x2cc07eu) {
+            trace_npe_format_increment(&env->npe_format_literal_tail_calls);
+        }
+        if (pc == 0x1b7aa2u && next == 0x5f380au) {
+            trace_npe_format_increment(&env->npe_format_field_calls);
+        }
+        if (pc == 0x5f382au && next == 0x1b7aa6u) {
+            trace_npe_format_increment(&env->npe_format_field_returns);
+            env->npe_format_field_return_r0 = env->gpr[0] & MASK16;
+        }
+
+        for (slot = 0; slot < DMCU_NPE_FORMAT_MEMCMP_SLOTS; slot++) {
+            if (pc == memcmp_call_pc[slot] && next == 0x2cc07eu) {
+                uint16_t argument_base =
+                    (env->gpr[DMCU_SP] + 4u) & MASK16;
+                unsigned argument;
+                unsigned pointer;
+                unsigned index;
+
+                /* A far SCALL has just pushed its two-word return frame.
+                 * The caller's six words therefore begin at post-SP+4:
+                 * left far pointer, right far pointer, then 32-bit length.
+                 * Sampling uses the same logical far-byte lane helper as the
+                 * other observers.  This is diagnostic-only and never writes
+                 * the guest stack or either compared buffer. */
+                for (argument = 0; argument < 6; argument++) {
+                    env->npe_format_memcmp_args[slot][argument] =
+                        internal_data_read(
+                            (argument_base + argument * 2u) & MASK16, 16);
+                }
+                for (pointer = 0; pointer < 2; pointer++) {
+                    uint16_t hi =
+                        env->npe_format_memcmp_args[slot][pointer * 2u];
+                    uint16_t lo =
+                        env->npe_format_memcmp_args[slot][pointer * 2u + 1u];
+                    bool valid = (hi & 0xff00u) == 0;
+
+                    env->npe_format_memcmp_pointer_valid[slot][pointer] = valid;
+                    for (index = 0; index < DMCU_NPE_FORMAT_SAMPLE_BYTES;
+                         index++) {
+                        env->npe_format_memcmp_sample[slot][pointer][index] =
+                            valid ? trace_userinfo_descriptor_byte(
+                                        hi, lo, index) : 0xffu;
+                    }
+                }
+            }
+            if (next == memcmp_return_target[slot] &&
+                next != (sequential & MASK24)) {
+                trace_npe_format_increment(
+                    &env->npe_format_memcmp_returns[slot]);
+                env->npe_format_memcmp_result[slot] =
+                    env->gpr[0] & MASK16;
+            }
+        }
+
+        if (pc == 0x1b7baeu) {
+            trace_npe_format_increment(&env->npe_format_status_site_hits);
+            env->npe_format_status_value = env->gpr[0] & MASK16;
+            if (env->npe_format_status_value == 2u) {
+                trace_npe_format_increment(&env->npe_format_status2_hits);
+            }
+        }
+
+        for (slot = 0; slot < ARRAY_SIZE(legacy_service_target); slot++) {
+            if (next == legacy_service_target[slot] &&
+                next != (sequential & MASK24)) {
+                trace_npe_format_increment(
+                    &env->npe_format_legacy_service_calls[slot]);
+            }
+        }
+        for (slot = 0; slot < ARRAY_SIZE(legacy_path_pc); slot++) {
+            if (pc == legacy_path_pc[slot]) {
+                trace_npe_format_increment(
+                    &env->npe_format_legacy_path_calls[slot]);
+            }
+        }
+
+        if (pc == 0x1b8294u) {
+            trace_npe_format_increment(&env->npe_format_dispatch_returns);
+            env->npe_format_dispatch_return_target = next;
+            env->npe_format_dispatch_return_r0 = env->gpr[0] & MASK16;
+            env->npe_format_dispatch_active = false;
+            env->npe_format_dispatch_followup_active = true;
+            env->npe_format_dispatch_followup_steps =
+                DMCU_NPE_FORMAT_FOLLOWUP_MAX_STEPS;
+        }
+    }
+
+    if (env->npe_format_dispatch_followup_active) {
+        if (pc == 0x2fb6deu) {
+            trace_npe_format_increment(&env->npe_format_router_b6de_hits);
+            env->npe_format_router_b6de_r0 = env->gpr[0] & MASK16;
+        }
+        if (pc == 0x2fb726u && next == 0x1fd1a6u) {
+            trace_npe_format_increment(&env->npe_format_mode2_calls);
+            env->npe_format_dispatch_followup_active = false;
+            env->npe_format_dispatch_followup_steps = 0;
+            env->npe_control_trace_count = 0;
+            env->npe_control_trace_frozen = false;
+            env->npe_control_trace_phase = 2;
+            env->npe_loader_control_trace_active = true;
+            env->npe_loader_control_trace_completed = false;
+            env->npe_loader_control_trace_entries++;
+            env->npe_loader_control_trace_returns = 0;
+            env->npe_loader_control_trace_return_target = 0;
+            env->npe_loader_control_trace_entry_r0 = env->gpr[0] & MASK16;
+            env->npe_loader_control_trace_entry_r1 = env->gpr[1] & MASK16;
+            env->npe_loader_control_trace_entry_error =
+                address_space_lduw_le(&address_space_memory, 0x527a3cu,
+                                      MEMTXATTRS_UNSPECIFIED, NULL);
+            env->npe_loader_control_trace_entry_file_error =
+                address_space_lduw_le(&address_space_memory, 0x512ae0u,
+                                      MEMTXATTRS_UNSPECIFIED, NULL);
+            env->npe_loader_control_trace_return_r0 = 0;
+            env->npe_loader_control_trace_return_r1 = 0;
+            env->npe_loader_control_trace_return_error = 0;
+            env->npe_loader_control_trace_return_file_error = 0;
+            env->npe_loader_control_trace_return_application_state = 0;
+            env->npe_loader_runtime_wait_detected = false;
+            env->npe_loader_runtime_wait_from = 0;
+            env->npe_loader_runtime_wait_target = 0;
+            env->npe_loader_runtime_wait_sp = 0;
+            env->npe_loader_runtime_wait_fp = 0;
+            env->npe_loader_runtime_wait_r0 = 0;
+            env->npe_loader_runtime_wait_r1 = 0;
+            env->npe_loader_runtime_wait_error = 0;
+            env->npe_loader_runtime_wait_file_error = 0;
+            env->npe_loader_control_trace_last_sp =
+                env->gpr[DMCU_SP] & MASK16;
+            env->npe_loader_stack_switch_detected = false;
+            env->npe_loader_stack_switch_from = 0;
+            env->npe_loader_stack_switch_target = 0;
+            env->npe_loader_stack_switch_old_sp = 0;
+            env->npe_loader_stack_switch_sp = 0;
+            env->npe_loader_stack_switch_fp = 0;
+            env->npe_loader_stack_switch_r0 = 0;
+            env->npe_loader_stack_switch_r1 = 0;
+            env->npe_loader_stack_switch_error = 0;
+            env->npe_loader_stack_switch_file_error = 0;
+            env->npe_loader_state_dispatch_detected = false;
+            env->npe_loader_state_dispatch_from = 0;
+            env->npe_loader_state_dispatch_target = 0;
+            env->npe_loader_state_dispatch_sp = 0;
+            env->npe_loader_state_dispatch_fp = 0;
+            env->npe_loader_state_dispatch_r0 = 0;
+            env->npe_loader_state_dispatch_r1 = 0;
+            memset(env->npe_loader_state_dispatch_table, 0,
+                   sizeof(env->npe_loader_state_dispatch_table));
+            env->npe_loader_error_first_write_valid = false;
+            env->npe_loader_error_first_nonzero_valid = false;
+            env->npe_loader_error_first_write_pc = 0;
+            env->npe_loader_error_first_write_old = 0;
+            env->npe_loader_error_first_write_new = 0;
+            env->npe_loader_error_first_write_bits = 0;
+            env->npe_loader_error_first_nonzero_pc = 0;
+            env->npe_loader_error_first_nonzero_old = 0;
+            env->npe_loader_error_first_nonzero_new = 0;
+            env->npe_loader_error_first_nonzero_bits = 0;
+            env->npe_loader_event_watch_active = true;
+            env->npe_loader_event_follow_active = false;
+            env->npe_loader_event_calls = 0;
+            env->npe_loader_event_returns = 0;
+            env->npe_loader_event_nonzero_returns = 0;
+            env->npe_loader_event_key86_returns = 0;
+            env->npe_loader_event_call_sp = 0;
+            env->npe_loader_event_call_fp = 0;
+            env->npe_loader_event_return_sp = 0;
+            env->npe_loader_event_return_fp = 0;
+            env->npe_loader_event_last_result = 0;
+            env->npe_loader_event_result = 0;
+            env->npe_loader_event_type = 0;
+            env->npe_loader_event_code = 0;
+            env->npe_loader_event_global_mode = 0;
+            env->npe_loader_event_global_flag = 0;
+            env->npe_loader_event_global_iteration = 0;
+            env->npe_loader_event_global_selection = 0;
+            env->npe_loader_event_error = 0;
+            env->npe_loader_event_file_error = 0;
+            env->npe_loader_event_result_zero_paths = 0;
+            env->npe_loader_event_type4_paths = 0;
+            env->npe_loader_event_other_type_paths = 0;
+            env->npe_loader_event_mode1_paths = 0;
+            env->npe_loader_event_other_mode_paths = 0;
+            env->npe_loader_event_flag_zero_paths = 0;
+            env->npe_loader_event_flag_nonzero_paths = 0;
+            env->npe_loader_event_prepare_calls = 0;
+            env->npe_loader_event_initialize_calls = 0;
+            env->npe_loader_event_initialize_returns = 0;
+            env->npe_loader_event_progress_paths = 0;
+            env->npe_loader_event_service_calls = 0;
+            env->npe_loader_event_controller_returns = 0;
+            reset_npe_game_trace(env);
+        } else if (env->npe_format_dispatch_followup_steps != 0u &&
+                   --env->npe_format_dispatch_followup_steps == 0u) {
+            env->npe_format_dispatch_followup_active = false;
+        }
+    }
+}
+
+/* Observe the exact mode-one transform which rejects the currently selected
+ * NPE data.  This follows original SCALL/return and validation edges only;
+ * the samples are never supplied back to the guest and no result is changed.
+ */
+static void trace_npe_transform(CPUDMCUState *env, uint32_t from,
+                                uint32_t target, uint16_t sp, uint16_t fp)
+{
+    uint32_t pc = from & MASK24;
+    uint32_t next = target & MASK24;
+    unsigned i;
+
+    if (env->in_interrupt) {
+        return;
+    }
+
+    if (pc == 0x2dc31eu && next == 0x3303b2u) {
+        uint16_t object_hi;
+        uint16_t object_lo;
+        uint16_t buffer_hi;
+        uint16_t buffer_lo;
+
+        env->npe_transform_active = true;
+        trace_npe_format_increment(&env->npe_transform_calls);
+        env->npe_transform_call_from = pc;
+        env->npe_transform_call_sp = sp;
+        env->npe_transform_call_post_sp = env->gpr[DMCU_SP] & MASK16;
+        env->npe_transform_call_fp = fp;
+        for (i = 0; i < DMCU_NPE_TRANSFORM_OUTER_ARGUMENT_WORDS; i++) {
+            env->npe_transform_args[i] =
+                internal_data_read((sp + i * 2u) & MASK16, 16);
+        }
+        object_hi = env->npe_transform_args[0];
+        object_lo = env->npe_transform_args[1];
+        buffer_hi = env->npe_transform_args[2];
+        buffer_lo = env->npe_transform_args[3];
+        env->npe_transform_object_valid = (object_hi & 0xff00u) == 0u;
+        env->npe_transform_buffer_valid = (buffer_hi & 0xff00u) == 0u;
+        for (i = 0; i < DMCU_NPE_TRANSFORM_SAMPLE_BYTES; i++) {
+            env->npe_transform_object_sample[i] =
+                env->npe_transform_object_valid ?
+                trace_userinfo_descriptor_byte(object_hi, object_lo, i) :
+                0xffu;
+            env->npe_transform_buffer_sample[i] =
+                env->npe_transform_buffer_valid ?
+                trace_userinfo_descriptor_byte(buffer_hi, buffer_lo, i) :
+                0xffu;
+        }
+        env->npe_transform_object_type =
+            env->npe_transform_object_valid ?
+            trace_userinfo_descriptor_byte(object_hi, object_lo, 5u) :
+            0xffffu;
+        env->npe_transform_table_base_hi = address_space_lduw_le(
+            &address_space_memory, 0x5129c4u,
+            MEMTXATTRS_UNSPECIFIED, NULL);
+        env->npe_transform_table_base_lo = address_space_lduw_le(
+            &address_space_memory, 0x5129c6u,
+            MEMTXATTRS_UNSPECIFIED, NULL);
+        env->npe_stream_global_at_transform_hi = address_space_lduw_le(
+            &address_space_memory, 0x5254e8u,
+            MEMTXATTRS_UNSPECIFIED, NULL);
+        env->npe_stream_global_at_transform_lo = address_space_lduw_le(
+            &address_space_memory, 0x5254eau,
+            MEMTXATTRS_UNSPECIFIED, NULL);
+        env->npe_transform_record_hi = 0;
+        env->npe_transform_record_lo = 0;
+        env->npe_transform_child_hi = 0;
+        env->npe_transform_child_lo = 0;
+        env->npe_transform_exit_from = 0;
+        env->npe_transform_exit_target = 0;
+        env->npe_transform_exit_r0 = 0;
+        env->npe_transform_exit_r1 = 0;
+        env->npe_transform_exit_file_error = 0;
+        env->npe_transform_return_from = 0;
+        env->npe_transform_return_target = 0;
+        env->npe_transform_return_r0 = 0;
+        env->npe_transform_return_r1 = 0;
+        env->npe_transform_return_file_error = 0;
+        env->npe_transform_error_page_calls = 0;
+    }
+
+    if (!env->npe_transform_active) {
+        return;
+    }
+
+    if (pc == 0x3303dau && next == 0x1cccd4u) {
+        trace_npe_format_increment(&env->npe_transform_resident_calls);
+        env->npe_transform_resident_sp = sp;
+        env->npe_transform_resident_post_sp =
+            env->gpr[DMCU_SP] & MASK16;
+        env->npe_transform_resident_fp = fp;
+        for (i = 0; i < DMCU_NPE_TRANSFORM_RESIDENT_ARGUMENT_WORDS; i++) {
+            env->npe_transform_resident_args[i] =
+                internal_data_read((sp + i * 2u) & MASK16, 16);
+        }
+    }
+    if (pc == 0x1ccd42u) {
+        env->npe_transform_record_hi = env->gpr[0] & MASK16;
+        env->npe_transform_record_lo = env->gpr[1] & MASK16;
+    }
+    if (pc == 0x1ccdeeu) {
+        env->npe_transform_child_hi = env->gpr[0] & MASK16;
+        env->npe_transform_child_lo = env->gpr[1] & MASK16;
+        if (next == 0x1ccdf2u) {
+            env->npe_transform_exit_from = pc;
+            env->npe_transform_exit_target = next;
+            env->npe_transform_exit_r0 = env->gpr[0] & MASK16;
+            env->npe_transform_exit_r1 = env->gpr[1] & MASK16;
+        }
+    }
+    if (next == 0x1cd450u ||
+        (next == 0x1cd456u &&
+         (pc == 0x1ccd78u || pc == 0x1ccdccu ||
+          pc == 0x1cce04u || pc == 0x1cd44cu))) {
+        env->npe_transform_exit_from = pc;
+        env->npe_transform_exit_target = next;
+        env->npe_transform_exit_r0 = env->gpr[0] & MASK16;
+        env->npe_transform_exit_r1 = env->gpr[1] & MASK16;
+        env->npe_transform_exit_file_error = address_space_lduw_le(
+            &address_space_memory, 0x512ae0u,
+            MEMTXATTRS_UNSPECIFIED, NULL);
+    }
+    if (pc == 0x1cd460u && next == 0x3303deu) {
+        trace_npe_format_increment(&env->npe_transform_resident_returns);
+    }
+    if (pc == 0x3303e6u && next == 0x2dc322u) {
+        trace_npe_format_increment(&env->npe_transform_returns);
+        env->npe_transform_return_from = pc;
+        env->npe_transform_return_target = next;
+        env->npe_transform_return_r0 = env->gpr[0] & MASK16;
+        env->npe_transform_return_r1 = env->gpr[1] & MASK16;
+        env->npe_transform_return_file_error = address_space_lduw_le(
+            &address_space_memory, 0x512ae0u,
+            MEMTXATTRS_UNSPECIFIED, NULL);
+    }
+    if (pc == 0x2dc35cu && next == 0x32136cu) {
+        trace_npe_format_increment(&env->npe_transform_error_page_calls);
+        env->npe_transform_active = false;
+    }
+}
+
+/* Follow the exact producer chain for A4:54E8.  The linked initializer is
+ * 17:3198 (source 34:3198); its file/object helper is 30:AFA8 (source
+ * 4D:AFA8), which in turn calls 30:C9A2 (source 4D:C9A2).  These counters
+ * and stack snapshots are observer-only. */
+static void trace_npe_stream_producer(CPUDMCUState *env, uint32_t from,
+                                      uint32_t target, uint16_t sp,
+                                      uint16_t fp)
+{
+    uint32_t pc = from & MASK24;
+    uint32_t next = target & MASK24;
+    unsigned i;
+
+    if (env->in_interrupt) {
+        return;
+    }
+
+    if (next == 0x173198u) {
+        trace_npe_format_increment(&env->npe_stream_initializer_calls);
+        env->npe_stream_initializer_caller = pc;
+        env->npe_stream_initializer_sp = sp;
+        env->npe_stream_initializer_fp = fp;
+        env->npe_stream_initializer_arg_hi =
+            internal_data_read(sp, 16);
+        env->npe_stream_initializer_arg_lo =
+            internal_data_read((sp + 2u) & MASK16, 16);
+    }
+    if (pc == 0x173deau) {
+        trace_npe_format_increment(&env->npe_stream_initializer_returns);
+        env->npe_stream_initializer_return_target = next;
+        env->npe_stream_initializer_return_r0 = env->gpr[0] & MASK16;
+        env->npe_stream_initializer_return_r1 = env->gpr[1] & MASK16;
+    }
+    if (next == 0x30afa8u) {
+        trace_npe_format_increment(&env->npe_stream_open_calls);
+        env->npe_stream_open_caller = pc;
+        env->npe_stream_open_sp = sp;
+        env->npe_stream_open_fp = fp;
+        for (i = 0; i < DMCU_NPE_STREAM_OPEN_ARGUMENT_WORDS; i++) {
+            env->npe_stream_open_args[i] =
+                internal_data_read((sp + i * 2u) & MASK16, 16);
+        }
+    }
+    if (pc == 0x30b08eu) {
+        trace_npe_format_increment(&env->npe_stream_open_returns);
+        env->npe_stream_open_return_target = next;
+        env->npe_stream_open_return_r0 = env->gpr[0] & MASK16;
+        env->npe_stream_open_return_r1 = env->gpr[1] & MASK16;
+    }
+    if (next == 0x30c9a2u) {
+        trace_npe_format_increment(&env->npe_stream_open_child_calls);
+        env->npe_stream_open_child_caller = pc;
+        env->npe_stream_open_child_sp = sp;
+        env->npe_stream_open_child_fp = fp;
+    }
+    if (pc == 0x30ca82u) {
+        trace_npe_format_increment(&env->npe_stream_open_child_returns);
+        env->npe_stream_open_child_return_target = next;
+        env->npe_stream_open_child_return_r0 = env->gpr[0] & MASK16;
+        env->npe_stream_open_child_return_r1 = env->gpr[1] & MASK16;
+    }
+}
+
+/* Required fault evidence is independent of optional historical observers.
+ * Return true only for the first newly captured bad transfer. */
+static bool trace_invalid_control(CPUDMCUState *env, uint32_t from,
+                                   uint32_t sequential, uint16_t word,
+                                   uint16_t ext, uint16_t sp, uint16_t fp,
+                                   bool call_or_return)
+{
+    if (call_or_return &&
+        (env->pc & MASK24) != (sequential & MASK24) &&
+        (from & MASK24) < DMCU_PROGRAM_BASE + DMCU_PROGRAM_SIZE &&
+        (((env->pc & MASK24) >=
+          DMCU_PROGRAM_BASE + DMCU_PROGRAM_SIZE) ||
+         ((env->pc & 1u) != 0)) &&
+        !env->invalid_control_valid) {
+        env->invalid_control_valid = true;
+        env->invalid_control_from = from & MASK24;
+        env->invalid_control_to = env->pc & MASK24;
+        env->invalid_control_word = word;
+        env->invalid_control_sequential = sequential & MASK24;
+        env->invalid_control_ext = ext;
+        env->invalid_control_sp = sp;
+        env->invalid_control_fp = fp;
+        env->invalid_control_post_sp = env->gpr[DMCU_SP] & MASK16;
+        env->invalid_control_post_fp = env->gpr[DMCU_FP] & MASK16;
+        env->invalid_control_ds0 = env->sfr[DMCU_SFR_DS0] & 0x01ffu;
+        env->invalid_control_ds1 = env->sfr[DMCU_SFR_DS1] & 0x01ffu;
+        env->invalid_control_psw = env->psw & MASK16;
+        env->invalid_control_in_interrupt = env->in_interrupt;
+        for (unsigned index = 0; index < DMCU_INVALID_CONTROL_GPR_WORDS;
+             index++) {
+            env->invalid_control_gpr[index] = env->gpr[index] & MASK16;
+        }
+        for (unsigned index = 0; index < DMCU_INVALID_CONTROL_STACK_WORDS;
+             index++) {
+            env->invalid_control_stack[index] =
+                internal_data_read((sp + index * 2u) & MASK16, 16);
+        }
+        for (unsigned index = 0; index < DMCU_INVALID_CONTROL_FRAME_WORDS;
+             index++) {
+            env->invalid_control_frame[index] =
+                internal_data_read((fp + index * 2u) & MASK16, 16);
+        }
+        env->npe_control_trace_frozen = true;
+        env->npe_modal_control_trace_active = false;
+        env->npe_loader_control_trace_active = false;
+        return true;
+    }
+    return false;
+}
+
+static void trace_control_minimal(CPUDMCUState *env, uint32_t from,
+                                  uint32_t sequential, uint16_t word,
+                                  uint16_t ext, uint16_t sp, uint16_t fp)
+{
+    uint8_t op = word >> 8;
+    bool call_or_return = op == 0xbd || op == 0xad || op == 0xbc ||
+                          op == 0xcc || op == 0xcd || op == 0xce || op == 0xc6;
+    bool invalid;
+    unsigned slot;
+
+    if (!call_or_return || (env->pc & MASK24) == (sequential & MASK24)) {
+        return;
+    }
+    invalid = trace_invalid_control(env, from, sequential, word, ext, sp, fp,
+                                    call_or_return);
+    /* The frontend uses this original mapper return as its read-only ACK.
+     * Preserve the exact old first-match slot and its snapshot semantics. */
+    if ((env->pc & MASK24) == 0x202e9eu) {
+        unsigned app = DMCU_APPLICATION_KEYMAP_RETURN_TRACE_INDEX;
+
+        env->application_trace_calls[app]++;
+        env->application_trace_from[app] = from & MASK24;
+        env->application_trace_sp[app] = sp;
+        env->application_trace_r0[app] = env->gpr[0] & MASK16;
+        env->application_trace_r1[app] = env->gpr[1] & MASK16;
+        env->application_trace_r2[app] = env->gpr[2] & MASK16;
+        for (unsigned argument = 0; argument < 4; argument++) {
+            env->application_trace_args[app][argument] =
+                internal_data_read((sp + argument * 2u) & MASK16, 16);
+        }
+    }
+    if (env->control_trace_frozen) {
+        return;
+    }
+    if (env->control_trace_count) {
+        unsigned previous = (env->control_trace_count - 1) %
+                            DMCU_CONTROL_TRACE_WORDS;
+
+        if (env->control_trace_from[previous] == (from & MASK24) &&
+            env->control_trace_to[previous] == (env->pc & MASK24) &&
+            env->control_trace_word[previous] == word) {
+            return;
+        }
+    }
+    slot = env->control_trace_count % DMCU_CONTROL_TRACE_WORDS;
+    env->control_trace_from[slot] = from & MASK24;
+    env->control_trace_to[slot] = env->pc & MASK24;
+    env->control_trace_word[slot] = word;
+    env->control_trace_sp[slot] = sp;
+    env->control_trace_fp[slot] = fp;
+    env->control_trace_count++;
+    if (invalid) {
+        env->control_trace_frozen = true;
+    }
+}
+
 static void trace_control_transfer(CPUDMCUState *env, uint32_t from,
                                    uint32_t sequential, uint16_t word,
+                                   uint16_t ext,
                                    uint16_t sp, uint16_t fp)
 {
+    if (env->control_observers_minimal) {
+        trace_control_minimal(env, from, sequential, word, ext, sp, fp);
+        return;
+    }
     static unsigned timer_idle_bad_leaf_entry_logs;
     static unsigned object_callback_entries;
     static unsigned object_callback_returns;
@@ -4390,6 +8112,32 @@ static void trace_control_transfer(CPUDMCUState *env, uint32_t from,
     static unsigned storage_registry_steps;
     static unsigned resource_storage_update_steps;
     static unsigned storage_ftl_classify_returns;
+    if ((env->pc & MASK24) == dmcu_code_address(0x32, 0xb63c)) {
+        uint32_t sequence = env->resource_open_continuation_trace_count++;
+        uint32_t slot = sequence %
+                        DMCU_RESOURCE_OPEN_CONTINUATION_TRACE_SLOTS;
+        unsigned index;
+
+        env->resource_open_continuation_trace_from[slot] = from & MASK24;
+        env->resource_open_continuation_trace_sequential[slot] =
+            sequential & MASK24;
+        env->resource_open_continuation_trace_word[slot] = word;
+        env->resource_open_continuation_trace_ext[slot] = ext;
+        env->resource_open_continuation_trace_sp[slot] = sp;
+        env->resource_open_continuation_trace_post_sp[slot] =
+            env->gpr[DMCU_SP] & MASK16;
+        env->resource_open_continuation_trace_fp[slot] = fp;
+        for (index = 0; index < 4; index++) {
+            env->resource_open_continuation_trace_regs[slot][index] =
+                env->gpr[index] & MASK16;
+        }
+        for (index = 0;
+             index < DMCU_RESOURCE_OPEN_CONTINUATION_STACK_WORDS;
+             index++) {
+            env->resource_open_continuation_trace_stack[slot][index] =
+                internal_data_read((sp + index * 2u) & MASK16, 16);
+        }
+    }
     static unsigned storage_ftl_fast_classify_returns;
     static unsigned storage_factory_ecc_returns;
     static bool application_state_control_trace_active;
@@ -4411,7 +8159,3723 @@ static void trace_control_transfer(CPUDMCUState *env, uint32_t from,
     static unsigned operation_context_return_logs;
     static unsigned operation_context_path_logs;
     static unsigned operation_modal_path_logs;
+    static unsigned foreground_event_dequeue_logs;
+    static unsigned npe_render_context_control_logs;
+    static unsigned result_header_stack_logs;
+    static unsigned sector_probe_result_call_logs;
+    static unsigned sector_probe_result_return_logs;
+    static unsigned npe_table_sector_probe_logs;
+    static unsigned storage_page_read_external_entry_logs;
+    static unsigned sector_probe_geometry_return_logs;
+    static unsigned region_edges_entry_logs;
+    static unsigned region_mask_return_logs;
+    static unsigned npe_bitmap_decode_path_logs;
+    static unsigned npe_bitmap_decode_loop_logs;
+    static unsigned npe_launch_entry_logs;
+    static unsigned npe_node_transfer_path_logs;
+    static uint32_t previous_instruction_from;
+    static uint32_t previous_instruction_target;
+    static uint16_t previous_instruction_word;
+    static bool previous_instruction_in_interrupt;
+    uint32_t prior_instruction_from = previous_instruction_from;
+    uint32_t prior_instruction_target = previous_instruction_target;
+    uint16_t prior_instruction_word = previous_instruction_word;
+    bool prior_instruction_in_interrupt = previous_instruction_in_interrupt;
     uint32_t target = env->pc & MASK24;
+
+    /* This observer runs after every instruction.  Retain only the immediately
+     * preceding edge so an overlay boundary can be distinguished from a real
+     * SCALL without changing guest-visible state. */
+    previous_instruction_from = from & MASK24;
+    previous_instruction_target = target;
+    previous_instruction_word = word;
+    previous_instruction_in_interrupt = env->in_interrupt;
+
+    trace_npe_format_dispatch(env, from, target, sequential);
+    trace_npe_transform(env, from, target, sp, fp);
+    trace_npe_stream_producer(env, from, target, sp, fp);
+
+    /* The settings child at 1E:F820 obtains its event through 33:38F8 and
+     * accepts the independent physical event E0 before calling resident
+     * 15:F0EE.  Observe each boundary without synthesizing an event or a
+     * callback.  In particular, 33:591E is a generic synthetic far call whose
+     * target comes directly from frame arguments FP+12/FP+14. */
+    if (!env->in_interrupt &&
+        (from & MASK24) == dmcu_code_address(0x1e, 0xf82e) &&
+        target == dmcu_code_address(0x33, 0x38f8)) {
+        env->settings_event_poll_calls++;
+        env->settings_event_poll_active = true;
+    }
+    if (!env->in_interrupt &&
+        (from & MASK24) == dmcu_code_address(0x33, 0x3918) &&
+        target == dmcu_code_address(0x1e, 0xf832)) {
+        env->settings_event_poll_returns++;
+        env->settings_event_last_value = env->gpr[0] & MASK16;
+        env->settings_event_poll_active = false;
+    }
+    if (!env->in_interrupt && env->settings_event_poll_active &&
+        (from & MASK24) == dmcu_code_address(0x33, 0x591e) &&
+        target != (sequential & MASK24)) {
+        env->settings_event_callback_calls++;
+        env->settings_event_callback_target = target;
+        env->settings_event_callback_hi =
+            internal_data_read((fp + 0x0012u) & MASK16, 16);
+        env->settings_event_callback_lo =
+            internal_data_read((fp + 0x0014u) & MASK16, 16);
+    }
+    if (!env->in_interrupt &&
+        (from & MASK24) == dmcu_code_address(0x1e, 0xf886) &&
+        target == dmcu_code_address(0x15, 0xf0ee)) {
+        env->settings_event_launch_calls++;
+    }
+
+    /* Preserve the non-idle control edges through every currently plausible
+     * settings route.  Catalogue state 0x55 resolves through 31:345E to the
+     * 50:FFDC descriptor whose exact callback is 14:B768; that callback
+     * dispatches edits by object kind.  The independent exact
+     * 19:C876/1B:A454 chain is the five-item sound-settings selector and its
+     * fifth-item sound-effects editor.  Keeping both proven implementations
+     * in one bounded timeline lets dynamic evidence identify how the state
+     * descriptor and menu selector converge without changing guest state. */
+    {
+        uint16_t sound_kind = 0;
+
+        if (!env->in_interrupt &&
+            (from & MASK24) == 0x1ef886u &&
+            target == 0x15f0eeu) {
+            sound_kind = 10; /* E0 launches six-way parent candidate */
+        } else if (!env->in_interrupt &&
+                   (from & MASK24) == 0x15f360u &&
+                   target != (sequential & MASK24)) {
+            sound_kind = 11; /* six-way selected-item dispatch */
+        } else if (!env->in_interrupt &&
+                   (from & MASK24) == 0x14b930u &&
+                   target != (sequential & MASK24)) {
+            sound_kind = 12; /* object-kind persistence dispatch */
+        } else if (!env->in_interrupt &&
+                   (from & MASK24) == 0x14babau &&
+                   target == 0x32ebaeu) {
+            sound_kind = 13; /* kind 0x52 / D013 writer */
+        } else if (!env->in_interrupt &&
+                   (from & MASK24) == 0x14bb74u &&
+                   target == 0x32ebaeu) {
+            sound_kind = 14; /* kind 0x55 / D016 writer */
+        } else if (!env->in_interrupt &&
+                   (from & MASK24) == 0x14bda4u &&
+                   target == 0x32ebaeu) {
+            sound_kind = 15; /* kind 0x56 / D017 writer */
+        } else if (!env->in_interrupt &&
+                   (from & MASK24) == 0x15fceau &&
+                   target == 0x32ebaeu) {
+            sound_kind = 16; /* selected index 4 / D01C writer */
+        } else if (!env->in_interrupt &&
+                   (from & MASK24) == 0x0f3932u &&
+                   target == 0x25206eu) {
+            sound_kind = 20; /* generic 0F:2094 lifecycle D013 read */
+        } else if (!env->in_interrupt &&
+                   (from & MASK24) == 0x2fc652u &&
+                   target == 0x31345eu) {
+            sound_kind = 21; /* state 0x55 takes descriptor route */
+        } else if (!env->in_interrupt &&
+                   (from & MASK24) == 0x313510u &&
+                   target == 0x2edb9cu) {
+            sound_kind = 22; /* construct object from 50:FFDC */
+        } else if (!env->in_interrupt &&
+            (from & MASK24) == 0x19cc78u) {
+            sound_kind = 31; /* sound-settings selector computed RET */
+        } else if (!env->in_interrupt &&
+                   (from & MASK24) == 0x19cc94u &&
+                   target == 0x1ba454u) {
+            sound_kind = 32; /* sound-effects fifth-item SCALL */
+        } else if (!env->in_interrupt &&
+                   (from & MASK24) == 0x1ba46cu &&
+                   target == 0x32d016u) {
+            sound_kind = 33; /* sound-effects editor reads D016 */
+        } else if (!env->in_interrupt &&
+                   (from & MASK24) == 0x1ba6bau &&
+                   target != (sequential & MASK24)) {
+            sound_kind = 34; /* sound-effects event-table dispatch */
+        } else if (!env->in_interrupt &&
+                   (from & MASK24) == 0x1bacbeu) {
+            sound_kind = 35; /* sound-effects editor RETS */
+        }
+
+        if (sound_kind) {
+            uint32_t sequence = env->sound_settings_trace_count++;
+            uint32_t sound_slot =
+                sequence % DMCU_SOUND_SETTINGS_TRACE_SLOTS;
+            uint16_t post_sp = env->gpr[DMCU_SP] & MASK16;
+            uint16_t return_base = (word >> 8) == 0xbdu ? post_sp : sp;
+
+            env->sound_settings_trace_pc[sound_slot] = from & MASK24;
+            env->sound_settings_trace_target[sound_slot] = target;
+            env->sound_settings_trace_kind[sound_slot] = sound_kind;
+            env->sound_settings_trace_event[sound_slot] =
+                address_space_ldub(&address_space_memory,
+                                   0x507e38u ^ 1u,
+                                   MEMTXATTRS_UNSPECIFIED, NULL);
+            env->sound_settings_trace_selection[sound_slot] =
+                address_space_ldub(&address_space_memory,
+                                   0x52573eu ^ 1u,
+                                   MEMTXATTRS_UNSPECIFIED, NULL);
+            env->sound_settings_trace_highlight[sound_slot] =
+                address_space_ldub(&address_space_memory,
+                                   0x525674u ^ 1u,
+                                   MEMTXATTRS_UNSPECIFIED, NULL);
+            env->sound_settings_trace_cursor[sound_slot] =
+                address_space_ldub(&address_space_memory,
+                                   0x5256acu ^ 1u,
+                                   MEMTXATTRS_UNSPECIFIED, NULL);
+            env->sound_settings_trace_switch_state[sound_slot] =
+                address_space_ldub(&address_space_memory,
+                                   0x5256c0u ^ 1u,
+                                   MEMTXATTRS_UNSPECIFIED, NULL);
+            env->sound_settings_trace_switch_aux[sound_slot] =
+                address_space_ldub(&address_space_memory,
+                                   0x52568cu ^ 1u,
+                                   MEMTXATTRS_UNSPECIFIED, NULL);
+            env->sound_settings_trace_switch_step[sound_slot] =
+                address_space_ldub(&address_space_memory,
+                                   0x52567eu ^ 1u,
+                                   MEMTXATTRS_UNSPECIFIED, NULL);
+            env->sound_settings_trace_r0[sound_slot] =
+                env->gpr[0] & MASK16;
+            env->sound_settings_trace_r1[sound_slot] =
+                env->gpr[1] & MASK16;
+            env->sound_settings_trace_sp[sound_slot] = sp;
+            env->sound_settings_trace_post_sp[sound_slot] = post_sp;
+            env->sound_settings_trace_fp[sound_slot] = fp;
+            env->sound_settings_trace_return_cs[sound_slot] =
+                internal_data_read(return_base, 16);
+            env->sound_settings_trace_return_pc[sound_slot] =
+                internal_data_read((return_base + 2u) & MASK16, 16);
+        }
+    }
+
+    /* Source 42:206E is installed at runtime 25:206E.  Logical resources
+     * 10:D012..D01C do not return directly after the ordinary transfer: the
+     * vendor code executes a near RET through the little-endian 25:2122 table
+     * into its own 25:2180..23A8 continuations.  They converge on the normal
+     * 25:2476 RETS.  Preserve that complete lifecycle here so an early boot
+     * read cannot be lost from the general resource-I/O ring.  This observer
+     * only samples the real guest frame and output byte.
+     */
+    if (!env->in_interrupt &&
+        target == dmcu_code_address(0x25, 0x206e)) {
+        /* trace_control_transfer() runs after SCALL has pushed its four-byte
+         * far return frame.  Its sp argument is the pre-instruction SP and
+         * therefore still points at the five caller arguments; rom_argument()
+         * here would incorrectly read that new return frame. */
+        uint16_t output_segment = internal_data_read(sp, 16);
+        uint16_t output_offset =
+            internal_data_read((sp + 2u) & MASK16, 16);
+        uint16_t source_segment =
+            internal_data_read((sp + 4u) & MASK16, 16);
+        uint16_t source_offset =
+            internal_data_read((sp + 6u) & MASK16, 16);
+        uint16_t length = internal_data_read((sp + 8u) & MASK16, 16);
+
+        if (source_segment == 0x0010u &&
+            source_offset >= 0xd012u && source_offset <= 0xd01cu) {
+            uint32_t sequence = env->resource_special_calls++;
+            uint32_t slot = sequence % DMCU_RESOURCE_SPECIAL_TRACE_SLOTS;
+
+            env->resource_special_active = true;
+            env->resource_special_active_slot = slot;
+            env->resource_special_from[slot] = from & MASK24;
+            env->resource_special_sp[slot] = sp;
+            env->resource_special_fp[slot] = fp;
+            env->resource_special_source[slot] = source_offset;
+            env->resource_special_length[slot] = length;
+            env->resource_special_output_segment[slot] = output_segment;
+            env->resource_special_output_offset[slot] = output_offset;
+            env->resource_special_output_before[slot] =
+                trace_resource_output_byte(output_segment, output_offset);
+            env->resource_special_output_transferred[slot] = 0;
+            env->resource_special_dispatch_target[slot] = 0;
+            env->resource_special_return_target[slot] = 0;
+            env->resource_special_result[slot] = 0;
+            env->resource_special_output_after[slot] = 0;
+        }
+    }
+    if (!env->in_interrupt && env->resource_special_active &&
+        (from & MASK24) == dmcu_code_address(0x25, 0x2120) &&
+        target >= dmcu_code_address(0x25, 0x2180) &&
+        target <= dmcu_code_address(0x25, 0x23a8)) {
+        uint32_t slot = env->resource_special_active_slot %
+                        DMCU_RESOURCE_SPECIAL_TRACE_SLOTS;
+
+        env->resource_special_dispatch_target[slot] = target;
+        env->resource_special_output_transferred[slot] =
+            trace_resource_output_byte(
+                env->resource_special_output_segment[slot],
+                env->resource_special_output_offset[slot]);
+    }
+    if (!env->in_interrupt && env->resource_special_active &&
+        (from & MASK24) == dmcu_code_address(0x25, 0x2476)) {
+        uint32_t slot = env->resource_special_active_slot %
+                        DMCU_RESOURCE_SPECIAL_TRACE_SLOTS;
+
+        env->resource_special_returns++;
+        env->resource_special_return_target[slot] = target;
+        env->resource_special_result[slot] = env->gpr[0] & MASK16;
+        env->resource_special_output_after[slot] =
+            trace_resource_output_byte(
+                env->resource_special_output_segment[slot],
+                env->resource_special_output_offset[slot]);
+        env->resource_special_active = false;
+    }
+
+    /* Observe the original resident settings dispatcher and persistence
+     * writer without changing its table, arguments, return values, or NAND
+     * traffic.  SCALL is sampled after it pushed the far return frame, while
+     * sp still identifies the caller's argument block, as above. */
+    if (!env->in_interrupt &&
+        target == dmcu_code_address(0x14, 0xb768)) {
+        uint32_t sequence = env->resource_persist_dispatch_calls++;
+        uint32_t slot = sequence % DMCU_RESOURCE_PERSIST_TRACE_SLOTS;
+        unsigned index;
+
+        env->resource_persist_dispatch_active = true;
+        env->resource_persist_dispatch_active_slot = slot;
+        env->resource_persist_dispatch_from[slot] = from & MASK24;
+        env->resource_persist_dispatch_sp[slot] = sp;
+        env->resource_persist_dispatch_fp[slot] = fp;
+        env->resource_persist_dispatch_handler[slot] = 0;
+        env->resource_persist_dispatch_key[slot] = 0xffffu;
+        env->resource_persist_dispatch_value[slot] = 0xffffu;
+        env->resource_persist_dispatch_previous[slot] = 0xffffu;
+        env->resource_persist_dispatch_return_target[slot] = 0;
+        for (index = 0; index < DMCU_RESOURCE_PERSIST_ARGUMENT_WORDS;
+             index++) {
+            env->resource_persist_dispatch_args[slot][index] =
+                internal_data_read((sp + index * 2u) & MASK16, 16);
+        }
+        for (index = 0; index < DMCU_RESOURCE_PERSIST_TABLE_WORDS;
+             index++) {
+            env->resource_persist_dispatch_table[slot][index] =
+                address_space_lduw_le(
+                    /* The guest indexes biased base B716 with the raw
+                     * 0x80..0x86 event, so the effective table begins at
+                     * B816 rather than at the encoded base itself. */
+                    &address_space_memory, 0x14b816u + index * 2u,
+                    MEMTXATTRS_UNSPECIFIED, NULL);
+        }
+    }
+    if (!env->in_interrupt && env->resource_persist_dispatch_active &&
+        (from & MASK24) == dmcu_code_address(0x14, 0xb814)) {
+        uint32_t slot = env->resource_persist_dispatch_active_slot %
+                        DMCU_RESOURCE_PERSIST_TRACE_SLOTS;
+        uint16_t object_high =
+            env->resource_persist_dispatch_args[slot][0];
+        uint16_t object_low =
+            env->resource_persist_dispatch_args[slot][1];
+
+        env->resource_persist_dispatch_handler[slot] = target;
+        env->resource_persist_dispatch_key[slot] = trace_resource_far_word(
+            object_high, (object_low + 0x0008u) & MASK16);
+        env->resource_persist_dispatch_previous[slot] =
+            trace_resource_far_word(
+                object_high, (object_low + 0x001cu) & MASK16);
+        env->resource_persist_dispatch_value[slot] = trace_resource_far_word(
+            object_high, (object_low + 0x001eu) & MASK16);
+    }
+    if (!env->in_interrupt && env->resource_persist_dispatch_active &&
+        (from & MASK24) == dmcu_code_address(0x14, 0xc76c)) {
+        uint32_t slot = env->resource_persist_dispatch_active_slot %
+                        DMCU_RESOURCE_PERSIST_TRACE_SLOTS;
+
+        env->resource_persist_dispatch_returns++;
+        env->resource_persist_dispatch_return_target[slot] = target;
+        env->resource_persist_dispatch_active = false;
+    }
+
+    if (!env->in_interrupt &&
+        target == dmcu_code_address(0x32, 0xebae)) {
+        unsigned index;
+
+        env->resource_persist_wrapper_calls++;
+        env->resource_persist_last_wrapper_from = from & MASK24;
+        env->resource_persist_last_wrapper_sp = sp;
+        env->resource_persist_last_wrapper_fp = fp;
+        for (index = 0; index < 5; index++) {
+            env->resource_persist_last_wrapper_args[index] =
+                internal_data_read((sp + index * 2u) & MASK16, 16);
+        }
+        env->resource_persist_last_buffer_value =
+            trace_resource_output_byte(
+                env->resource_persist_last_wrapper_args[0],
+                env->resource_persist_last_wrapper_args[1]);
+    }
+    if (!env->in_interrupt &&
+        (from & MASK24) == dmcu_code_address(0x32, 0xebec)) {
+        env->resource_persist_wrapper_returns++;
+        env->resource_persist_last_wrapper_result = env->gpr[0] & MASK16;
+    }
+    if (!env->in_interrupt &&
+        target == dmcu_code_address(0x33, 0x0d7e)) {
+        unsigned index;
+
+        env->resource_persist_bridge_calls++;
+        env->resource_persist_last_bridge_from = from & MASK24;
+        for (index = 0; index < 5; index++) {
+            env->resource_persist_last_bridge_args[index] =
+                internal_data_read((sp + index * 2u) & MASK16, 16);
+        }
+    }
+    if (!env->in_interrupt &&
+        (from & MASK24) == dmcu_code_address(0x33, 0x0dae)) {
+        env->resource_persist_bridge_returns++;
+        env->resource_persist_last_bridge_result = env->gpr[0] & MASK16;
+    }
+    if (!env->in_interrupt &&
+        target == dmcu_code_address(0x28, 0x0f92)) {
+        unsigned index;
+
+        env->resource_persist_page_calls++;
+        env->resource_persist_last_page_from = from & MASK24;
+        for (index = 0; index < 5; index++) {
+            env->resource_persist_last_page_args[index] =
+                internal_data_read((sp + index * 2u) & MASK16, 16);
+        }
+    }
+    if (!env->in_interrupt &&
+        (from & MASK24) == dmcu_code_address(0x28, 0x12a2)) {
+        env->resource_persist_page_returns++;
+        env->resource_persist_last_page_result = env->gpr[0] & MASK16;
+    }
+
+    /* Follow the caller-owned far return frame of the exact vendor resource
+     * compositor.  The frame is captured after the real SCALL has pushed it;
+     * all later samples and write records are observer-only. */
+    if (!env->in_interrupt &&
+        target == dmcu_code_address(0x2e, 0x0af6) &&
+        ((from & MASK24) < dmcu_code_address(0x2e, 0x0af6) ||
+         (from & MASK24) > dmcu_code_address(0x2e, 0x0c82))) {
+        uint64_t sequence = env->npe_resource_return_trace_count++;
+        uint32_t slot = sequence % DMCU_NPE_RESOURCE_RETURN_TRACE_SLOTS;
+        uint16_t base = env->gpr[DMCU_SP] & MASK16;
+
+        env->npe_resource_return_trace_sequence[slot] = sequence + 1u;
+        env->npe_resource_return_active_slot = slot + 1u;
+        env->npe_resource_return_active_sequence = sequence + 1u;
+        env->npe_resource_return_caller[slot] = from & MASK24;
+        env->npe_resource_return_call_sp[slot] = sp;
+        env->npe_resource_return_call_post_sp[slot] = base;
+        env->npe_resource_return_call_fp[slot] = fp;
+        env->npe_resource_return_frame_base[slot] = base;
+        env->npe_resource_return_initial_frame[slot][0] =
+            internal_data_read(base, 16);
+        env->npe_resource_return_initial_frame[slot][1] =
+            internal_data_read((base + 2u) & MASK16, 16);
+        memcpy(env->npe_resource_return_final_frame[slot],
+               env->npe_resource_return_initial_frame[slot],
+               sizeof(env->npe_resource_return_final_frame[slot]));
+        env->npe_resource_return_stage_valid[slot] = 0;
+        memset(env->npe_resource_return_stage_pc[slot], 0,
+               sizeof(env->npe_resource_return_stage_pc[slot]));
+        memset(env->npe_resource_return_stage_target[slot], 0,
+               sizeof(env->npe_resource_return_stage_target[slot]));
+        memset(env->npe_resource_return_stage_word[slot], 0,
+               sizeof(env->npe_resource_return_stage_word[slot]));
+        memset(env->npe_resource_return_stage_sp[slot], 0,
+               sizeof(env->npe_resource_return_stage_sp[slot]));
+        memset(env->npe_resource_return_stage_post_sp[slot], 0,
+               sizeof(env->npe_resource_return_stage_post_sp[slot]));
+        memset(env->npe_resource_return_stage_fp[slot], 0,
+               sizeof(env->npe_resource_return_stage_fp[slot]));
+        memset(env->npe_resource_return_stage_frame[slot], 0,
+               sizeof(env->npe_resource_return_stage_frame[slot]));
+        snapshot_npe_resource_return_stage(
+            env, 0, from, target, word, sp, fp);
+    }
+    if (env->npe_resource_return_active_slot) {
+        unsigned stage = DMCU_NPE_RESOURCE_RETURN_TRACE_STAGES;
+
+        if ((from & MASK24) == dmcu_code_address(0x2e, 0x0af6) &&
+            target == dmcu_code_address(0x2e, 0x0af8)) {
+            stage = 1;
+        } else if (target == dmcu_code_address(0x2e, 0x0b80)) {
+            stage = 2;
+        } else if (target == dmcu_code_address(0x2e, 0x0bea)) {
+            stage = 3;
+        } else if (target == dmcu_code_address(0x2e, 0x0bfa)) {
+            stage = 4;
+        } else if (target == dmcu_code_address(0x2e, 0x0c18)) {
+            stage = 5;
+        } else if (target == dmcu_code_address(0x2e, 0x0c44)) {
+            stage = 6;
+        } else if (target == dmcu_code_address(0x2e, 0x0c62)) {
+            stage = 7;
+        } else if (target == dmcu_code_address(0x2e, 0x0c6e)) {
+            stage = 8;
+        } else if (target == dmcu_code_address(0x2e, 0x0c7a)) {
+            stage = 9;
+        } else if ((from & MASK24) == dmcu_code_address(0x2e, 0x0c80) &&
+                   target == dmcu_code_address(0x2e, 0x0c82)) {
+            stage = 10;
+        } else if ((from & MASK24) == dmcu_code_address(0x2e, 0x0c82)) {
+            stage = 11;
+        }
+        if (stage < DMCU_NPE_RESOURCE_RETURN_TRACE_STAGES &&
+            !(stage == 0 && target == dmcu_code_address(0x2e, 0x0af6))) {
+            snapshot_npe_resource_return_stage(
+                env, stage, from, target, word, sp, fp);
+            if (stage == 11) {
+                env->npe_resource_return_active_slot = 0;
+                env->npe_resource_return_active_sequence = 0;
+            }
+        }
+    }
+
+    /* The complete linked function spans 2F:DF06..F21C but has no direct
+     * SCALL/SJMP reference in the application image.  Capture the first edge
+     * which crosses into that range from outside it.  This also detects a
+     * computed dispatch which incorrectly lands after the LINK prologue.
+     * The observer is intentionally read-only. */
+    if (!env->in_interrupt &&
+        target >= dmcu_code_address(0x2f, 0xdf06) &&
+        target <= dmcu_code_address(0x2f, 0xf21c) &&
+        !(from >= dmcu_code_address(0x2f, 0xdf06) &&
+          from <= dmcu_code_address(0x2f, 0xf21c))) {
+        uint32_t entry = env->npe_df06_entry_count++;
+
+        if (entry == 0u) {
+            unsigned i;
+
+            env->npe_df06_entry_from = from & MASK24;
+            env->npe_df06_entry_target = target;
+            env->npe_df06_entry_sequential = sequential & MASK24;
+            env->npe_df06_entry_prior_from = prior_instruction_from & MASK24;
+            env->npe_df06_entry_prior_target =
+                prior_instruction_target & MASK24;
+            env->npe_df06_entry_word = word;
+            env->npe_df06_entry_ext = ext;
+            env->npe_df06_entry_prior_word = prior_instruction_word;
+            env->npe_df06_entry_pre_sp = sp;
+            env->npe_df06_entry_post_sp = env->gpr[DMCU_SP] & MASK16;
+            env->npe_df06_entry_pre_fp = fp;
+            env->npe_df06_entry_post_fp = env->gpr[DMCU_FP] & MASK16;
+            env->npe_df06_entry_application_state = address_space_lduw_le(
+                &address_space_memory, 0x512aaau,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            env->npe_df06_entry_object_hi = address_space_lduw_le(
+                &address_space_memory, 0x5254a4u,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            env->npe_df06_entry_object_lo = address_space_lduw_le(
+                &address_space_memory, 0x5254a6u,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            env->npe_df06_entry_stream_hi = address_space_lduw_le(
+                &address_space_memory, 0x5254e8u,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            env->npe_df06_entry_stream_lo = address_space_lduw_le(
+                &address_space_memory, 0x5254eau,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            for (i = 0; i < ARRAY_SIZE(env->npe_df06_entry_gpr); i++) {
+                env->npe_df06_entry_gpr[i] = env->gpr[i] & MASK16;
+            }
+            for (i = 0; i < DMCU_NPE_DF06_STACK_WORDS; i++) {
+                env->npe_df06_entry_pre_stack[i] = internal_data_read(
+                    (sp + i * 2u) & MASK16, 16);
+                env->npe_df06_entry_post_stack[i] = internal_data_read(
+                    ((env->gpr[DMCU_SP] & MASK16) + i * 2u) & MASK16, 16);
+            }
+        }
+    }
+
+    /* Name the actual stages reached between the application catalogue and
+     * the NPE bitmap loop.  In particular, 27:9892 and 2B:9178 are linked
+     * targets whose exact source-bank counterparts contain the parser and
+     * global-context constructor.  Keeping their entry edges alongside the
+     * engine/decoder entries distinguishes an omitted constructor from a
+     * constructor that ran and was later cleared. */
+    if (!env->in_interrupt && npe_launch_entry_logs < 96u &&
+        (target == dmcu_code_address(0x33, 0x3870) ||
+         target == dmcu_code_address(0x33, 0x3892) ||
+         target == dmcu_code_address(0x27, 0x9892) ||
+         target == dmcu_code_address(0x2b, 0x9178) ||
+         target == dmcu_code_address(0x2f, 0xa0b6) ||
+         target == dmcu_code_address(0x2b, 0x0000) ||
+         target == dmcu_code_address(0x5f, 0x0000) ||
+         target == dmcu_code_address(0x5f, 0x4e3e) ||
+         from == dmcu_code_address(0x5f, 0x0246) ||
+         from == dmcu_code_address(0x5f, 0x5070) ||
+         target == dmcu_code_address(0x32, 0xb63c) ||
+         target == dmcu_code_address(0x5f, 0xb63c) ||
+         from == dmcu_code_address(0x32, 0xb68e) ||
+         from == dmcu_code_address(0x5f, 0xb68e) ||
+         target == dmcu_code_address(0x03, 0x4128) ||
+         target == dmcu_code_address(0x32, 0xf38a) ||
+         target == dmcu_code_address(0x5f, 0xf38a) ||
+         from == dmcu_code_address(0x32, 0xf3c4) ||
+         from == dmcu_code_address(0x5f, 0xf3c4) ||
+         target == dmcu_code_address(0x10, 0xd019) ||
+         target == dmcu_code_address(0x26, 0x3e5e) ||
+         from == dmcu_code_address(0x26, 0x41fc) ||
+         target == dmcu_code_address(0x2d, 0xc276) ||
+         from == dmcu_code_address(0x2d, 0xc418) ||
+         target == dmcu_code_address(0x33, 0x03b2) ||
+         from == dmcu_code_address(0x33, 0x03e6) ||
+         (dmcu_code_segment(target) == 0x10 &&
+          dmcu_code_pc(target) < 0x0100) ||
+         target == dmcu_code_address(0x1f, 0x12b4))) {
+        qemu_log_mask(
+            LOG_UNIMP,
+            "DMCU NPE launch entry #%u %02x:%04x>%02x:%04x "
+            "word=%04x sequential=%u sp=%04x>%04x fp=%04x>%04x "
+            "r=%04x,%04x,%04x,%04x\n",
+            ++npe_launch_entry_logs,
+            dmcu_code_segment(from), dmcu_code_pc(from),
+            dmcu_code_segment(target), dmcu_code_pc(target), word & MASK16,
+            sequential, sp & MASK16, env->gpr[DMCU_SP] & MASK16,
+            fp & MASK16, env->gpr[DMCU_FP] & MASK16,
+            env->gpr[0] & MASK16, env->gpr[1] & MASK16,
+            env->gpr[2] & MASK16, env->gpr[3] & MASK16);
+    }
+
+    /* Follow the exact bitmap-decoder chain used by the NPE loader.  These
+     * bounded snapshots are deliberately log-only: the source routines use
+     * packed far pointers whose high word is shifted into DS0/DS1, so a
+     * conventional physical-memory dump alone cannot show which argument
+     * produced a non-terminating node walk. */
+    if (!env->in_interrupt && npe_bitmap_decode_path_logs < 64u &&
+        (((from & MASK24) == dmcu_code_address(0x1f, 0x1464) &&
+          target == dmcu_code_address(0x5f, 0x716c)) ||
+         ((from & MASK24) == dmcu_code_address(0x5f, 0x7234) &&
+          target == dmcu_code_address(0x31, 0xaed0)) ||
+         ((from & MASK24) == dmcu_code_address(0x31, 0xaf70) &&
+          target == dmcu_code_address(0x5f, 0x7238)) ||
+         ((from & MASK24) == dmcu_code_address(0x5f, 0x725a) &&
+          target == dmcu_code_address(0x5f, 0x8202)) ||
+         ((from & MASK24) == dmcu_code_address(0x5f, 0x84aa) &&
+          target == dmcu_code_address(0x5f, 0x725e)))) {
+        uint16_t arg0_hi = internal_data_read((sp + 0u) & MASK16, 16);
+        uint16_t arg0_lo = internal_data_read((sp + 2u) & MASK16, 16);
+        uint32_t arg0_physical =
+            (((uint32_t)arg0_hi << 16) | arg0_lo) & MASK24;
+        uint16_t sample[8];
+        unsigned i;
+
+        for (i = 0; i < ARRAY_SIZE(sample); i++) {
+            sample[i] = address_space_lduw_le(
+                &address_space_memory, arg0_physical + i * 2u,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+        }
+        qemu_log_mask(
+            LOG_UNIMP,
+            "DMCU NPE bitmap decode path #%u "
+            "%02x:%04x>%02x:%04x word=%04x "
+            "sp=%04x>%04x fp=%04x>%04x "
+            "r=%04x,%04x,%04x,%04x "
+            "args=%04x,%04x,%04x,%04x,%04x,%04x "
+            "arg0p=%06x data=%04x,%04x,%04x,%04x,%04x,%04x,%04x,%04x\n",
+            ++npe_bitmap_decode_path_logs,
+            dmcu_code_segment(from), dmcu_code_pc(from),
+            dmcu_code_segment(target), dmcu_code_pc(target), word & MASK16,
+            sp & MASK16, env->gpr[DMCU_SP] & MASK16,
+            fp & MASK16, env->gpr[DMCU_FP] & MASK16,
+            env->gpr[0] & MASK16, env->gpr[1] & MASK16,
+            env->gpr[2] & MASK16, env->gpr[3] & MASK16,
+            arg0_hi, arg0_lo,
+            internal_data_read((sp + 4u) & MASK16, 16),
+            internal_data_read((sp + 6u) & MASK16, 16),
+            internal_data_read((sp + 8u) & MASK16, 16),
+            internal_data_read((sp + 10u) & MASK16, 16),
+            arg0_physical,
+            sample[0], sample[1], sample[2], sample[3],
+            sample[4], sample[5], sample[6], sample[7]);
+    }
+
+    /* Capture the state which decides whether 5F:716C leaves its bitmap
+     * loop.  Far pointers are stored as an ordinary 8:16 value; the helper's
+     * SL/SLOSB sequence folds bit 15 of the low word into the 9-bit DS bank,
+     * which is equivalent to the 24-bit concatenation used here.  Byte reads
+     * use the external word bus's exchanged lane, hence status_physical ^ 1.
+     * All samples are bounded and read-only. */
+    if (!env->in_interrupt && npe_bitmap_decode_loop_logs < 128u &&
+        ((from & MASK24) == dmcu_code_address(0x5f, 0x7358) ||
+         (from & MASK24) == dmcu_code_address(0x5f, 0x743c) ||
+         (from & MASK24) == dmcu_code_address(0x5f, 0x748e) ||
+         (from & MASK24) == dmcu_code_address(0x5f, 0x749e))) {
+        uint16_t global_context_hi = address_space_lduw_le(
+            &address_space_memory, 0x525424u,
+            MEMTXATTRS_UNSPECIFIED, NULL);
+        uint16_t global_context_lo = address_space_lduw_le(
+            &address_space_memory, 0x525426u,
+            MEMTXATTRS_UNSPECIFIED, NULL);
+        uint16_t global_root_hi = address_space_lduw_le(
+            &address_space_memory, 0x525440u,
+            MEMTXATTRS_UNSPECIFIED, NULL);
+        uint16_t global_root_lo = address_space_lduw_le(
+            &address_space_memory, 0x525442u,
+            MEMTXATTRS_UNSPECIFIED, NULL);
+        uint32_t global_root_physical =
+            (((uint32_t)global_root_hi << 16) | global_root_lo) & MASK24;
+        uint32_t status_physical =
+            (global_root_physical + 0x02a0u) & MASK24;
+        uint8_t status = address_space_ldub(
+            &address_space_memory, status_physical ^ 1u,
+            MEMTXATTRS_UNSPECIFIED, NULL);
+
+        qemu_log_mask(
+            LOG_UNIMP,
+            "DMCU NPE bitmap loop #%u %02x:%04x>%02x:%04x "
+            "sp=%04x fp=%04x r=%04x,%04x,%04x,%04x "
+            "args=%04x:%04x,%04x:%04x,%04x:%04x "
+            "locals=%04x,%04x,%04x,%04x,%04x,%04x,"
+            "%04x,%04x,%04x,%04x,%04x,%04x,"
+            "%04x,%04x,%04x,%04x,%04x,%04x "
+            "globals=%04x:%04x,%04x:%04x rootp=%06x "
+            "statusp=%06x status=%02x\n",
+            ++npe_bitmap_decode_loop_logs,
+            dmcu_code_segment(from), dmcu_code_pc(from),
+            dmcu_code_segment(target), dmcu_code_pc(target),
+            env->gpr[DMCU_SP] & MASK16, env->gpr[DMCU_FP] & MASK16,
+            env->gpr[0] & MASK16, env->gpr[1] & MASK16,
+            env->gpr[2] & MASK16, env->gpr[3] & MASK16,
+            internal_data_read((fp + 6u) & MASK16, 16),
+            internal_data_read((fp + 8u) & MASK16, 16),
+            internal_data_read((fp + 10u) & MASK16, 16),
+            internal_data_read((fp + 12u) & MASK16, 16),
+            internal_data_read((fp + 14u) & MASK16, 16),
+            internal_data_read((fp + 16u) & MASK16, 16),
+            internal_data_read((fp - 0x30u) & MASK16, 16),
+            internal_data_read((fp - 0x2eu) & MASK16, 16),
+            internal_data_read((fp - 0x2cu) & MASK16, 16),
+            internal_data_read((fp - 0x2au) & MASK16, 16),
+            internal_data_read((fp - 0x28u) & MASK16, 16),
+            internal_data_read((fp - 0x26u) & MASK16, 16),
+            internal_data_read((fp - 0x24u) & MASK16, 16),
+            internal_data_read((fp - 0x22u) & MASK16, 16),
+            internal_data_read((fp - 0x14u) & MASK16, 16),
+            internal_data_read((fp - 0x12u) & MASK16, 16),
+            internal_data_read((fp - 0x10u) & MASK16, 16),
+            internal_data_read((fp - 0x0eu) & MASK16, 16),
+            internal_data_read((fp - 0x0cu) & MASK16, 16),
+            internal_data_read((fp - 0x0au) & MASK16, 16),
+            internal_data_read((fp - 0x08u) & MASK16, 16),
+            internal_data_read((fp - 0x06u) & MASK16, 16),
+            internal_data_read((fp - 0x04u) & MASK16, 16),
+            internal_data_read((fp - 0x02u) & MASK16, 16),
+            global_context_hi, global_context_lo,
+            global_root_hi, global_root_lo,
+            global_root_physical, status_physical, status);
+    }
+
+    /* Trace the source-pinned NPE node-transfer routine and every far helper
+     * edge it can take.  The writable 5F:C5EC data window intentionally
+     * overlaps its logical code address, while instruction fetches come from
+     * the pristine 38:C5EC source.  Capturing both sides of each SCALL makes
+     * the first bad saved return address visible without altering guest RAM,
+     * registers, flags, or control flow. */
+    if (!env->in_interrupt && npe_node_transfer_path_logs < 1024u &&
+        (dmcu_code_segment(from) == 0x5fu ||
+         dmcu_code_segment(target) == 0x5fu)) {
+        static const uint16_t child_calls[] = {
+            0xc652, 0xc7b6, 0xc852, 0xc900, 0xcaca, 0xcb96, 0xcc74,
+            0xcd68, 0xc95c, 0xcb26, 0xcbf2, 0xccd0, 0xcd04,
+        };
+        bool node_edge =
+            target == dmcu_code_address(0x5f, 0xc5ec) ||
+            ((from & MASK24) == dmcu_code_address(0x5f, 0xce3a));
+        const char *edge_kind =
+            target == dmcu_code_address(0x5f, 0xc5ec) ? "entry" :
+            "return";
+        unsigned child;
+
+        for (child = 0; child < ARRAY_SIZE(child_calls); child++) {
+            uint32_t call = dmcu_code_address(0x5f, child_calls[child]);
+            uint32_t resume = dmcu_code_address(
+                0x5f, (child_calls[child] + 4u) & MASK16);
+
+            if ((from & MASK24) == call || target == resume) {
+                node_edge = true;
+                edge_kind = (from & MASK24) == call ? "child-call" :
+                    "child-return";
+                break;
+            }
+        }
+
+        if (node_edge) {
+            qemu_log_mask(
+                LOG_UNIMP,
+                "DMCU NPE node transfer path #%u %s "
+                "%02x:%04x>%02x:%04x word=%04x "
+                "sp=%04x>%04x fp=%04x>%04x "
+                "r=%04x,%04x,%04x,%04x,%04x,%04x "
+                "stack=%04x,%04x,%04x,%04x,%04x,%04x,"
+                "%04x,%04x,%04x,%04x,%04x,%04x "
+                "frame=%04x,%04x,%04x,%04x,%04x,%04x\n",
+                ++npe_node_transfer_path_logs, edge_kind,
+                dmcu_code_segment(from), dmcu_code_pc(from),
+                dmcu_code_segment(target), dmcu_code_pc(target),
+                word & MASK16,
+                sp & MASK16, env->gpr[DMCU_SP] & MASK16,
+                fp & MASK16, env->gpr[DMCU_FP] & MASK16,
+                env->gpr[0] & MASK16, env->gpr[1] & MASK16,
+                env->gpr[2] & MASK16, env->gpr[3] & MASK16,
+                env->gpr[4] & MASK16, env->gpr[5] & MASK16,
+                internal_data_read((sp + 0u) & MASK16, 16),
+                internal_data_read((sp + 2u) & MASK16, 16),
+                internal_data_read((sp + 4u) & MASK16, 16),
+                internal_data_read((sp + 6u) & MASK16, 16),
+                internal_data_read((sp + 8u) & MASK16, 16),
+                internal_data_read((sp + 10u) & MASK16, 16),
+                internal_data_read((sp + 12u) & MASK16, 16),
+                internal_data_read((sp + 14u) & MASK16, 16),
+                internal_data_read((sp + 16u) & MASK16, 16),
+                internal_data_read((sp + 18u) & MASK16, 16),
+                internal_data_read((sp + 20u) & MASK16, 16),
+                internal_data_read((sp + 22u) & MASK16, 16),
+                internal_data_read((fp + 0u) & MASK16, 16),
+                internal_data_read((fp + 2u) & MASK16, 16),
+                internal_data_read((fp + 4u) & MASK16, 16),
+                internal_data_read((fp + 6u) & MASK16, 16),
+                internal_data_read((fp + 8u) & MASK16, 16),
+                internal_data_read((fp + 10u) & MASK16, 16));
+        }
+    }
+
+    if (env->storage_probe_page_watch_active &&
+        env->storage_probe_page_watch_count < 32u &&
+        target >= dmcu_code_address(0x5f, 0x261e) &&
+        target < dmcu_code_address(0x5f, 0x27e6) &&
+        ((from & MASK24) < dmcu_code_address(0x5f, 0x261c) ||
+         (from & MASK24) >= dmcu_code_address(0x5f, 0x27e6))) {
+        qemu_log_mask(
+            LOG_UNIMP,
+            "DMCU probe-armed page transition #%u "
+            "%02x:%04x>%02x:%04x word=%04x irq=%u "
+            "sp=%04x fp=%04x post-sp=%04x post-fp=%04x "
+            "stack=%04x,%04x,%04x,%04x,%04x,%04x "
+            "fpargs=%04x,%04x,%04x,%04x,%04x,%04x,%04x,%04x "
+            "r=%04x,%04x,%04x,%04x\n",
+            ++env->storage_probe_page_watch_count,
+            dmcu_code_segment(from), dmcu_code_pc(from),
+            dmcu_code_segment(target), dmcu_code_pc(target),
+            word & MASK16, env->in_interrupt,
+            sp & MASK16, fp & MASK16,
+            env->gpr[DMCU_SP] & MASK16,
+            env->gpr[DMCU_FP] & MASK16,
+            internal_data_read((sp + 0u) & MASK16, 16),
+            internal_data_read((sp + 2u) & MASK16, 16),
+            internal_data_read((sp + 4u) & MASK16, 16),
+            internal_data_read((sp + 6u) & MASK16, 16),
+            internal_data_read((sp + 8u) & MASK16, 16),
+            internal_data_read((sp + 10u) & MASK16, 16),
+            internal_data_read((fp + 6u) & MASK16, 16),
+            internal_data_read((fp + 8u) & MASK16, 16),
+            internal_data_read((fp + 10u) & MASK16, 16),
+            internal_data_read((fp + 12u) & MASK16, 16),
+            internal_data_read((fp + 14u) & MASK16, 16),
+            internal_data_read((fp + 16u) & MASK16, 16),
+            internal_data_read((fp + 18u) & MASK16, 16),
+            internal_data_read((fp + 20u) & MASK16, 16),
+            env->gpr[0] & MASK16, env->gpr[1] & MASK16,
+            env->gpr[2] & MASK16, env->gpr[3] & MASK16);
+    }
+
+    /* A correct invocation of relocated 5F:261C enters at its LINK.  Any control
+     * transfer from outside the routine to a later PC skips the frame setup
+     * and reinterprets the caller's saved words as the sector count. */
+    if (storage_page_read_external_entry_logs < 128u &&
+        target >= dmcu_code_address(0x5f, 0x261e) &&
+        target < dmcu_code_address(0x5f, 0x27e6) &&
+        ((from & MASK24) < dmcu_code_address(0x5f, 0x261c) ||
+         (from & MASK24) >= dmcu_code_address(0x5f, 0x27e6))) {
+        qemu_log_mask(
+            LOG_UNIMP,
+            "DMCU storage page-read external entry #%u "
+            "%02x:%04x>%02x:%04x word=%04x ext=%04x irq=%u "
+            "sp=%04x fp=%04x post-sp=%04x post-fp=%04x "
+            "stack=%04x,%04x,%04x,%04x,%04x,%04x "
+            "fpargs=%04x,%04x,%04x,%04x,%04x,%04x,%04x,%04x "
+            "r=%04x,%04x,%04x,%04x phase=%u\n",
+            ++storage_page_read_external_entry_logs,
+            dmcu_code_segment(from), dmcu_code_pc(from),
+            dmcu_code_segment(target), dmcu_code_pc(target),
+            word & MASK16, ext & MASK16, env->in_interrupt,
+            sp & MASK16, fp & MASK16,
+            env->gpr[DMCU_SP] & MASK16,
+            env->gpr[DMCU_FP] & MASK16,
+            internal_data_read((sp + 0u) & MASK16, 16),
+            internal_data_read((sp + 2u) & MASK16, 16),
+            internal_data_read((sp + 4u) & MASK16, 16),
+            internal_data_read((sp + 6u) & MASK16, 16),
+            internal_data_read((sp + 8u) & MASK16, 16),
+            internal_data_read((sp + 10u) & MASK16, 16),
+            internal_data_read((fp + 6u) & MASK16, 16),
+            internal_data_read((fp + 8u) & MASK16, 16),
+            internal_data_read((fp + 10u) & MASK16, 16),
+            internal_data_read((fp + 12u) & MASK16, 16),
+            internal_data_read((fp + 14u) & MASK16, 16),
+            internal_data_read((fp + 16u) & MASK16, 16),
+            internal_data_read((fp + 18u) & MASK16, 16),
+            internal_data_read((fp + 20u) & MASK16, 16),
+            env->gpr[0] & MASK16, env->gpr[1] & MASK16,
+            env->gpr[2] & MASK16, env->gpr[3] & MASK16,
+            env->npe_control_trace_phase);
+    }
+
+    if (sector_probe_geometry_return_logs < 16u &&
+        (from & MASK24) == dmcu_code_address(0x07, 0x47a0) &&
+        target == dmcu_code_address(0x5f, 0xf9d6)) {
+        qemu_log_mask(
+            LOG_UNIMP,
+            "DMCU sector probe geometry return #%u result=%04x "
+            "sp=%04x fp=%04x stack=%04x,%04x,%04x,%04x "
+            "root=%04x:%04x record=%04x:%04x\n",
+            ++sector_probe_geometry_return_logs,
+            env->gpr[0] & MASK16, sp & MASK16, fp & MASK16,
+            internal_data_read((sp + 0u) & MASK16, 16),
+            internal_data_read((sp + 2u) & MASK16, 16),
+            internal_data_read((sp + 4u) & MASK16, 16),
+            internal_data_read((sp + 6u) & MASK16, 16),
+            address_space_lduw_le(&address_space_memory, 0x5129c4u,
+                                  MEMTXATTRS_UNSPECIFIED, NULL),
+            address_space_lduw_le(&address_space_memory, 0x5129c6u,
+                                  MEMTXATTRS_UNSPECIFIED, NULL),
+            address_space_lduw_le(&address_space_memory, 0x5127c2u,
+                                  MEMTXATTRS_UNSPECIFIED, NULL),
+            address_space_lduw_le(&address_space_memory, 0x5127c4u,
+                                  MEMTXATTRS_UNSPECIFIED, NULL));
+    }
+
+    /* The relocated 5F:F928 storage geometry probe has three calls to the
+     * still-unrecovered resident cache-result helper.  Retain bounded entry
+     * and return snapshots while comparing candidate ROM reconstructions.
+     * This is a read-only observer: it does not alter registers, memory,
+     * control flow, or the helper result. */
+    if (!env->in_interrupt && sector_probe_result_call_logs < 32u &&
+        ((from & MASK24) == 0x5ffa1eu ||
+         (from & MASK24) == 0x5ffb44u ||
+         (from & MASK24) == 0x5ffbb8u)) {
+        qemu_log_mask(
+            LOG_UNIMP,
+            "DMCU sector probe result call #%u %02x:%04x>%02x:%04x "
+            "word=%04x sp=%04x fp=%04x r=%04x,%04x,%04x,%04x "
+            "stack=%04x,%04x,%04x,%04x,%04x,%04x\n",
+            ++sector_probe_result_call_logs,
+            dmcu_code_segment(from), dmcu_code_pc(from),
+            dmcu_code_segment(target), dmcu_code_pc(target), word & MASK16,
+            sp & MASK16, fp & MASK16,
+            env->gpr[0] & MASK16, env->gpr[1] & MASK16,
+            env->gpr[2] & MASK16, env->gpr[3] & MASK16,
+            internal_data_read((sp + 0u) & MASK16, 16),
+            internal_data_read((sp + 2u) & MASK16, 16),
+            internal_data_read((sp + 4u) & MASK16, 16),
+            internal_data_read((sp + 6u) & MASK16, 16),
+            internal_data_read((sp + 8u) & MASK16, 16),
+            internal_data_read((sp + 10u) & MASK16, 16));
+    }
+    if (!env->in_interrupt && sector_probe_result_return_logs < 32u &&
+        word == 0xc620u &&
+        (target == 0x5ffa22u || target == 0x5ffb48u ||
+         target == 0x5ffbbcu)) {
+        qemu_log_mask(
+            LOG_UNIMP,
+            "DMCU sector probe result return #%u %02x:%04x>%02x:%04x "
+            "sp=%04x fp=%04x r=%04x,%04x,%04x,%04x "
+            "stack=%04x,%04x,%04x,%04x,%04x,%04x\n",
+            ++sector_probe_result_return_logs,
+            dmcu_code_segment(from), dmcu_code_pc(from),
+            dmcu_code_segment(target), dmcu_code_pc(target),
+            sp & MASK16, fp & MASK16,
+            env->gpr[0] & MASK16, env->gpr[1] & MASK16,
+            env->gpr[2] & MASK16, env->gpr[3] & MASK16,
+            internal_data_read((sp + 0u) & MASK16, 16),
+            internal_data_read((sp + 2u) & MASK16, 16),
+            internal_data_read((sp + 4u) & MASK16, 16),
+            internal_data_read((sp + 6u) & MASK16, 16),
+            internal_data_read((sp + 8u) & MASK16, 16),
+            internal_data_read((sp + 10u) & MASK16, 16));
+    }
+
+    /* During the NPE table read, retain the complete storage-page boundary
+     * chain rather than the first boot-time cache probes above.  This trace
+     * distinguishes a cache miss from a failed direct-media refill without
+     * modifying the helper result or any guest buffer byte. */
+    if (!env->in_interrupt && env->npe_game_table_io_active &&
+        npe_table_sector_probe_logs < 512u &&
+        (((from & MASK24) == dmcu_code_address(0x1c, 0xd374) &&
+          target == dmcu_code_address(0x5f, 0xf928)) ||
+         ((from & MASK24) == dmcu_code_address(0x5f, 0xfe7e) &&
+          target == dmcu_code_address(0x1c, 0xd378)) ||
+         (from & MASK24) == dmcu_code_address(0x5f, 0xfa1e) ||
+         (from & MASK24) == dmcu_code_address(0x5f, 0xfb44) ||
+         (from & MASK24) == dmcu_code_address(0x5f, 0xfbb8) ||
+         (target == dmcu_code_address(0x5f, 0xfa22) && word == 0xc620u) ||
+         (target == dmcu_code_address(0x5f, 0xfb48) && word == 0xc620u) ||
+         (target == dmcu_code_address(0x5f, 0xfbbc) && word == 0xc620u) ||
+         (from & MASK24) == dmcu_code_address(0x5f, 0xfa90) ||
+         (from & MASK24) == dmcu_code_address(0x5f, 0xfc8a) ||
+         (from & MASK24) == dmcu_code_address(0x5f, 0xfd5e) ||
+         target == dmcu_code_address(0x5f, 0xfa94) ||
+         target == dmcu_code_address(0x5f, 0xfc8e) ||
+         target == dmcu_code_address(0x5f, 0xfd62))) {
+        uint16_t cache_head[8];
+        unsigned cache_index;
+
+        for (cache_index = 0; cache_index < ARRAY_SIZE(cache_head);
+             cache_index++) {
+            cache_head[cache_index] = address_space_lduw_le(
+                &address_space_memory, 0x511a40u + cache_index * 2u,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+        }
+        qemu_log_mask(
+            LOG_UNIMP,
+            "DMCU NPE table sector probe #%u "
+            "%02x:%04x>%02x:%04x word=%04x "
+            "sp=%04x>%04x fp=%04x>%04x "
+            "r=%04x,%04x,%04x,%04x "
+            "stack=%04x,%04x,%04x,%04x,%04x,%04x "
+            "cache=%04x,%04x,%04x,%04x,%04x,%04x,%04x,%04x\n",
+            ++npe_table_sector_probe_logs,
+            dmcu_code_segment(from), dmcu_code_pc(from),
+            dmcu_code_segment(target), dmcu_code_pc(target), word & MASK16,
+            sp & MASK16, env->gpr[DMCU_SP] & MASK16,
+            fp & MASK16, env->gpr[DMCU_FP] & MASK16,
+            env->gpr[0] & MASK16, env->gpr[1] & MASK16,
+            env->gpr[2] & MASK16, env->gpr[3] & MASK16,
+            internal_data_read((sp + 0u) & MASK16, 16),
+            internal_data_read((sp + 2u) & MASK16, 16),
+            internal_data_read((sp + 4u) & MASK16, 16),
+            internal_data_read((sp + 6u) & MASK16, 16),
+            internal_data_read((sp + 8u) & MASK16, 16),
+            internal_data_read((sp + 10u) & MASK16, 16),
+            cache_head[0], cache_head[1], cache_head[2], cache_head[3],
+            cache_head[4], cache_head[5], cache_head[6], cache_head[7]);
+    }
+
+    /* Arm the exact adjacent resource pair only: 27:58E4 supplies the
+     * 240x17 footer/background object and 31:590E supplies the 44x15 clock
+     * background object.  Caller order in the trace preserves pair order. */
+    if (!env->in_interrupt &&
+        ((from & MASK24) == dmcu_code_address(0x27, 0x58e4) ||
+         (from & MASK24) == dmcu_code_address(0x31, 0x590e)) &&
+        target == dmcu_code_address(0x2e, 0x0af6)) {
+        uint32_t sequence = env->clock_resource_release_calls++;
+
+        if (sequence < DMCU_CLOCK_RESOURCE_RELEASE_TRACE_SLOTS) {
+            env->clock_resource_release_active = sequence + 1u;
+            env->clock_resource_release_caller[sequence] = from & MASK24;
+            env->clock_resource_release_call_sp[sequence] = sp;
+            env->clock_resource_release_call_post_sp[sequence] =
+                env->gpr[DMCU_SP] & MASK16;
+            env->clock_resource_release_call_fp[sequence] = fp;
+        } else {
+            env->clock_resource_release_active = 0;
+        }
+    }
+    if (env->clock_resource_release_active) {
+        uint32_t slot = env->clock_resource_release_active - 1u;
+
+        if ((from & MASK24) == dmcu_code_address(0x2e, 0x0c6a)) {
+            snapshot_clock_resource_release(
+                env, CLOCK_RESOURCE_RELEASE_CALL_8B26, from, target,
+                word, ext, sp, fp, env->gpr[DMCU_SP] & MASK16,
+                env->gpr[DMCU_FP] & MASK16, true,
+                internal_data_read(sp, 16));
+        } else if ((from & MASK24) == dmcu_code_address(0x30, 0x8c1a) &&
+                   target == dmcu_code_address(0x2e, 0x0c6e)) {
+            snapshot_clock_resource_release(
+                env, CLOCK_RESOURCE_RELEASE_RETURN_8B26, from, target,
+                word, ext, sp, fp, env->gpr[DMCU_SP] & MASK16,
+                env->gpr[DMCU_FP] & MASK16, false, 0xffffu);
+        } else if ((from & MASK24) == dmcu_code_address(0x2e, 0x0c76)) {
+            snapshot_clock_resource_release(
+                env, CLOCK_RESOURCE_RELEASE_CALL_3A56, from, target,
+                word, ext, sp, fp, env->gpr[DMCU_SP] & MASK16,
+                env->gpr[DMCU_FP] & MASK16, true,
+                internal_data_read(sp, 16));
+        } else if ((from & MASK24) == dmcu_code_address(0x30, 0x3b60) &&
+                   target == dmcu_code_address(0x2e, 0x0c7a)) {
+            snapshot_clock_resource_release(
+                env, CLOCK_RESOURCE_RELEASE_RETURN_3A56, from, target,
+                word, ext, sp, fp, env->gpr[DMCU_SP] & MASK16,
+                env->gpr[DMCU_FP] & MASK16, false, 0xffffu);
+        }
+        if (target == dmcu_code_address(0x31, 0x8abc)) {
+            uint16_t handle = internal_data_read(sp, 16);
+
+            env->clock_resource_release_mask_calls[slot]++;
+            if (env->clock_resource_release_mask_calls[slot] == 1u) {
+                uint16_t mask;
+                bool valid;
+
+                env->clock_resource_release_mask_caller[slot] = from & MASK24;
+                env->clock_resource_release_mask_handle[slot] = handle;
+                env->clock_resource_release_mask_bitmap_before[slot] =
+                    clock_resource_release_bitmap(handle, &mask, &valid);
+            }
+        } else if ((from & MASK24) == dmcu_code_address(0x31, 0x8b68) &&
+                   (target == dmcu_code_address(0x30, 0x8c0c) ||
+                    target == dmcu_code_address(0x30, 0x3b52))) {
+            uint16_t mask;
+            bool valid;
+
+            env->clock_resource_release_mask_returns[slot]++;
+            env->clock_resource_release_mask_return_target[slot] = target;
+            env->clock_resource_release_mask_bitmap_after[slot] =
+                clock_resource_release_bitmap(
+                    env->clock_resource_release_mask_handle[slot],
+                    &mask, &valid);
+        }
+    }
+
+    /* The exact 1A:DEAA compare family contains six computed near returns.
+     * Record the architectural target produced by each RET, plus a monotonic
+     * count of the specific 1A:0000 failure target.  This does not validate,
+     * replace, or redirect the return. */
+    {
+        static const uint32_t compare_ret_from[
+            DMCU_APPLICATION_COMPARE_RET_SITES] = {
+            0x1ae110u, 0x1ae30au, 0x1ae504u,
+            0x1ae560u, 0x1ae5bcu, 0x1ae61eu,
+        };
+        unsigned site;
+
+        for (site = 0;
+             word == 0xc600u && dmcu_code_segment(from) == 0x1au &&
+             site < DMCU_APPLICATION_COMPARE_RET_SITES; site++) {
+            if ((from & MASK24) != compare_ret_from[site]) {
+                continue;
+            }
+            env->application_compare_ret_count[site]++;
+            env->application_compare_ret_target[site] = target;
+            env->application_compare_ret_word[site] = word;
+            env->application_compare_ret_sp[site] = sp;
+            env->application_compare_ret_post_sp[site] =
+                env->gpr[DMCU_SP] & MASK16;
+            env->application_compare_ret_fp[site] = fp;
+            if (target == 0x1a0000u) {
+                env->application_compare_ret_zero_target_count++;
+                if (env->application_compare_ret_zero_target_count == 1u) {
+                    env->application_compare_ret_first_zero_from =
+                        from & MASK24;
+                    env->application_compare_ret_first_zero_target = target;
+                    env->application_compare_ret_first_zero_sp = sp;
+                    env->application_compare_ret_first_zero_post_sp =
+                        env->gpr[DMCU_SP] & MASK16;
+                    env->application_compare_ret_first_zero_fp = fp;
+                }
+            }
+            break;
+        }
+    }
+
+    /* The Game World completion path currently reaches the exact 2B:758E
+     * header parser but later returns through 2B:77B4 with a damaged far
+     * address.  Keep a small read-only entry/exit stack snapshot so the first
+     * corrupting caller can be identified without single-stepping millions
+     * of foreground-loop instructions. */
+    if (result_header_stack_logs < 16 &&
+        (target == 0x2b758eu || (from & MASK24) == 0x2b77b4u)) {
+        qemu_log_mask(
+            LOG_UNIMP,
+            "DMCU result header stack #%u %02x:%04x>%02x:%04x "
+            "word=%04x sp=%04x fp=%04x r=%04x:%04x "
+            "stack=%04x,%04x,%04x,%04x,%04x,%04x "
+            "frame=%04x,%04x,%04x,%04x\n",
+            ++result_header_stack_logs,
+            dmcu_code_segment(from), dmcu_code_pc(from),
+            dmcu_code_segment(target), dmcu_code_pc(target), word & MASK16,
+            sp & MASK16, fp & MASK16, env->gpr[0] & MASK16,
+            env->gpr[1] & MASK16,
+            internal_data_read((sp + 0u) & MASK16, 16),
+            internal_data_read((sp + 2u) & MASK16, 16),
+            internal_data_read((sp + 4u) & MASK16, 16),
+            internal_data_read((sp + 6u) & MASK16, 16),
+            internal_data_read((sp + 8u) & MASK16, 16),
+            internal_data_read((sp + 10u) & MASK16, 16),
+            internal_data_read((fp + 0u) & MASK16, 16),
+            internal_data_read((fp + 2u) & MASK16, 16),
+            internal_data_read((fp + 4u) & MASK16, 16),
+            internal_data_read((fp + 6u) & MASK16, 16));
+    }
+
+    /* Observe the exact event boundary inside the status-2 NPE controller.
+     * Live 1F:D5B2 passes caller locals FP-8 and FP-14 to the common
+     * 1E:F734 worker and resumes at 1F:D5B6.  A nonzero return owns one
+     * bounded follow-through across the source-proven comparison chain and
+     * initialization calls.  This observer reads registers/SRAM/globals only
+     * and never changes guest architectural state. */
+    if (env->npe_loader_event_watch_active && !env->in_interrupt) {
+        uint32_t loader_pc = from & MASK24;
+        uint32_t loader_target = target & MASK24;
+
+        if (loader_pc == dmcu_code_address(0x1f, 0xd5b2) &&
+            loader_target == dmcu_code_address(0x03, 0x4158)) {
+            env->npe_loader_event_calls++;
+            env->npe_loader_event_call_sp = sp;
+            env->npe_loader_event_call_fp = fp;
+        }
+        if (loader_pc == dmcu_code_address(0x1e, 0xfd7a) &&
+            loader_target == dmcu_code_address(0x1f, 0xd5b6)) {
+            uint16_t result = env->gpr[0] & MASK16;
+            bool key86 = env->npe_modal_control_trace_pending;
+
+            env->npe_loader_event_returns++;
+            env->npe_loader_event_return_sp = sp;
+            env->npe_loader_event_return_fp = fp;
+            env->npe_loader_event_last_result = result;
+            if (result != 0u) {
+                env->npe_loader_event_nonzero_returns++;
+            }
+            if (key86) {
+                env->npe_loader_event_key86_returns++;
+                env->npe_loader_event_follow_active = true;
+                env->npe_game_trace_armed = true;
+                env->npe_loader_event_result = result;
+                env->npe_loader_event_type = internal_data_read(
+                    (fp - 8u) & MASK16, 16);
+                env->npe_loader_event_code = internal_data_read(
+                    (fp - 0x14u) & MASK16, 16);
+                env->npe_loader_event_global_mode = address_space_lduw_le(
+                    &address_space_memory, 0x527934u,
+                    MEMTXATTRS_UNSPECIFIED, NULL);
+                env->npe_loader_event_global_flag = address_space_ldub(
+                    &address_space_memory, 0x527ac4u ^ 1u,
+                    MEMTXATTRS_UNSPECIFIED, NULL);
+                env->npe_loader_event_global_iteration = address_space_ldub(
+                    &address_space_memory, 0x527a32u ^ 1u,
+                    MEMTXATTRS_UNSPECIFIED, NULL);
+                env->npe_loader_event_global_selection =
+                    address_space_lduw_le(
+                        &address_space_memory, 0x527a76u,
+                        MEMTXATTRS_UNSPECIFIED, NULL);
+                env->npe_loader_event_error = address_space_lduw_le(
+                    &address_space_memory, 0x527a3cu,
+                    MEMTXATTRS_UNSPECIFIED, NULL);
+                env->npe_loader_event_file_error = address_space_lduw_le(
+                    &address_space_memory, 0x512ae0u,
+                    MEMTXATTRS_UNSPECIFIED, NULL);
+            }
+        }
+        if (env->npe_loader_event_follow_active) {
+            if (loader_pc == dmcu_code_address(0x1f, 0xd5ba) &&
+                loader_target == dmcu_code_address(0x1f, 0xd760)) {
+                env->npe_loader_event_result_zero_paths++;
+                env->npe_loader_event_follow_active = false;
+            } else if (loader_pc == dmcu_code_address(0x1f, 0xd5c4)) {
+                if (loader_target == dmcu_code_address(0x1f, 0xd5c8)) {
+                    env->npe_loader_event_type4_paths++;
+                } else if (loader_target ==
+                           dmcu_code_address(0x1f, 0xd742)) {
+                    env->npe_loader_event_other_type_paths++;
+                }
+            } else if (loader_pc == dmcu_code_address(0x1f, 0xd5d2)) {
+                if (loader_target == dmcu_code_address(0x1f, 0xd5d6)) {
+                    env->npe_loader_event_mode1_paths++;
+                } else if (loader_target ==
+                           dmcu_code_address(0x1f, 0xd71e)) {
+                    env->npe_loader_event_other_mode_paths++;
+                }
+            } else if (loader_pc == dmcu_code_address(0x1f, 0xd5e0)) {
+                if (loader_target == dmcu_code_address(0x1f, 0xd5e4)) {
+                    env->npe_loader_event_flag_zero_paths++;
+                } else if (loader_target ==
+                           dmcu_code_address(0x1f, 0xd71e)) {
+                    env->npe_loader_event_flag_nonzero_paths++;
+                }
+            } else if (loader_pc == dmcu_code_address(0x1f, 0xd5e4) &&
+                       loader_target == dmcu_code_address(0x1d, 0x5820)) {
+                env->npe_loader_event_prepare_calls++;
+            } else if (loader_pc == dmcu_code_address(0x1f, 0xd5e8) &&
+                       loader_target == dmcu_code_address(0x25, 0x8392)) {
+                env->npe_loader_event_initialize_calls++;
+            } else if (loader_target ==
+                       dmcu_code_address(0x1f, 0xd5ec)) {
+                env->npe_loader_event_initialize_returns++;
+            } else if (loader_pc == dmcu_code_address(0x1f, 0xd71e)) {
+                env->npe_loader_event_progress_paths++;
+            } else if (loader_pc == dmcu_code_address(0x1f, 0xd760) &&
+                       loader_target == dmcu_code_address(0x2d, 0xf47c)) {
+                env->npe_loader_event_service_calls++;
+                env->npe_loader_event_follow_active = false;
+            }
+        }
+        if (loader_pc == dmcu_code_address(0x1f, 0xd772) &&
+            word == 0xc620u) {
+            env->npe_loader_event_controller_returns++;
+            env->npe_loader_event_watch_active = false;
+            env->npe_loader_event_follow_active = false;
+        }
+    }
+
+    /* Follow the exact mode-2 loader and, after the accepted 0x86 event, the
+     * operation-seven UI plus first mode-one update/draw closure.  Arming at
+     * 2F:B726 retains loader-time stream access; every checkpoint remains
+     * observer-only and never redirects control or changes guest state. */
+    if (env->npe_game_trace_armed && !env->in_interrupt) {
+        static const uint16_t frame_clear_child_call_pc[8] = {
+            0x5c78, 0x5c92, 0x5d4a, 0x5d84,
+            0x5db6, 0x5e58, 0x5eb4, 0x5ec4,
+        };
+        static const uint16_t frame_clear_child_continuation_pc[8] = {
+            0x5c7c, 0x5c96, 0x5d4e, 0x5d88,
+            0x5dba, 0x5e5c, 0x5eb8, 0x5ec8,
+        };
+        uint32_t game_pc = from & MASK24;
+        uint32_t game_target = target & MASK24;
+        uint32_t lifecycle_sequence;
+        unsigned frame_clear_child;
+
+        /* The exact operation-transition closure ends in relocated leaf
+         * 25:0000.  Retain its six incoming words, the two data globals used
+         * by its format split, and the actually selected child.  This is a
+         * bounded read-only observer: it neither redirects the still-missing
+         * child nor supplies a synthetic result. */
+        if (game_target == dmcu_code_address(0x25, 0x0000)) {
+            uint32_t sequence = env->npe_transition_leaf_calls++;
+            uint32_t slot = sequence % DMCU_NPE_TRANSITION_LEAF_SLOTS;
+            unsigned argument;
+
+            env->npe_transition_leaf_from[slot] = game_pc;
+            env->npe_transition_leaf_sp[slot] =
+                env->gpr[DMCU_SP] & MASK16;
+            env->npe_transition_leaf_state[slot] = address_space_lduw_le(
+                &address_space_memory, 0x512828u,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            env->npe_transition_leaf_format[slot] = address_space_lduw_le(
+                &address_space_memory, 0x51282au,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            for (argument = 0; argument < 6; argument++) {
+                env->npe_transition_leaf_args[slot][argument] =
+                    rom_argument(env, argument) & MASK16;
+            }
+            env->npe_transition_leaf_branch[slot] = 0;
+            env->npe_transition_leaf_result[slot] = 0;
+        } else if (game_pc == dmcu_code_address(0x25, 0x0394) &&
+                   game_target == dmcu_code_address(0x10, 0xfc0e)) {
+            env->npe_transition_leaf_low_dispatch_calls++;
+            if (env->npe_transition_leaf_calls) {
+                uint32_t slot = (env->npe_transition_leaf_calls - 1u) %
+                                DMCU_NPE_TRANSITION_LEAF_SLOTS;
+                env->npe_transition_leaf_branch[slot] = 1;
+            }
+        } else if (game_pc == dmcu_code_address(0x25, 0x03d6) &&
+                   game_target == dmcu_code_address(0x25, 0xdf62)) {
+            env->npe_transition_leaf_high_dispatch_calls++;
+            if (env->npe_transition_leaf_calls) {
+                uint32_t slot = (env->npe_transition_leaf_calls - 1u) %
+                                DMCU_NPE_TRANSITION_LEAF_SLOTS;
+                env->npe_transition_leaf_branch[slot] = 2;
+            }
+        } else if (game_pc == dmcu_code_address(0x25, 0x0410)) {
+            env->npe_transition_leaf_returns++;
+            if (env->npe_transition_leaf_calls) {
+                uint32_t slot = (env->npe_transition_leaf_calls - 1u) %
+                                DMCU_NPE_TRANSITION_LEAF_SLOTS;
+                env->npe_transition_leaf_result[slot] =
+                    env->gpr[0] & MASK16;
+            }
+        }
+
+        /* A compact closure monitor for the exact 46:5C22 -> 29:5C22
+         * relocation.  It only observes call edges and arrivals at the
+         * eight static continuations; it never changes guest state. */
+        for (frame_clear_child = 0; frame_clear_child < 8;
+             frame_clear_child++) {
+            if (game_pc == dmcu_code_address(
+                    0x29, frame_clear_child_call_pc[frame_clear_child])) {
+                if (env->npe_game_frame_clear_child_calls[
+                        frame_clear_child]++ == 0u) {
+                    env->npe_game_frame_clear_child_targets[
+                        frame_clear_child] = game_target;
+                }
+            }
+            if (game_target == dmcu_code_address(
+                    0x29,
+                    frame_clear_child_continuation_pc[frame_clear_child])) {
+                if (env->npe_game_frame_clear_child_continuations[
+                        frame_clear_child]++ == 0u) {
+                    env->npe_game_frame_clear_child_continuation_from[
+                        frame_clear_child] = game_pc;
+                }
+            }
+        }
+
+        /* Give every selected publication/UI edge one shared sequence.  The
+         * resulting order distinguishes late publication from stale code
+         * translation without altering registers, memory, or control flow. */
+        if (game_pc == dmcu_code_address(0x1d, 0x8a5c) &&
+            game_target == dmcu_code_address(0x06, 0x6b80)) {
+            lifecycle_sequence = ++env->npe_game_ui_lifecycle_sequence;
+            if (env->npe_game_ui_wrapper_8a5c_calls++ == 0u) {
+                env->npe_game_ui_wrapper_8a5c_sequence = lifecycle_sequence;
+            }
+        } else if (game_pc == dmcu_code_address(0x1d, 0x9140) &&
+                   game_target == dmcu_code_address(0x06, 0x6b80)) {
+            lifecycle_sequence = ++env->npe_game_ui_lifecycle_sequence;
+            if (env->npe_game_ui_wrapper_9140_calls++ == 0u) {
+                env->npe_game_ui_wrapper_9140_sequence = lifecycle_sequence;
+            }
+        } else if (game_pc == dmcu_code_address(0x06, 0x6fb2) &&
+                   game_target == dmcu_code_address(0x1a, 0x7600)) {
+            lifecycle_sequence = ++env->npe_game_ui_lifecycle_sequence;
+            if (env->npe_game_ui_publisher_calls++ == 0u) {
+                env->npe_game_ui_publisher_call_sequence = lifecycle_sequence;
+            }
+        } else if (game_pc == dmcu_code_address(0x1a, 0x78ec) &&
+                   game_target == dmcu_code_address(0x06, 0x6fb6)) {
+            lifecycle_sequence = ++env->npe_game_ui_lifecycle_sequence;
+            if (env->npe_game_ui_publisher_returns++ == 0u) {
+                env->npe_game_ui_publisher_return_sequence = lifecycle_sequence;
+            }
+        } else if (game_pc == dmcu_code_address(0x06, 0x6fee) &&
+                   game_target == dmcu_code_address(0x2b, 0x0da2)) {
+            lifecycle_sequence = ++env->npe_game_ui_lifecycle_sequence;
+            if (env->npe_game_ui_wrapper_tail_calls++ == 0u) {
+                env->npe_game_ui_wrapper_tail_sequence = lifecycle_sequence;
+            }
+        } else if (game_pc == dmcu_code_address(0x29, 0xd2d8) &&
+                   game_target == dmcu_code_address(0x2f, 0xe15a)) {
+            lifecycle_sequence = ++env->npe_game_ui_lifecycle_sequence;
+            if (env->npe_game_ui_e15a_calls++ == 0u) {
+                env->npe_game_ui_e15a_call_sequence = lifecycle_sequence;
+            }
+        } else if (game_pc == dmcu_code_address(0x2f, 0xe27e) &&
+                   game_target == dmcu_code_address(0x29, 0xd2dc)) {
+            lifecycle_sequence = ++env->npe_game_ui_lifecycle_sequence;
+            if (env->npe_game_ui_e15a_returns++ == 0u) {
+                env->npe_game_ui_e15a_return_sequence = lifecycle_sequence;
+            }
+        } else if (game_pc == dmcu_code_address(0x29, 0xd2f4) &&
+                   game_target == dmcu_code_address(0x2f, 0x6ab8)) {
+            lifecycle_sequence = ++env->npe_game_ui_lifecycle_sequence;
+            if (env->npe_game_ui_6ab8_calls++ == 0u) {
+                env->npe_game_ui_6ab8_call_sequence = lifecycle_sequence;
+            }
+        } else if (game_pc == dmcu_code_address(0x2f, 0x6bf8) &&
+                   game_target == dmcu_code_address(0x29, 0xd2f8)) {
+            lifecycle_sequence = ++env->npe_game_ui_lifecycle_sequence;
+            if (env->npe_game_ui_6ab8_returns++ == 0u) {
+                env->npe_game_ui_6ab8_return_sequence = lifecycle_sequence;
+            }
+        } else if (game_pc == dmcu_code_address(0x2f, 0x6ac2) &&
+                   game_target == dmcu_code_address(0x29, 0x5c22)) {
+            lifecycle_sequence = ++env->npe_game_ui_lifecycle_sequence;
+            if (env->npe_game_ui_5c22_calls++ == 0u) {
+                env->npe_game_ui_5c22_call_sequence = lifecycle_sequence;
+            }
+        } else if (game_pc == dmcu_code_address(0x29, 0x5edc) &&
+                   game_target == dmcu_code_address(0x2f, 0x6ac6)) {
+            lifecycle_sequence = ++env->npe_game_ui_lifecycle_sequence;
+            if (env->npe_game_ui_5c22_returns++ == 0u) {
+                env->npe_game_ui_5c22_return_sequence = lifecycle_sequence;
+            }
+        }
+
+        if (game_target == dmcu_code_address(0x29, 0xd2dc)) {
+            lifecycle_sequence = ++env->npe_game_ui_lifecycle_sequence;
+            if (env->npe_game_ui_e15a_continuation_entries++ == 0u) {
+                env->npe_game_ui_e15a_continuation_sequence =
+                    lifecycle_sequence;
+                env->npe_game_ui_e15a_continuation_from = game_pc;
+            }
+        }
+        if (game_target == dmcu_code_address(0x29, 0xd2f8)) {
+            lifecycle_sequence = ++env->npe_game_ui_lifecycle_sequence;
+            if (env->npe_game_ui_6ab8_continuation_entries++ == 0u) {
+                env->npe_game_ui_6ab8_continuation_sequence =
+                    lifecycle_sequence;
+                env->npe_game_ui_6ab8_continuation_from = game_pc;
+            }
+        }
+        if (game_target == dmcu_code_address(0x2f, 0x6ac6)) {
+            lifecycle_sequence = ++env->npe_game_ui_lifecycle_sequence;
+            if (env->npe_game_ui_5c22_continuation_entries++ == 0u) {
+                env->npe_game_ui_5c22_continuation_sequence =
+                    lifecycle_sequence;
+                env->npe_game_ui_5c22_continuation_from = game_pc;
+            }
+        }
+
+        if (game_pc == dmcu_code_address(0x31, 0xa480) &&
+            game_target == dmcu_code_address(0x03, 0x438c)) {
+            env->npe_game_transition_service_calls++;
+        } else if (game_pc == dmcu_code_address(0x03, 0x438c) &&
+                   game_target == dmcu_code_address(0x32, 0x5f86)) {
+            uint32_t sequence = env->npe_transition_gate_entries++;
+            uint32_t slot = sequence % DMCU_NPE_TRANSITION_GATE_SLOTS;
+            unsigned argument;
+            unsigned context_word;
+
+            env->npe_game_transition_service_entries++;
+            env->npe_transition_gate_entry_from[slot] = game_pc;
+            env->npe_transition_gate_entry_sp[slot] =
+                env->gpr[DMCU_SP] & MASK16;
+            env->npe_transition_gate_entry_fp[slot] =
+                env->gpr[DMCU_FP] & MASK16;
+            env->npe_transition_gate_entry_value[slot] =
+                address_space_lduw_le(
+                    &address_space_memory, 0x50b87au,
+                    MEMTXATTRS_UNSPECIFIED, NULL);
+            /* 31:A3F4 reads A4:7A04 as a byte.  Even byte addresses use the
+             * high bus lane, hence the physical xor-one below. */
+            env->npe_transition_gate_entry_operation[slot] =
+                address_space_ldub(
+                    &address_space_memory, 0x527a04u ^ 1u,
+                    MEMTXATTRS_UNSPECIFIED, NULL);
+            for (argument = 0; argument < 6; argument++) {
+                env->npe_transition_gate_entry_args[slot][argument] =
+                    rom_argument(env, argument) & MASK16;
+            }
+            for (context_word = 0; context_word < 8; context_word++) {
+                env->npe_transition_gate_entry_context[slot][context_word] =
+                    address_space_lduw_le(
+                        &address_space_memory,
+                        0x50b874u + context_word * 2u,
+                        MEMTXATTRS_UNSPECIFIED, NULL);
+            }
+        } else if (game_pc == dmcu_code_address(0x32, 0x5ff2) &&
+                   game_target == dmcu_code_address(0x31, 0xa484)) {
+            env->npe_game_transition_service_returns++;
+        }
+        if (game_target == dmcu_code_address(0x31, 0xa484)) {
+            if (env->npe_game_transition_service_continuations++ == 0u) {
+                env->npe_game_transition_service_continuation_from = game_pc;
+            }
+        }
+        if (game_pc == dmcu_code_address(0x32, 0x5fe6) &&
+            game_target == dmcu_code_address(0x32, 0xb974)) {
+            env->npe_game_transition_service_child_calls++;
+        } else if (game_pc == dmcu_code_address(0x32, 0xb9c4) &&
+                   game_target == dmcu_code_address(0x32, 0x5fea)) {
+            env->npe_game_transition_service_child_returns++;
+        } else if (game_pc == dmcu_code_address(0x32, 0xb9b8) &&
+                   game_target == dmcu_code_address(0x25, 0x0000)) {
+            env->npe_game_transition_service_leaf_calls++;
+        } else if (game_pc == dmcu_code_address(0x25, 0x0410) &&
+                   game_target == dmcu_code_address(0x32, 0xb9bc)) {
+            env->npe_game_transition_service_leaf_returns++;
+        }
+
+        if (game_pc == dmcu_code_address(0x2d, 0x2dc0) &&
+            game_target == dmcu_code_address(0x00, 0x1002)) {
+            env->npe_game_callback_entries++;
+            env->npe_game_callback_state = address_space_ldub(
+                &address_space_memory, 0x527a3eu ^ 1u,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+        } else if (game_pc == dmcu_code_address(0x00, 0x100c)) {
+            if (game_target == dmcu_code_address(0x00, 0x56fa)) {
+                env->npe_game_callback_state_zero_paths++;
+            } else if (game_target == dmcu_code_address(0x00, 0x1010)) {
+                env->npe_game_callback_state_one_paths++;
+            } else {
+                env->npe_game_callback_state_other_paths++;
+            }
+        }
+
+        /* Operation one is the post-0x86 transition selected by the exact
+         * 2D:F47C table.  Distinguish its source-proven normal controller
+         * body from the 7AB4/7A50-gated tail exit through 31:A3F4. */
+        if (game_pc == dmcu_code_address(0x2d, 0xf4c8) &&
+            game_target == dmcu_code_address(0x2d, 0xf4fa)) {
+            env->npe_game_operation_one_dispatches++;
+        }
+        if (game_pc == dmcu_code_address(0x2d, 0xf4fa) &&
+            game_target == dmcu_code_address(0x1a, 0x1312)) {
+            env->npe_game_operation_one_entries++;
+        } else if (game_pc == dmcu_code_address(0x1a, 0x1340) &&
+                   game_target == dmcu_code_address(0x31, 0xa3f4)) {
+            env->npe_game_operation_one_fast_exits++;
+        } else if (game_pc == dmcu_code_address(0x31, 0xa742) &&
+                   game_target == dmcu_code_address(0x2d, 0xf4fe)) {
+            env->npe_game_operation_one_fast_returns++;
+        } else if ((game_pc == dmcu_code_address(0x1a, 0x132e) &&
+                    game_target == dmcu_code_address(0x1a, 0x136e)) ||
+                   (game_pc == dmcu_code_address(0x1a, 0x133c) &&
+                    game_target == dmcu_code_address(0x1a, 0x1344))) {
+            env->npe_game_operation_one_normal_paths++;
+        } else if (game_pc == dmcu_code_address(0x1a, 0x1366) &&
+                   game_target == dmcu_code_address(0x2f, 0x6ab8)) {
+            env->npe_game_operation_one_frame_init_calls++;
+        } else if (game_pc == dmcu_code_address(0x1a, 0x1c90) &&
+                   game_target == dmcu_code_address(0x2d, 0xf4fe)) {
+            env->npe_game_operation_one_normal_returns++;
+        }
+
+        /* Event 0x86 has two source-exact controller paths.  State 7AC4==0
+         * calls the 29:CE22 selector at 1A:141E; later states take the
+         * 1A:19C4 comparison branch to 1A:19DC.  These counters are strictly
+         * observer-only and distinguish game action from menu confirmation. */
+        if (game_pc == dmcu_code_address(0x1a, 0x141e) &&
+            game_target == dmcu_code_address(0x29, 0xce22)) {
+            env->npe_game_primary_action_selector_calls++;
+        } else if (game_target == dmcu_code_address(0x1a, 0x1422)) {
+            env->npe_game_primary_action_selector_returns++;
+            env->npe_game_primary_action_selector_result =
+                env->gpr[0] & MASK16;
+        } else if (game_pc == dmcu_code_address(0x1a, 0x148c)) {
+            env->npe_game_primary_action_object_guard_checks++;
+            env->npe_game_primary_action_object_guard_value =
+                env->gpr[0] & 0xffu;
+            if (game_target == dmcu_code_address(0x1a, 0x1c7e)) {
+                env->npe_game_primary_action_object_guard_rejects++;
+            } else if (game_target == dmcu_code_address(0x1a, 0x1490)) {
+                env->npe_game_primary_action_object_guard_passes++;
+            }
+        } else if (game_pc == dmcu_code_address(0x1a, 0x14fc) &&
+                   game_target == dmcu_code_address(0x25, 0x3082)) {
+            uint16_t object_index =
+                env->npe_game_primary_action_selector_result;
+
+            env->npe_game_primary_action_object_commits++;
+            if (object_index < 8u) {
+                env->npe_game_primary_action_object_commit_flag =
+                    address_space_ldub(
+                        &address_space_memory,
+                        (0x52742cu + object_index) ^ 1u,
+                        MEMTXATTRS_UNSPECIFIED, NULL);
+            }
+        } else if ((game_pc == dmcu_code_address(0x1a, 0x19c8) ||
+                    game_pc == dmcu_code_address(0x1a, 0x19d0) ||
+                    game_pc == dmcu_code_address(0x1a, 0x19d8)) &&
+                   game_target == dmcu_code_address(0x1a, 0x19dc)) {
+            env->npe_game_primary_action_late_paths++;
+        }
+
+        /* Primary direction events reach four source-exact branches in the
+         * relocated NewJourney controller.  Keeping separate observer-only
+         * counters lets a host probe distinguish a matrix edge accepted by
+         * generic dispatch from one actually consumed by the running game. */
+        if (game_pc == dmcu_code_address(0x1a, 0x16a6) &&
+            game_target == dmcu_code_address(0x1a, 0x16ba)) {
+            env->npe_game_direction_up_paths++;
+        } else if (game_pc == dmcu_code_address(0x1a, 0x16d6) &&
+                   game_target == dmcu_code_address(0x1a, 0x16ea)) {
+            env->npe_game_direction_down_paths++;
+        } else if (game_pc == dmcu_code_address(0x1a, 0x1706) &&
+                   game_target == dmcu_code_address(0x1a, 0x171a)) {
+            env->npe_game_direction_left_paths++;
+        } else if (game_pc == dmcu_code_address(0x1a, 0x1736) &&
+                   game_target == dmcu_code_address(0x1a, 0x174a)) {
+            env->npe_game_direction_right_paths++;
+        }
+
+        /* Record the complete source-exact movement helper transaction.  The
+         * branch counters above only prove that the event was decoded; a wall
+         * or obstacle may still leave the viewport coordinates unchanged.
+         * These values are observations of the original globals and R0. */
+        if (game_pc == dmcu_code_address(0x1a, 0x1762) &&
+            game_target == dmcu_code_address(0x1e, 0x1452)) {
+            env->npe_game_direction_helper_active = true;
+            env->npe_game_direction_helper_calls++;
+            env->npe_game_direction_code = address_space_ldub(
+                &address_space_memory, 0x5269d4u ^ 1u,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            env->npe_game_direction_before_x = address_space_ldub(
+                &address_space_memory, 0x5269d5u ^ 1u,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            env->npe_game_direction_before_y = address_space_ldub(
+                &address_space_memory, 0x5269d6u ^ 1u,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            env->npe_game_direction_before_offset_x = address_space_ldub(
+                &address_space_memory, 0x527a2eu ^ 1u,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            env->npe_game_direction_before_offset_y = address_space_ldub(
+                &address_space_memory, 0x527a2cu ^ 1u,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            env->npe_game_direction_before_map_index = address_space_lduw_le(
+                &address_space_memory, 0x527a58u,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            env->npe_game_direction_before_scroll = address_space_lduw_le(
+                &address_space_memory, 0x527a84u,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+        } else if (env->npe_game_direction_helper_active &&
+                   game_target == dmcu_code_address(0x1a, 0x1766)) {
+            env->npe_game_direction_helper_returns++;
+            /* 1E:1452 restores caller R0 (0x0FA0) before RETS; the movement
+             * outcome consumed at 1A:176A is the guest global 52:7A86. */
+            env->npe_game_direction_helper_result = address_space_lduw_le(
+                &address_space_memory, 0x527a86u,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            env->npe_game_direction_after_x = address_space_ldub(
+                &address_space_memory, 0x5269d5u ^ 1u,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            env->npe_game_direction_after_y = address_space_ldub(
+                &address_space_memory, 0x5269d6u ^ 1u,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            env->npe_game_direction_after_offset_x = address_space_ldub(
+                &address_space_memory, 0x527a2eu ^ 1u,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            env->npe_game_direction_after_offset_y = address_space_ldub(
+                &address_space_memory, 0x527a2cu ^ 1u,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            env->npe_game_direction_after_map_index = address_space_lduw_le(
+                &address_space_memory, 0x527a58u,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            env->npe_game_direction_after_scroll = address_space_lduw_le(
+                &address_space_memory, 0x527a84u,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            env->npe_game_direction_helper_active = false;
+        }
+
+        /* The movement redraw path passes its object in R4:R5 and also on the
+         * caller stack to the exact resident 1D:831E renderer.  At 1D:87AA
+         * that renderer performs a computed far call from object+0x1E.  Keep
+         * both snapshots so a bad incoming object can be distinguished from
+         * corruption inside the renderer without changing guest state. */
+        if (game_pc == dmcu_code_address(0x2e, 0x266c) &&
+            game_target == dmcu_code_address(0x1d, 0x831e)) {
+            env->npe_game_render_active = true;
+            env->npe_game_render_calls++;
+            env->npe_game_render_entry_sp = sp;
+            env->npe_game_render_entry_fp = fp;
+            env->npe_game_render_object_hi = env->gpr[4] & MASK16;
+            env->npe_game_render_object_lo = env->gpr[5] & MASK16;
+            env->npe_game_render_stack_object_hi =
+                internal_data_read(sp, 16);
+            env->npe_game_render_stack_object_lo =
+                internal_data_read((sp + 2u) & MASK16, 16);
+            env->npe_game_render_object_valid =
+                snapshot_npe_game_render_object(
+                    env->npe_game_render_object_hi,
+                    env->npe_game_render_object_lo,
+                    env->npe_game_render_entry_words);
+        } else if (env->npe_game_render_active &&
+                   game_pc == dmcu_code_address(0x1d, 0x87aa) &&
+                   word == 0xc620u) {
+            env->npe_game_render_callback_dispatches++;
+            env->npe_game_render_callback_sp = sp;
+            env->npe_game_render_callback_fp = fp;
+            env->npe_game_render_callback_r0 = env->gpr[0] & MASK16;
+            env->npe_game_render_callback_r1 = env->gpr[1] & MASK16;
+            env->npe_game_render_callback_target_segment =
+                dmcu_code_segment(game_target);
+            env->npe_game_render_callback_target_pc =
+                dmcu_code_pc(game_target);
+            env->npe_game_render_callback_object_hi =
+                internal_data_read((fp + 6u) & MASK16, 16);
+            env->npe_game_render_callback_object_lo =
+                internal_data_read((fp + 8u) & MASK16, 16);
+            env->npe_game_render_callback_object_valid =
+                snapshot_npe_game_render_object(
+                    env->npe_game_render_callback_object_hi,
+                    env->npe_game_render_callback_object_lo,
+                    env->npe_game_render_callback_words);
+        } else if (env->npe_game_render_active &&
+                   game_target == dmcu_code_address(0x2e, 0x2670) &&
+                   dmcu_code_segment(game_pc) == 0x1du) {
+            env->npe_game_render_active = false;
+        }
+
+        /* 29:D284 calls the exact relocated 0C:BDBE NPE table loader.  Its
+         * argument is the source pointer established from 52:79D6/79D8.
+         * Keep a bounded ring of every taken control edge while the loader
+         * owns the stack.  This includes nested resident services and is
+         * observer-only, so a long-running child can be identified without
+         * changing guest timing, registers, memory, or control flow. */
+        if (game_pc == dmcu_code_address(0x29, 0xd284) &&
+            game_target == dmcu_code_address(0x0c, 0xbdbe)) {
+            env->npe_game_table_loader_active = true;
+            env->npe_game_table_loader_calls++;
+            env->npe_game_table_loader_argument =
+                ((uint32_t)internal_data_read(sp, 16) << 16) |
+                internal_data_read((sp + 2u) & MASK16, 16);
+            env->npe_game_table_loader_entry_sp = sp;
+            env->npe_game_table_loader_entry_fp = fp;
+        }
+        if (env->npe_game_table_loader_active) {
+            env->npe_game_table_loader_last_pc = game_pc;
+            env->npe_game_table_loader_last_target = game_target;
+            env->npe_game_table_loader_last_word = word;
+            env->npe_game_table_loader_last_sp = sp;
+            env->npe_game_table_loader_last_fp = fp;
+            if (game_target != (sequential & MASK24)) {
+                uint32_t sequence = env->npe_game_table_loader_edge_count++;
+                uint32_t slot = sequence %
+                    DMCU_NPE_GAME_LOADER_EDGE_SLOTS;
+
+                env->npe_game_table_loader_edge_from[slot] = game_pc;
+                env->npe_game_table_loader_edge_to[slot] = game_target;
+                env->npe_game_table_loader_edge_word[slot] = word;
+                env->npe_game_table_loader_edge_sp[slot] = sp;
+                env->npe_game_table_loader_edge_fp[slot] = fp;
+            }
+        }
+        if (game_pc == dmcu_code_address(0x0c, 0xf256) &&
+            game_target == dmcu_code_address(0x29, 0xd288)) {
+            env->npe_game_table_loader_active = false;
+            env->npe_game_table_loader_returns++;
+            env->npe_game_table_loader_return_r0 = env->gpr[0] & MASK16;
+            env->npe_game_table_loader_return_r1 = env->gpr[1] & MASK16;
+        }
+
+        /* Source-exact 03:401C is a five-word stream seek wrapper.  Its
+         * installed 30:C8C0..C99C implementation accepts stream, signed
+         * 32-bit offset and whence (0 absolute, 1 current, 2 end).  Observe
+         * every game-lifetime call, not only the cold table loader, so the
+         * seek which first selects a high NPE section can be separated from
+         * the following 03:4010 read without changing guest stream state. */
+        if (game_target == dmcu_code_address(0x03, 0x401c)) {
+            unsigned i;
+            uint32_t sequence = env->npe_game_table_resolver_calls++;
+            uint32_t slot = sequence %
+                            DMCU_NPE_GAME_STREAM_RESOLVE_SLOTS;
+            uint32_t stream;
+            uint32_t offset;
+
+            env->npe_game_table_resolver_active = true;
+            env->npe_game_table_resolver_current_slot = slot;
+            env->npe_game_table_resolver_from = game_pc;
+            env->npe_game_table_resolver_expected_return =
+                dmcu_code_address(dmcu_code_segment(game_pc),
+                                  (dmcu_code_pc(game_pc) + 4u) & MASK16);
+            for (i = 0; i < ARRAY_SIZE(env->npe_game_table_resolver_args);
+                 i++) {
+                env->npe_game_table_resolver_args[i] =
+                    internal_data_read((sp + i * 2u) & MASK16, 16);
+            }
+            stream = ((uint32_t)env->npe_game_table_resolver_args[0] << 16) |
+                     env->npe_game_table_resolver_args[1];
+            offset = ((uint32_t)env->npe_game_table_resolver_args[2] << 16) |
+                     env->npe_game_table_resolver_args[3];
+            env->npe_game_table_resolver_from_trace[slot] = game_pc;
+            env->npe_game_table_resolver_stream_trace[slot] =
+                stream & MASK24;
+            env->npe_game_table_resolver_offset_trace[slot] = offset;
+            env->npe_game_table_resolver_whence_trace[slot] =
+                env->npe_game_table_resolver_args[4];
+            env->npe_game_table_resolver_position_before_trace[slot] =
+                npe_stream_position(stream & MASK24);
+            env->npe_game_table_resolver_position_after_trace[slot] =
+                env->npe_game_table_resolver_position_before_trace[slot];
+            env->npe_game_table_resolver_result_r0_trace[slot] = 0;
+            env->npe_game_table_resolver_result_r1_trace[slot] = 0;
+            env->npe_game_table_resolver_error_trace[slot] = 0;
+        } else if (env->npe_game_table_resolver_active &&
+                   game_pc == dmcu_code_address(0x30, 0xc99c) &&
+                   game_target ==
+                       env->npe_game_table_resolver_expected_return) {
+            uint32_t slot = env->npe_game_table_resolver_current_slot;
+            uint32_t stream =
+                env->npe_game_table_resolver_stream_trace[slot];
+
+            env->npe_game_table_resolver_active = false;
+            env->npe_game_table_resolver_returns++;
+            env->npe_game_table_resolver_result_r0 = env->gpr[0] & MASK16;
+            env->npe_game_table_resolver_result_r1 = env->gpr[1] & MASK16;
+            env->npe_game_table_resolver_error = address_space_lduw_le(
+                &address_space_memory, 0x512ae0u,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            env->npe_game_table_resolver_position_after_trace[slot] =
+                npe_stream_position(stream & MASK24);
+            env->npe_game_table_resolver_result_r0_trace[slot] =
+                env->npe_game_table_resolver_result_r0;
+            env->npe_game_table_resolver_result_r1_trace[slot] =
+                env->npe_game_table_resolver_result_r1;
+            env->npe_game_table_resolver_error_trace[slot] =
+                env->npe_game_table_resolver_error;
+        }
+
+        /* All 275 source-proven 03:4010 call sites use five stack words:
+         * stream, destination, and byte length.  The installed jump-table
+         * target is the exact 33:048A wrapper, which calls 1C:CCD4 and
+         * returns at 33:04BE.  The outer npe_game_trace_armed guard limits
+         * this inventory to the native NPE lifetime; retain every call so
+         * later map events and media/resource readers can be compared with
+         * the 0C:BDBE cold-loader baseline. */
+        if (game_target == dmcu_code_address(0x03, 0x4010)) {
+            uint32_t stream =
+                ((uint32_t)internal_data_read(sp, 16) << 16) |
+                internal_data_read((sp + 2u) & MASK16, 16);
+            uint32_t destination =
+                ((uint32_t)internal_data_read((sp + 4u) & MASK16, 16)
+                 << 16) |
+                internal_data_read((sp + 6u) & MASK16, 16);
+            uint16_t length = internal_data_read(
+                (sp + 8u) & MASK16, 16);
+            uint32_t sequence = env->npe_game_table_io_calls++;
+            uint32_t slot = sequence % DMCU_NPE_GAME_TABLE_IO_SLOTS;
+            uint32_t position = npe_stream_position(stream & MASK24);
+            uint64_t range_end = MIN((uint64_t)position + length,
+                                     (uint64_t)1u << 24);
+            uint32_t first_page = position >>
+                                  DMCU_NPE_GAME_STREAM_PAGE_SHIFT;
+            uint32_t last_page = length && range_end > position ?
+                (uint32_t)((range_end - 1u) >>
+                           DMCU_NPE_GAME_STREAM_PAGE_SHIFT) : first_page;
+            uint32_t page;
+            uint32_t section13_start =
+                ((uint32_t)address_space_lduw_le(
+                    &address_space_memory, 0x5279f6u,
+                    MEMTXATTRS_UNSPECIFIED, NULL) << 16) |
+                address_space_lduw_le(
+                    &address_space_memory, 0x5279f8u,
+                    MEMTXATTRS_UNSPECIFIED, NULL);
+
+            if (destination >= 0x526ca2u && destination < 0x526dbau) {
+                env->npe_game_table_io_table_calls++;
+            }
+
+            env->npe_game_table_io_active = true;
+            env->npe_game_table_io_current_slot = slot;
+            env->npe_game_table_io_write_base =
+                env->npe_game_table_writes;
+            env->npe_game_table_io_from[slot] = game_pc;
+            env->npe_game_table_io_stream[slot] = stream & MASK24;
+            env->npe_game_table_io_destination[slot] =
+                destination & MASK24;
+            env->npe_game_table_io_position_before[slot] = position;
+            env->npe_game_table_io_position_after[slot] = position;
+            env->npe_game_table_io_length[slot] = length;
+            env->npe_game_table_io_method[slot] = 0;
+            env->npe_game_table_io_result_r0[slot] = 0;
+            env->npe_game_table_io_result_r1[slot] = 0;
+            env->npe_game_table_io_error[slot] = 0;
+            env->npe_game_table_io_writes[slot] = 0;
+            env->npe_game_high_stream_io_active = false;
+            if (section13_start && position >= section13_start) {
+                uint32_t high_sequence =
+                    env->npe_game_high_stream_io_calls++;
+                uint32_t high_slot = high_sequence %
+                    DMCU_NPE_GAME_HIGH_STREAM_IO_SLOTS;
+
+                env->npe_game_high_stream_io_active = true;
+                env->npe_game_high_stream_io_current_slot = high_slot;
+                env->npe_game_high_stream_io_from[high_slot] = game_pc;
+                env->npe_game_high_stream_io_destination[high_slot] =
+                    destination & MASK24;
+                env->npe_game_high_stream_io_position_before[high_slot] =
+                    position;
+                env->npe_game_high_stream_io_position_after[high_slot] =
+                    position;
+                env->npe_game_high_stream_io_length[high_slot] = length;
+                env->npe_game_high_stream_io_result_r0[high_slot] = 0;
+                env->npe_game_high_stream_io_result_r1[high_slot] = 0;
+                env->npe_game_high_stream_io_error[high_slot] = 0;
+            }
+            env->npe_game_stream_requested_bytes += length;
+            if (position < env->npe_game_stream_position_min) {
+                env->npe_game_stream_position_min = position;
+            }
+            if (range_end > env->npe_game_stream_position_max) {
+                env->npe_game_stream_position_max = range_end;
+            }
+            if (length && first_page < DMCU_NPE_GAME_STREAM_PAGE_COUNT) {
+                last_page = MIN(last_page,
+                    (uint32_t)DMCU_NPE_GAME_STREAM_PAGE_COUNT - 1u);
+                for (page = first_page; page <= last_page; page++) {
+                    if (env->npe_game_stream_page_calls[page]++ == 0u) {
+                        env->npe_game_stream_pages_touched++;
+                    }
+                }
+            }
+            if (game_pc == dmcu_code_address(0x0c, 0xd06a)) {
+                env->npe_game_grid_count_io_active = true;
+                env->npe_game_grid_count_io_calls++;
+                env->npe_game_grid_count_io_stream = stream & MASK24;
+                env->npe_game_grid_count_io_destination =
+                    destination & MASK24;
+                env->npe_game_grid_count_io_length = length;
+                env->npe_game_grid_count_io_position = stream ?
+                    (((uint32_t)address_space_lduw_le(
+                        &address_space_memory, (stream + 0x28u) & MASK24,
+                        MEMTXATTRS_UNSPECIFIED, NULL) << 16) |
+                     address_space_lduw_le(
+                        &address_space_memory, (stream + 0x2au) & MASK24,
+                        MEMTXATTRS_UNSPECIFIED, NULL)) : 0u;
+                env->npe_game_grid_count_io_cache_position =
+                    ((uint32_t)address_space_lduw_le(
+                        &address_space_memory, 0x5127bcu,
+                        MEMTXATTRS_UNSPECIFIED, NULL) << 16) |
+                    address_space_lduw_le(
+                        &address_space_memory, 0x5127beu,
+                        MEMTXATTRS_UNSPECIFIED, NULL);
+            }
+        } else if (env->npe_game_table_io_active &&
+                   game_pc == dmcu_code_address(0x33, 0x04b2) &&
+                   game_target == dmcu_code_address(0x1c, 0xccd4)) {
+            uint32_t slot = env->npe_game_table_io_current_slot;
+
+            env->npe_game_table_io_methods++;
+            if (slot < DMCU_NPE_GAME_TABLE_IO_SLOTS) {
+                env->npe_game_table_io_method[slot] = game_target;
+            }
+        } else if (env->npe_game_table_io_active &&
+                   game_target == dmcu_code_address(0x33, 0x04b6)) {
+            env->npe_game_table_io_method_returns++;
+        } else if (env->npe_game_table_io_active &&
+                   game_pc == dmcu_code_address(0x33, 0x04be)) {
+            uint32_t slot = env->npe_game_table_io_current_slot;
+            uint32_t expected_return =
+                (env->npe_game_table_io_from[slot] + 4u) & MASK24;
+
+            if (game_target == expected_return &&
+                slot < DMCU_NPE_GAME_TABLE_IO_SLOTS) {
+                env->npe_game_table_io_active = false;
+                env->npe_game_table_io_returns++;
+                env->npe_game_table_io_result_r0[slot] =
+                    env->gpr[0] & MASK16;
+                env->npe_game_table_io_result_r1[slot] =
+                    env->gpr[1] & MASK16;
+                env->npe_game_table_io_error[slot] =
+                    address_space_lduw_le(
+                        &address_space_memory, 0x512ae0u,
+                        MEMTXATTRS_UNSPECIFIED, NULL);
+                env->npe_game_table_io_writes[slot] =
+                    env->npe_game_table_writes -
+                    env->npe_game_table_io_write_base;
+                {
+                    uint32_t before =
+                        env->npe_game_table_io_position_before[slot];
+                    uint32_t after = npe_stream_position(
+                        env->npe_game_table_io_stream[slot] & MASK24);
+
+                    env->npe_game_table_io_position_after[slot] = after;
+                    env->npe_game_stream_position_returns++;
+                    if (after != before) {
+                        env->npe_game_stream_position_changed++;
+                    }
+                    if (after >= before) {
+                        env->npe_game_stream_advanced_bytes += after - before;
+                    } else {
+                        env->npe_game_stream_position_reverse++;
+                    }
+                    if (after > env->npe_game_stream_position_max) {
+                        env->npe_game_stream_position_max = after;
+                    }
+                    if (env->npe_game_high_stream_io_active) {
+                        uint32_t high_slot =
+                            env->npe_game_high_stream_io_current_slot;
+
+                        env->npe_game_high_stream_io_active = false;
+                        env->npe_game_high_stream_io_returns++;
+                        env->npe_game_high_stream_io_position_after[
+                            high_slot] = after;
+                        env->npe_game_high_stream_io_result_r0[high_slot] =
+                            env->npe_game_table_io_result_r0[slot];
+                        env->npe_game_high_stream_io_result_r1[high_slot] =
+                            env->npe_game_table_io_result_r1[slot];
+                        env->npe_game_high_stream_io_error[high_slot] =
+                            env->npe_game_table_io_error[slot];
+                    }
+                }
+                if (env->npe_game_grid_count_io_active &&
+                    env->npe_game_table_io_from[slot] ==
+                        dmcu_code_address(0x0c, 0xd06a)) {
+                    env->npe_game_grid_count_io_active = false;
+                    env->npe_game_grid_count_io_returns++;
+                    env->npe_game_grid_count_io_value = internal_data_read(
+                        env->npe_game_grid_count_io_destination & MASK16, 8);
+                }
+            }
+        }
+
+        if (game_pc == dmcu_code_address(0x1f, 0xd760) &&
+            game_target == dmcu_code_address(0x2d, 0xf47c)) {
+            env->npe_game_service_dispatch_calls++;
+        } else if (game_pc == dmcu_code_address(0x2d, 0xf52a) &&
+                   game_target == dmcu_code_address(0x1d, 0x8a3a)) {
+            env->npe_game_ui_handler_calls++;
+            env->npe_game_flag_7a7a = address_space_ldub(
+                &address_space_memory, 0x527a7au ^ 1u,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            env->npe_game_flag_7a7c = address_space_ldub(
+                &address_space_memory, 0x527a7cu ^ 1u,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            env->npe_game_flag_7a7e = address_space_ldub(
+                &address_space_memory, 0x527a7eu ^ 1u,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            snapshot_npe_game_frame(env, NPE_GAME_FRAME_UI_ENTRY);
+        } else if (game_pc == dmcu_code_address(0x1d, 0x8eb6) &&
+                   game_target == dmcu_code_address(0x1d, 0x8eca)) {
+            env->npe_game_code86_paths++;
+        } else if (game_pc == dmcu_code_address(0x1d, 0x8ed4) &&
+                   game_target == dmcu_code_address(0x1d, 0x8ed8)) {
+            env->npe_game_flag_7a7e_one_paths++;
+        } else if (game_pc == dmcu_code_address(0x1d, 0x8ee2) &&
+                   game_target == dmcu_code_address(0x1d, 0x8ee6)) {
+            env->npe_game_flag_7a7c_one_paths++;
+        } else if (game_pc == dmcu_code_address(0x1d, 0x8eea) &&
+                   game_target == dmcu_code_address(0x03, 0x4224)) {
+            env->npe_game_memory_mode_calls++;
+        } else if (game_pc == dmcu_code_address(0x31, 0xb0b4) &&
+                   game_target == dmcu_code_address(0x1d, 0x8eee)) {
+            env->npe_game_memory_mode_returns++;
+            snapshot_npe_game_frame(env, NPE_GAME_FRAME_MEMORY_MODE_RETURN);
+        } else if (game_pc == dmcu_code_address(0x1d, 0x8ef0) &&
+                   game_target == dmcu_code_address(0x29, 0xd0ba)) {
+            unsigned index;
+            uint16_t post_sp = env->gpr[DMCU_SP] & MASK16;
+
+            env->npe_game_ui_init_calls++;
+            env->npe_game_ui_init_call_sequence =
+                ++env->npe_game_ui_lifecycle_sequence;
+            env->npe_game_ui_init_call_pre_sp = sp;
+            env->npe_game_ui_init_call_post_sp = post_sp;
+            env->npe_game_ui_init_call_pre_fp = fp;
+            env->npe_game_ui_init_call_post_fp =
+                env->gpr[DMCU_FP] & MASK16;
+            for (index = 0;
+                 index < ARRAY_SIZE(env->npe_game_ui_init_call_frame);
+                 index++) {
+                env->npe_game_ui_init_call_frame[index] =
+                    internal_data_read((post_sp + index * 2u) & MASK16, 16);
+            }
+            snapshot_npe_game_frame(env, NPE_GAME_FRAME_UI_INIT_ENTRY);
+        } else if (game_pc == dmcu_code_address(0x29, 0xd34e)) {
+            unsigned index;
+
+            env->npe_game_ui_init_rets_seen++;
+            env->npe_game_ui_init_rets_target = game_target;
+            env->npe_game_ui_init_rets_word = word;
+            env->npe_game_ui_init_rets_pre_sp = sp;
+            env->npe_game_ui_init_rets_post_sp =
+                env->gpr[DMCU_SP] & MASK16;
+            env->npe_game_ui_init_rets_pre_fp = fp;
+            env->npe_game_ui_init_rets_post_fp =
+                env->gpr[DMCU_FP] & MASK16;
+            for (index = 0;
+                 index < ARRAY_SIZE(env->npe_game_ui_init_rets_frame);
+                 index++) {
+                env->npe_game_ui_init_rets_frame[index] =
+                    internal_data_read((sp + index * 2u) & MASK16, 16);
+            }
+            if (game_target == dmcu_code_address(0x1d, 0x8ef4)) {
+                env->npe_game_ui_init_returns++;
+                snapshot_npe_game_frame(env, NPE_GAME_FRAME_UI_INIT_RETURN);
+            }
+        } else if (game_pc == dmcu_code_address(0x1d, 0x8ef4) &&
+                   game_target == dmcu_code_address(0x03, 0x422c)) {
+            env->npe_game_buffer_sync_calls++;
+        } else if (game_pc == dmcu_code_address(0x31, 0x4c66) &&
+                   game_target == dmcu_code_address(0x1d, 0x8ef8)) {
+            env->npe_game_buffer_sync_returns++;
+            snapshot_npe_game_frame(env, NPE_GAME_FRAME_BUFFER_SYNC_RETURN);
+        } else if (game_pc == dmcu_code_address(0x1d, 0x8f10) &&
+                   game_target == dmcu_code_address(0x03, 0x4178)) {
+            env->npe_game_state_publish_calls++;
+        } else if (game_pc == dmcu_code_address(0x33, 0x2216) &&
+                   game_target == dmcu_code_address(0x1d, 0x8f14)) {
+            env->npe_game_state_publish_returns++;
+        } else if (game_pc == dmcu_code_address(0x1d, 0x9150) &&
+                   game_target == dmcu_code_address(0x2d, 0xf52e)) {
+            env->npe_game_ui_handler_returns++;
+        } else if (game_pc == dmcu_code_address(0x2d, 0xf610) &&
+                   game_target == dmcu_code_address(0x1f, 0xd764)) {
+            env->npe_game_service_returns++;
+            env->npe_game_service_mode = address_space_lduw_le(
+                &address_space_memory, 0x527934u,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            env->npe_game_service_pointer =
+                ((uint32_t)internal_data_read(0x04fcu, 16) << 16) |
+                internal_data_read(0x04feu, 16);
+            snapshot_npe_game_frame(env, NPE_GAME_FRAME_SERVICE_RETURN);
+        } else if (game_pc == dmcu_code_address(0x1f, 0xd5e4) &&
+                   game_target == dmcu_code_address(0x1d, 0x5820)) {
+            env->npe_game_grid_calls++;
+            snapshot_npe_game_frame(env, NPE_GAME_FRAME_GRID_ENTRY);
+        } else if (game_pc == dmcu_code_address(0x1d, 0x5f56) &&
+                   game_target == dmcu_code_address(0x1f, 0xd5e8)) {
+            env->npe_game_grid_returns++;
+            snapshot_npe_game_frame(env, NPE_GAME_FRAME_GRID_RETURN);
+        } else if (game_pc == dmcu_code_address(0x1f, 0xd5e8) &&
+                   game_target == dmcu_code_address(0x25, 0x8392)) {
+            env->npe_game_initialize_calls++;
+            snapshot_npe_game_frame(env, NPE_GAME_FRAME_INITIALIZE_ENTRY);
+        } else if (game_pc == dmcu_code_address(0x25, 0x8778) &&
+                   game_target == dmcu_code_address(0x1f, 0xd5ec)) {
+            env->npe_game_initialize_returns++;
+            snapshot_npe_game_frame(env, NPE_GAME_FRAME_INITIALIZE_RETURN);
+        } else if (game_target == dmcu_code_address(0x23, 0x6c3c)) {
+            env->npe_game_range_calls++;
+        } else if (game_target == dmcu_code_address(0x27, 0xe84c)) {
+            env->npe_game_randomize_calls++;
+        } else if (game_target == dmcu_code_address(0x2e, 0x79fa)) {
+            env->npe_game_compare_calls++;
+        } else if (game_target == dmcu_code_address(0x29, 0xbbf2)) {
+            env->npe_game_draw_calls++;
+            snapshot_npe_game_frame(env, NPE_GAME_FRAME_DRAW_ENTRY);
+        } else if (game_pc == dmcu_code_address(0x1f, 0xd674) &&
+                   game_target == dmcu_code_address(0x1f, 0xd678)) {
+            uint32_t sequence = env->npe_game_branch_trace_count;
+
+            if (env->npe_game_branch_trace_count != UINT32_MAX) {
+                env->npe_game_branch_trace_count++;
+            }
+            if (sequence < DMCU_NPE_GAME_BRANCH_TRACE_SLOTS) {
+                unsigned record;
+                unsigned live = 0;
+
+                env->npe_game_branch_state[sequence] = internal_data_read(
+                    (fp - 9u) & MASK16, 8) & 0xffu;
+                env->npe_game_branch_index[sequence] = internal_data_read(
+                    (fp - 1u) & MASK16, 8) & 0xffu;
+                env->npe_game_branch_fp[sequence] = fp;
+                env->npe_game_branch_mode[sequence] =
+                    address_space_lduw_le(
+                        &address_space_memory, 0x527934u,
+                        MEMTXATTRS_UNSPECIFIED, NULL);
+                for (record = 0; record < 20u; record++) {
+                    live += address_space_lduw_le(
+                        &address_space_memory,
+                        0x526ca2u + record * 14u,
+                        MEMTXATTRS_UNSPECIFIED, NULL) != 0u;
+                }
+                env->npe_game_branch_live[sequence] = live;
+                for (record = 0; record < 7u; record++) {
+                    env->npe_game_branch_grid[sequence][record] =
+                        address_space_lduw_le(
+                            &address_space_memory,
+                            0x52783au + record * 2u,
+                            MEMTXATTRS_UNSPECIFIED, NULL);
+                }
+            }
+        } else if (game_pc == dmcu_code_address(0x29, 0xbe8a)) {
+            env->npe_game_draw_returns++;
+            snapshot_npe_game_frame(env, NPE_GAME_FRAME_DRAW_RETURN);
+        } else if (game_target == dmcu_code_address(0x2d, 0x908e)) {
+            env->npe_game_draw_item_calls++;
+        } else if (game_target == dmcu_code_address(0x5f, 0x0000)) {
+            env->npe_game_state_dispatch_calls++;
+        }
+
+        /* Retain only the most recent exact 29:BBF2 map draw.  Unlike the
+         * launch-wide NPE control ring, this observer is reset on every draw
+         * entry, so a movement-triggered draw cannot be hidden by earlier
+         * loader traffic.  The seven sites are the statically proven SCALLs
+         * in source 46:BBF2, relocated without HLE to live 29:BBF2. */
+        {
+            static const uint16_t draw_child_call_pc[
+                DMCU_NPE_GAME_DRAW_CHILD_SITES] = {
+                0xbc76, 0xbd40, 0xbd4e, 0xbdd2,
+                0xbddc, 0xbde2, 0xbe72,
+            };
+            static const uint16_t draw_child_continuation_pc[
+                DMCU_NPE_GAME_DRAW_CHILD_SITES] = {
+                0xbc7a, 0xbd44, 0xbd52, 0xbdd6,
+                0xbde0, 0xbde6, 0xbe76,
+            };
+            uint8_t control_op = word >> 8;
+            bool call_or_return =
+                control_op == 0xbdu || control_op == 0xadu ||
+                control_op == 0xbcu || control_op == 0xccu ||
+                control_op == 0xcdu || control_op == 0xceu ||
+                control_op == 0xc6u;
+            unsigned child;
+
+            if (game_target == dmcu_code_address(0x29, 0xbbf2)) {
+                env->npe_game_draw_trace_active = true;
+                env->npe_game_draw_trace_call = env->npe_game_draw_calls;
+                env->npe_game_draw_trace_edge_count = 0;
+                env->npe_game_draw_trace_active_child = 0;
+                memset(env->npe_game_draw_child_calls, 0,
+                       sizeof(env->npe_game_draw_child_calls));
+                memset(env->npe_game_draw_child_returns, 0,
+                       sizeof(env->npe_game_draw_child_returns));
+                memset(env->npe_game_draw_child_target, 0,
+                       sizeof(env->npe_game_draw_child_target));
+                memset(env->npe_game_draw_child_return_from, 0,
+                       sizeof(env->npe_game_draw_child_return_from));
+                memset(env->npe_game_draw_child_call_sp, 0,
+                       sizeof(env->npe_game_draw_child_call_sp));
+                memset(env->npe_game_draw_child_call_fp, 0,
+                       sizeof(env->npe_game_draw_child_call_fp));
+                memset(env->npe_game_draw_child_return_sp, 0,
+                       sizeof(env->npe_game_draw_child_return_sp));
+                memset(env->npe_game_draw_child_return_fp, 0,
+                       sizeof(env->npe_game_draw_child_return_fp));
+            }
+
+            if (env->npe_game_draw_trace_active) {
+                for (child = 0;
+                     child < DMCU_NPE_GAME_DRAW_CHILD_SITES; child++) {
+                    if (game_pc == dmcu_code_address(
+                            0x29, draw_child_call_pc[child])) {
+                        env->npe_game_draw_child_calls[child]++;
+                        env->npe_game_draw_child_target[child] = game_target;
+                        env->npe_game_draw_child_call_sp[child] = sp;
+                        env->npe_game_draw_child_call_fp[child] = fp;
+                        env->npe_game_draw_trace_active_child = child + 1u;
+                    }
+                    if (game_target == dmcu_code_address(
+                            0x29, draw_child_continuation_pc[child])) {
+                        env->npe_game_draw_child_returns[child]++;
+                        env->npe_game_draw_child_return_from[child] = game_pc;
+                        env->npe_game_draw_child_return_sp[child] = sp;
+                        env->npe_game_draw_child_return_fp[child] = fp;
+                        if (env->npe_game_draw_trace_active_child ==
+                            child + 1u) {
+                            env->npe_game_draw_trace_active_child = 0;
+                        }
+                    }
+                }
+
+                if (!env->in_interrupt && call_or_return &&
+                    game_target != (sequential & MASK24)) {
+                    uint32_t sequence = env->npe_game_draw_trace_edge_count;
+                    uint32_t slot =
+                        sequence % DMCU_NPE_GAME_DRAW_TRACE_SLOTS;
+
+                    if (env->npe_game_draw_trace_edge_count != UINT32_MAX) {
+                        env->npe_game_draw_trace_edge_count++;
+                    }
+                    env->npe_game_draw_trace_from[slot] = game_pc;
+                    env->npe_game_draw_trace_target[slot] = game_target;
+                    env->npe_game_draw_trace_word[slot] = word;
+                    env->npe_game_draw_trace_sp[slot] = sp;
+                    env->npe_game_draw_trace_fp[slot] = fp;
+                    env->npe_game_draw_trace_r0[slot] =
+                        env->gpr[0] & MASK16;
+                    env->npe_game_draw_trace_r1[slot] =
+                        env->gpr[1] & MASK16;
+                    env->npe_game_draw_trace_child[slot] =
+                        env->npe_game_draw_trace_active_child;
+                }
+
+                if (game_pc == dmcu_code_address(0x29, 0xbe8a)) {
+                    env->npe_game_draw_trace_active = false;
+                }
+            }
+        }
+
+        if (game_target == dmcu_code_address(0x1d, 0x8ef4)) {
+            env->npe_game_ui_init_continuation_entries++;
+            env->npe_game_ui_init_continuation_from = game_pc;
+            env->npe_game_ui_init_continuation_word = word;
+            env->npe_game_ui_init_continuation_pre_sp = sp;
+            env->npe_game_ui_init_continuation_post_sp =
+                env->gpr[DMCU_SP] & MASK16;
+            env->npe_game_ui_init_continuation_pre_fp = fp;
+            env->npe_game_ui_init_continuation_post_fp =
+                env->gpr[DMCU_FP] & MASK16;
+        }
+    }
+
+    /* After modal event 0x86 enters the exact 1E:F734 worker, preserve its
+     * actual RETS edge and, only when the caller really is 2F:C216, the small
+     * restored decoder that owns its two output pointers.  The same worker
+     * legitimately returns to the NPE controller at 1F:D5B6; that edge is
+     * handled by NPE_LOADER_EVENT above and must not replace the independent
+     * phase-2 loader trace with an impossible 2F:C340 completion condition. */
+    {
+        uint8_t modal_op = word >> 8;
+        bool modal_call_or_return =
+            modal_op == 0xbdu || modal_op == 0xadu || modal_op == 0xbcu ||
+            modal_op == 0xccu || modal_op == 0xcdu || modal_op == 0xceu ||
+            modal_op == 0xc6u;
+
+        /* The modal worker can make thousands of nested file/object calls
+         * after observing 0x86.  Start only at its exact common RETS. */
+        if (env->npe_modal_control_trace_pending && !env->in_interrupt &&
+            modal_call_or_return &&
+            (from & MASK24) == dmcu_code_address(0x1e, 0xfd7a)) {
+            bool loader_event_return =
+                target == dmcu_code_address(0x1f, 0xd5b6);
+
+            env->npe_modal_control_trace_pending = false;
+            env->npe_modal_control_trace_active = !loader_event_return;
+            env->npe_modal_control_trace_caller = target;
+            env->npe_modal_control_trace_result = env->gpr[0] & MASK16;
+            env->npe_modal_control_trace_outputs_valid =
+                target == dmcu_code_address(0x2f, 0xc23a);
+            if (env->npe_modal_control_trace_outputs_valid) {
+                /* Exact source 4C:C216 is installed at live 2F:C216.  Its
+                 * two far output pointers address caller locals FP-2 and
+                 * FP-4; 1E:F734 fills them before returning to C23A. */
+                env->npe_modal_control_trace_type = internal_data_read(
+                    (fp - 2u) & MASK16, 16);
+                env->npe_modal_control_trace_code = internal_data_read(
+                    (fp - 4u) & MASK16, 16);
+            }
+            if (!loader_event_return) {
+                env->npe_control_trace_count = 0;
+                env->npe_control_trace_frozen = false;
+                env->npe_control_trace_phase = 1;
+            }
+        }
+
+        if (env->npe_modal_control_trace_active &&
+            !env->npe_control_trace_frozen && !env->in_interrupt &&
+            modal_call_or_return && target != (sequential & MASK24)) {
+            uint32_t sequence = env->npe_control_trace_count++;
+            uint32_t slot = sequence % DMCU_NPE_CONTROL_TRACE_SLOTS;
+            bool modal_outer_return =
+                (from & MASK24) == dmcu_code_address(0x2f, 0xc340) &&
+                word == 0xc620u;
+
+            env->npe_control_trace_from[slot] = from & MASK24;
+            env->npe_control_trace_target[slot] = target;
+            env->npe_control_trace_word[slot] = word;
+            env->npe_control_trace_sp[slot] = sp;
+            env->npe_control_trace_fp[slot] = fp;
+            env->npe_control_trace_r0[slot] = env->gpr[0] & MASK16;
+            env->npe_control_trace_r1[slot] = env->gpr[1] & MASK16;
+            env->npe_control_trace_error[slot] = address_space_lduw_le(
+                &address_space_memory, 0x527a3cu,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            env->npe_control_trace_file_error[slot] = address_space_lduw_le(
+                &address_space_memory, 0x512ae0u,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            if (modal_outer_return) {
+                env->npe_modal_control_trace_decoder_valid = true;
+                env->npe_modal_control_trace_decoder_caller = target;
+                env->npe_modal_control_trace_decoder_result =
+                    env->gpr[0] & MASK16;
+            }
+            if (modal_outer_return ||
+                sequence + 1u >=
+                DMCU_NPE_CONTROL_TRACE_MAX_TRANSITIONS) {
+                env->npe_control_trace_frozen = true;
+                env->npe_modal_control_trace_active = false;
+            }
+        }
+    }
+
+    /* Once NPE_FORMAT_DISPATCH selects status 2, retain the last 256 exact
+     * call/return edges until the complete 1F:D1A6 loader either returns or
+     * first hands control to the resident 2F:E398 event loop.  Per-edge
+     * result/error snapshots expose the transition without logging the
+     * subsequent idle loop or changing execution. */
+    {
+        uint8_t loader_op = word >> 8;
+        bool loader_call_or_return =
+            loader_op == 0xbdu || loader_op == 0xadu ||
+            loader_op == 0xbcu || loader_op == 0xccu ||
+            loader_op == 0xcdu || loader_op == 0xceu ||
+            loader_op == 0xc6u;
+        bool loader_runtime_wait =
+            (from & MASK24) == dmcu_code_address(0x2f, 0xf20c) &&
+            target == dmcu_code_address(0x2f, 0xe398);
+        bool loader_state_dispatch =
+            (from & MASK24) == dmcu_code_address(0x2b, 0x089e) &&
+            word == 0xc600u;
+
+        if (env->npe_loader_control_trace_active &&
+            !env->npe_control_trace_frozen && !env->in_interrupt &&
+            (loader_call_or_return || loader_runtime_wait ||
+             loader_state_dispatch) &&
+            target != (sequential & MASK24)) {
+            uint32_t sequence = env->npe_control_trace_count++;
+            uint32_t slot = sequence % DMCU_NPE_CONTROL_TRACE_SLOTS;
+            bool loader_outer_return =
+                (from & MASK24) == dmcu_code_address(0x1f, 0xd772) &&
+                word == 0xc620u &&
+                target == dmcu_code_address(0x2f, 0xb72a);
+            bool loader_stack_switch =
+                env->npe_loader_control_trace_last_sp < 0xc000u &&
+                sp >= 0xc000u;
+            env->npe_control_trace_from[slot] = from & MASK24;
+            env->npe_control_trace_target[slot] = target;
+            env->npe_control_trace_word[slot] = word;
+            env->npe_control_trace_sp[slot] = sp;
+            env->npe_control_trace_fp[slot] = fp;
+            env->npe_control_trace_r0[slot] = env->gpr[0] & MASK16;
+            env->npe_control_trace_r1[slot] = env->gpr[1] & MASK16;
+            env->npe_control_trace_error[slot] = address_space_lduw_le(
+                &address_space_memory, 0x527a3cu,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            env->npe_control_trace_file_error[slot] = address_space_lduw_le(
+                &address_space_memory, 0x512ae0u,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            if (loader_stack_switch) {
+                env->npe_loader_stack_switch_detected = true;
+                env->npe_loader_stack_switch_from = from & MASK24;
+                env->npe_loader_stack_switch_target = target;
+                env->npe_loader_stack_switch_old_sp =
+                    env->npe_loader_control_trace_last_sp;
+                env->npe_loader_stack_switch_sp = sp;
+                env->npe_loader_stack_switch_fp = fp;
+                env->npe_loader_stack_switch_r0 = env->gpr[0] & MASK16;
+                env->npe_loader_stack_switch_r1 = env->gpr[1] & MASK16;
+                env->npe_loader_stack_switch_error =
+                    env->npe_control_trace_error[slot];
+                env->npe_loader_stack_switch_file_error =
+                    env->npe_control_trace_file_error[slot];
+            }
+            if (loader_state_dispatch) {
+                unsigned index;
+
+                env->npe_loader_state_dispatch_detected = true;
+                env->npe_loader_state_dispatch_from = from & MASK24;
+                env->npe_loader_state_dispatch_target = target;
+                env->npe_loader_state_dispatch_sp = sp;
+                env->npe_loader_state_dispatch_fp = fp;
+                env->npe_loader_state_dispatch_r0 = env->gpr[0] & MASK16;
+                env->npe_loader_state_dispatch_r1 = env->gpr[1] & MASK16;
+                for (index = 0;
+                     index < ARRAY_SIZE(env->npe_loader_state_dispatch_table);
+                     index++) {
+                    env->npe_loader_state_dispatch_table[index] =
+                        address_space_lduw_le(
+                            &address_space_memory, 0x0e08a0u + index * 2u,
+                            MEMTXATTRS_UNSPECIFIED, NULL);
+                }
+            }
+            env->npe_loader_control_trace_last_sp = sp;
+            if (loader_outer_return) {
+                env->npe_loader_control_trace_returns++;
+                env->npe_loader_control_trace_return_target = target;
+                env->npe_loader_control_trace_return_r0 =
+                    env->gpr[0] & MASK16;
+                env->npe_loader_control_trace_return_r1 =
+                    env->gpr[1] & MASK16;
+                env->npe_loader_control_trace_return_error =
+                    env->npe_control_trace_error[slot];
+                env->npe_loader_control_trace_return_file_error =
+                    env->npe_control_trace_file_error[slot];
+                env->npe_loader_control_trace_return_application_state =
+                    address_space_lduw_le(&address_space_memory, 0x512aaau,
+                                          MEMTXATTRS_UNSPECIFIED, NULL);
+                env->npe_loader_control_trace_completed = true;
+            }
+            if (loader_runtime_wait) {
+                env->npe_loader_runtime_wait_detected = true;
+                env->npe_loader_runtime_wait_from = from & MASK24;
+                env->npe_loader_runtime_wait_target = target;
+                env->npe_loader_runtime_wait_sp = sp;
+                env->npe_loader_runtime_wait_fp = fp;
+                env->npe_loader_runtime_wait_r0 = env->gpr[0] & MASK16;
+                env->npe_loader_runtime_wait_r1 = env->gpr[1] & MASK16;
+                env->npe_loader_runtime_wait_error =
+                    env->npe_control_trace_error[slot];
+                env->npe_loader_runtime_wait_file_error =
+                    env->npe_control_trace_file_error[slot];
+            }
+            if (loader_outer_return || loader_state_dispatch ||
+                loader_stack_switch ||
+                loader_runtime_wait ||
+                sequence + 1u >= DMCU_NPE_CONTROL_TRACE_MAX_TRANSITIONS) {
+                env->npe_control_trace_frozen = true;
+                env->npe_loader_control_trace_active = false;
+            }
+        }
+    }
+
+    /* Follow the exact caller-owned render object from the Game World
+     * browser's large local frame into 21:CEF4 and back through its shared
+     * non-local callback return.  This is deliberately tied to guest PCs and
+     * observes only existing SRAM, registers, and control-flow decisions. */
+    if (env->npe_glyph_trace_armed &&
+        (from & MASK24) == 0x1b23b8u && word == 0x2ea9u) {
+        uint16_t frame = env->gpr[DMCU_FP] & MASK16;
+
+        env->npe_render_object_watch_active = true;
+        env->npe_operation_callback_watch_active = true;
+        npe_render_context_control_logs = 0;
+        env->npe_render_object_initial_valid = true;
+        env->npe_render_object_before_valid = false;
+        env->npe_render_object_after_valid = false;
+        env->npe_render_object_base = (frame - 0x28u) & MASK16;
+        env->npe_render_object_calls = 0;
+        env->npe_render_object_returns = 0;
+        env->npe_render_object_context_calls = 0;
+        env->npe_render_object_context_returns = 0;
+        env->npe_render_object_context_return_from = 0;
+        env->npe_render_object_context_return_word = 0;
+        env->npe_render_object_context_return_sp = 0;
+        env->npe_render_object_context_return_fp = 0;
+        env->npe_render_object_context_result = 0;
+        env->npe_render_object_context_init_entries = 0;
+        env->npe_render_object_context_branch_count = 0;
+        env->npe_render_object_context_branch_target = 0;
+        env->npe_render_object_context_branch_psw = 0;
+        env->npe_render_object_context_branch_r0 = 0;
+        env->npe_render_object_context_branch_r1 = 0;
+        env->npe_render_object_context_failure_count = 0;
+        env->npe_render_object_context_failure_from = 0;
+        env->npe_operation_context_test_calls = 0;
+        env->npe_operation_context_test_returns = 0;
+        env->npe_operation_context_test_entry_sp = 0;
+        env->npe_operation_context_test_entry_post_sp = 0;
+        env->npe_operation_context_test_entry_fp = 0;
+        env->npe_operation_context_test_arg_hi = 0;
+        env->npe_operation_context_test_arg_lo = 0;
+        env->npe_operation_context_test_return_from = 0;
+        env->npe_operation_context_test_return_word = 0;
+        env->npe_operation_context_test_return_sp = 0;
+        env->npe_operation_context_test_return_post_sp = 0;
+        env->npe_operation_context_test_return_fp = 0;
+        env->npe_operation_context_test_result = 0;
+        env->npe_operation_callbacks_installed_valid = false;
+        env->npe_operation_callbacks_object_hi = 0;
+        env->npe_operation_callbacks_object_lo = 0;
+        memset(env->npe_operation_callbacks_installed, 0,
+               sizeof(env->npe_operation_callbacks_installed));
+        env->npe_operation_layout_calls = 0;
+        env->npe_operation_layout_returns = 0;
+        env->npe_operation_layout_object_hi = 0;
+        env->npe_operation_layout_object_lo = 0;
+        memset(env->npe_operation_layout_before, 0,
+               sizeof(env->npe_operation_layout_before));
+        memset(env->npe_operation_layout_after, 0,
+               sizeof(env->npe_operation_layout_after));
+        env->npe_operation_event_loop_calls = 0;
+        env->npe_operation_event_loop_returns = 0;
+        env->npe_operation_event_loop_entry_sp = 0;
+        env->npe_operation_event_loop_entry_fp = 0;
+        env->npe_operation_event_loop_return_from = 0;
+        env->npe_operation_event_loop_return_sp = 0;
+        env->npe_operation_event_loop_return_fp = 0;
+        memset(env->npe_operation_callback_calls, 0,
+               sizeof(env->npe_operation_callback_calls));
+        memset(env->npe_operation_callback_from, 0,
+               sizeof(env->npe_operation_callback_from));
+        memset(env->npe_operation_callback_word, 0,
+               sizeof(env->npe_operation_callback_word));
+        memset(env->npe_operation_callback_sp, 0,
+               sizeof(env->npe_operation_callback_sp));
+        memset(env->npe_operation_callback_fp, 0,
+               sizeof(env->npe_operation_callback_fp));
+        memset(env->npe_operation_callback_stack, 0,
+               sizeof(env->npe_operation_callback_stack));
+        env->npe_resource_check_watch_active = false;
+        env->npe_resource_check_calls = 0;
+        env->npe_resource_check_returns = 0;
+        env->npe_resource_check_caller = 0;
+        env->npe_resource_check_return_from = 0;
+        env->npe_resource_check_return_target = 0;
+        env->npe_resource_check_entry_sp = 0;
+        env->npe_resource_check_entry_post_sp = 0;
+        env->npe_resource_check_entry_fp = 0;
+        env->npe_resource_check_entry_error = 0;
+        env->npe_resource_check_return_sp = 0;
+        env->npe_resource_check_return_post_sp = 0;
+        env->npe_resource_check_return_fp = 0;
+        env->npe_resource_check_return_r0 = 0;
+        env->npe_resource_check_return_r1 = 0;
+        env->npe_resource_check_return_error = 0;
+        env->npe_resource_check_stage = 0;
+        memset(env->npe_resource_check_child_calls, 0,
+               sizeof(env->npe_resource_check_child_calls));
+        memset(env->npe_resource_check_child_returns, 0,
+               sizeof(env->npe_resource_check_child_returns));
+        memset(env->npe_resource_check_child_call_from, 0,
+               sizeof(env->npe_resource_check_child_call_from));
+        memset(env->npe_resource_check_child_call_target, 0,
+               sizeof(env->npe_resource_check_child_call_target));
+        memset(env->npe_resource_check_child_call_word, 0,
+               sizeof(env->npe_resource_check_child_call_word));
+        memset(env->npe_resource_check_child_call_sp, 0,
+               sizeof(env->npe_resource_check_child_call_sp));
+        memset(env->npe_resource_check_child_call_post_sp, 0,
+               sizeof(env->npe_resource_check_child_call_post_sp));
+        memset(env->npe_resource_check_child_call_fp, 0,
+               sizeof(env->npe_resource_check_child_call_fp));
+        memset(env->npe_resource_check_child_return_from, 0,
+               sizeof(env->npe_resource_check_child_return_from));
+        memset(env->npe_resource_check_child_return_target, 0,
+               sizeof(env->npe_resource_check_child_return_target));
+        memset(env->npe_resource_check_child_return_word, 0,
+               sizeof(env->npe_resource_check_child_return_word));
+        memset(env->npe_resource_check_child_return_sp, 0,
+               sizeof(env->npe_resource_check_child_return_sp));
+        memset(env->npe_resource_check_child_return_post_sp, 0,
+               sizeof(env->npe_resource_check_child_return_post_sp));
+        memset(env->npe_resource_check_child_return_fp, 0,
+               sizeof(env->npe_resource_check_child_return_fp));
+        memset(env->npe_resource_check_child_return_r0, 0,
+               sizeof(env->npe_resource_check_child_return_r0));
+        memset(env->npe_resource_check_child_return_r1, 0,
+               sizeof(env->npe_resource_check_child_return_r1));
+        memset(env->npe_resource_check_child_return_error, 0,
+               sizeof(env->npe_resource_check_child_return_error));
+        env->npe_resource_check_error_first_write_valid = false;
+        env->npe_resource_check_error_first_nonzero_valid = false;
+        env->npe_resource_check_error_first_write_pc = 0;
+        env->npe_resource_check_error_first_write_address = 0;
+        env->npe_resource_check_error_first_write_old = 0;
+        env->npe_resource_check_error_first_write_new = 0;
+        env->npe_resource_check_error_first_write_word_old = 0;
+        env->npe_resource_check_error_first_write_word_new = 0;
+        env->npe_resource_check_error_first_write_sp = 0;
+        env->npe_resource_check_error_first_write_fp = 0;
+        env->npe_resource_check_error_first_write_bits = 0;
+        env->npe_resource_check_error_first_write_stage = 0;
+        env->npe_resource_check_error_first_nonzero_pc = 0;
+        env->npe_resource_check_error_first_nonzero_address = 0;
+        env->npe_resource_check_error_first_nonzero_old = 0;
+        env->npe_resource_check_error_first_nonzero_new = 0;
+        env->npe_resource_check_error_first_nonzero_word_old = 0;
+        env->npe_resource_check_error_first_nonzero_word_new = 0;
+        env->npe_resource_check_error_first_nonzero_sp = 0;
+        env->npe_resource_check_error_first_nonzero_fp = 0;
+        env->npe_resource_check_error_first_nonzero_bits = 0;
+        env->npe_resource_check_error_first_nonzero_stage = 0;
+        env->npe_resource_check_error_write_sequence = 0;
+        memset(env->npe_resource_check_error_write_event, 0,
+               sizeof(env->npe_resource_check_error_write_event));
+        memset(env->npe_resource_check_error_write_pc, 0,
+               sizeof(env->npe_resource_check_error_write_pc));
+        memset(env->npe_resource_check_error_write_address, 0,
+               sizeof(env->npe_resource_check_error_write_address));
+        memset(env->npe_resource_check_error_write_word_old, 0,
+               sizeof(env->npe_resource_check_error_write_word_old));
+        memset(env->npe_resource_check_error_write_word_new, 0,
+               sizeof(env->npe_resource_check_error_write_word_new));
+        memset(env->npe_resource_check_error_write_r0, 0,
+               sizeof(env->npe_resource_check_error_write_r0));
+        memset(env->npe_resource_check_error_write_r1, 0,
+               sizeof(env->npe_resource_check_error_write_r1));
+        memset(env->npe_resource_check_error_write_sp, 0,
+               sizeof(env->npe_resource_check_error_write_sp));
+        memset(env->npe_resource_check_error_write_fp, 0,
+               sizeof(env->npe_resource_check_error_write_fp));
+        memset(env->npe_resource_check_error_write_bits, 0,
+               sizeof(env->npe_resource_check_error_write_bits));
+        memset(env->npe_resource_check_error_write_stage, 0,
+               sizeof(env->npe_resource_check_error_write_stage));
+        env->npe_render_object_context_trampoline_entries = 0;
+        env->npe_render_object_context_trampoline_from = 0;
+        env->npe_render_object_context_trampoline_word = 0;
+        env->npe_render_object_context_trampoline_sp = 0;
+        env->npe_render_object_context_trampoline_fp = 0;
+        env->npe_render_object_context_trampoline_r0 = 0;
+        env->npe_render_object_compositor_entries = 0;
+        env->npe_render_object_compositor_entry_from = 0;
+        env->npe_render_object_compositor_entry_word = 0;
+        env->npe_render_object_compositor_entry_sp = 0;
+        env->npe_render_object_compositor_entry_fp = 0;
+        env->npe_render_object_compositor_child_calls = 0;
+        env->npe_render_object_compositor_child_from = 0;
+        env->npe_render_object_compositor_child_word = 0;
+        env->npe_render_object_compositor_child_sp = 0;
+        env->npe_render_object_compositor_child_fp = 0;
+        env->npe_render_object_compositor_resident_returns = 0;
+        env->npe_render_object_compositor_resident_return_from = 0;
+        env->npe_render_object_compositor_resident_return_word = 0;
+        env->npe_render_object_compositor_resident_return_sp = 0;
+        env->npe_render_object_compositor_resident_return_fp = 0;
+        env->npe_render_object_compositor_source_entries = 0;
+        env->npe_render_object_compositor_source_entry_from = 0;
+        env->npe_render_object_compositor_source_entry_target = 0;
+        env->npe_render_object_compositor_source_entry_word = 0;
+        env->npe_render_object_compositor_source_entry_sp = 0;
+        env->npe_render_object_compositor_source_entry_fp = 0;
+        env->npe_render_object_compositor_source_entry_r0 = 0;
+        memset(env->npe_render_object_compositor_source_entry_stack, 0,
+               sizeof(env->npe_render_object_compositor_source_entry_stack));
+        env->npe_render_object_caller = 0;
+        env->npe_render_object_return_from = 0;
+        env->npe_render_object_return_target = 0;
+        env->npe_render_object_entry_sp = 0;
+        env->npe_render_object_entry_fp = 0;
+        env->npe_render_object_return_sp = 0;
+        env->npe_render_object_return_fp = 0;
+        env->npe_render_object_arg_hi = 0;
+        env->npe_render_object_arg_lo = 0;
+        env->npe_render_object_layout_calls = 0;
+        env->npe_render_object_helper_tail_calls = 0;
+        env->npe_render_object_write_sequence = 0;
+        env->npe_materialize_watch_active = false;
+        env->npe_materialize_count_inputs_valid = false;
+        env->npe_materialize_total_valid = false;
+        env->npe_materialize_calls = 0;
+        env->npe_materialize_returns = 0;
+        env->npe_materialize_entry_sp = 0;
+        env->npe_materialize_entry_fp = 0;
+        env->npe_materialize_arg_path_hi = 0;
+        env->npe_materialize_arg_path_lo = 0;
+        env->npe_materialize_arg_mode = 0;
+        env->npe_materialize_frame_fp = 0;
+        env->npe_materialize_return_r0 = 0;
+        env->npe_materialize_return_r1 = 0;
+        memset(env->npe_materialize_count_inputs, 0,
+               sizeof(env->npe_materialize_count_inputs));
+        env->npe_materialize_total_hi = 0;
+        env->npe_materialize_total_lo = 0;
+        memset(env->npe_materialize_path, 0,
+               sizeof(env->npe_materialize_path));
+        memset(env->npe_materialize_local_pattern, 0,
+               sizeof(env->npe_materialize_local_pattern));
+        env->npe_materialize_trace_count = 0;
+        memset(env->npe_render_object_branch_count, 0,
+               sizeof(env->npe_render_object_branch_count));
+        memset(env->npe_render_object_branch_from, 0,
+               sizeof(env->npe_render_object_branch_from));
+        memset(env->npe_render_object_branch_target, 0,
+               sizeof(env->npe_render_object_branch_target));
+        memset(env->npe_render_object_branch_psw, 0,
+               sizeof(env->npe_render_object_branch_psw));
+        memset(env->npe_render_object_branch_r0, 0,
+               sizeof(env->npe_render_object_branch_r0));
+        env->npe_object_mask_watch_active = false;
+        env->npe_object_mask_calls = 0;
+        env->npe_object_mask_returns = 0;
+        env->npe_object_mask_caller = 0;
+        env->npe_object_mask_return_from = 0;
+        env->npe_object_mask_return_target = 0;
+        env->npe_object_mask_entry_sp = 0;
+        env->npe_object_mask_entry_post_sp = 0;
+        env->npe_object_mask_entry_fp = 0;
+        env->npe_object_mask_arg_hi = 0;
+        env->npe_object_mask_arg_lo = 0;
+        env->npe_object_mask_return_sp = 0;
+        env->npe_object_mask_return_post_sp = 0;
+        env->npe_object_mask_return_fp = 0;
+        env->npe_object_mask_return_r0 = 0;
+        env->npe_object_mask_return_r1 = 0;
+        memset(env->npe_object_mask_entry_fields, 0,
+               sizeof(env->npe_object_mask_entry_fields));
+        memset(env->npe_object_mask_return_fields, 0,
+               sizeof(env->npe_object_mask_return_fields));
+        memset(env->npe_object_mask_branch_count, 0,
+               sizeof(env->npe_object_mask_branch_count));
+        memset(env->npe_object_mask_branch_from, 0,
+               sizeof(env->npe_object_mask_branch_from));
+        memset(env->npe_object_mask_branch_target, 0,
+               sizeof(env->npe_object_mask_branch_target));
+        memset(env->npe_object_mask_branch_psw, 0,
+               sizeof(env->npe_object_mask_branch_psw));
+        memset(env->npe_object_mask_branch_r0, 0,
+               sizeof(env->npe_object_mask_branch_r0));
+        memset(env->npe_object_mask_attach_calls, 0,
+               sizeof(env->npe_object_mask_attach_calls));
+        memset(env->npe_render_object_before, 0,
+               sizeof(env->npe_render_object_before));
+        memset(env->npe_render_object_after, 0,
+               sizeof(env->npe_render_object_after));
+        snapshot_npe_render_object(
+            env, env->npe_render_object_initial);
+    }
+
+    /* 1C:D92C passes the same far browser object to the exact resident
+     * 1F:5BFA mask builder.  R0 is preserved at 1C:D932 and then consumed by
+     * three source-proven branches at D9B2, D9DE, and D9E8.  Observe that
+     * narrow chain directly so a wrong mask result can be distinguished from
+     * an object-state/type rejection without guessing either result. */
+    if (env->npe_operation_callback_watch_active &&
+        (from & MASK24) == 0x1cd92cu && target == 0x1f5bfau &&
+        (word >> 8) == 0xbdu) {
+        env->npe_object_mask_calls++;
+        if (env->npe_object_mask_calls == 1u) {
+            env->npe_object_mask_watch_active = true;
+            env->npe_object_mask_caller = from & MASK24;
+            env->npe_object_mask_entry_sp = sp;
+            env->npe_object_mask_entry_post_sp =
+                env->gpr[DMCU_SP] & MASK16;
+            env->npe_object_mask_entry_fp = fp;
+            env->npe_object_mask_arg_hi = internal_data_read(sp, 16);
+            env->npe_object_mask_arg_lo = internal_data_read(
+                (sp + 2u) & MASK16, 16);
+            snapshot_npe_object_mask_fields(
+                env->npe_object_mask_arg_hi,
+                env->npe_object_mask_arg_lo,
+                env->npe_object_mask_entry_fields);
+        }
+    }
+    if (env->npe_object_mask_watch_active &&
+        (from & MASK24) == 0x1f61feu && target == 0x1cd930u &&
+        word == 0xc620u) {
+        env->npe_object_mask_returns++;
+        env->npe_object_mask_return_from = from & MASK24;
+        env->npe_object_mask_return_target = target;
+        env->npe_object_mask_return_sp = sp;
+        env->npe_object_mask_return_post_sp =
+            env->gpr[DMCU_SP] & MASK16;
+        env->npe_object_mask_return_fp = fp;
+        env->npe_object_mask_return_r0 = env->gpr[0] & MASK16;
+        env->npe_object_mask_return_r1 = env->gpr[1] & MASK16;
+        snapshot_npe_object_mask_fields(
+            env->npe_object_mask_arg_hi,
+            env->npe_object_mask_arg_lo,
+            env->npe_object_mask_return_fields);
+    }
+    if (env->npe_object_mask_watch_active && (word >> 8) == 0xacu) {
+        static const uint32_t branch_pc[3] = {
+            0x1cd9b2u, 0x1cd9deu, 0x1cd9e8u,
+        };
+        unsigned branch;
+
+        for (branch = 0; branch < ARRAY_SIZE(branch_pc); branch++) {
+            if ((from & MASK24) != branch_pc[branch]) {
+                continue;
+            }
+            env->npe_object_mask_branch_count[branch]++;
+            env->npe_object_mask_branch_from[branch] = from & MASK24;
+            env->npe_object_mask_branch_target[branch] = target;
+            env->npe_object_mask_branch_psw[branch] = env->psw & MASK16;
+            env->npe_object_mask_branch_r0[branch] =
+                env->gpr[0] & MASK16;
+            /* D9DE and D9E8 branch straight to the layout epilogue on
+             * rejection.  Closing the first-call watch here keeps later
+             * unrelated layout work from overwriting this result. */
+            if (branch >= 1u && target == 0x1cdbdcu) {
+                env->npe_object_mask_watch_active = false;
+            }
+            break;
+        }
+    }
+    if (env->npe_object_mask_watch_active &&
+        (from & MASK24) == 0x1cd9f0u && target == 0x335228u &&
+        (word >> 8) == 0xbdu) {
+        env->npe_object_mask_attach_calls[0]++;
+    }
+    if (env->npe_object_mask_watch_active &&
+        (from & MASK24) == 0x1cda12u && target == 0x334492u &&
+        (word >> 8) == 0xbdu) {
+        env->npe_object_mask_attach_calls[1]++;
+    }
+    if (env->npe_render_object_watch_active &&
+        (from & MASK24) == 0x1b25feu && target == 0x18cfa8u &&
+        (word >> 8) == 0xbdu) {
+        env->npe_render_object_context_calls++;
+    }
+
+    /* Operation 1 reduces the published render-object count to the return of
+     * exact 29:9746.  Follow its source-proven enumerator/filter/contribution
+     * edges so a missing Hero item can be assigned to one real guest stage. */
+    if (env->npe_operation_callback_watch_active &&
+        (from & MASK24) == 0x18d11au && target == 0x299746u &&
+        (word >> 8) == 0xbdu) {
+        env->npe_materialize_calls++;
+        if (env->npe_materialize_calls == 1u) {
+            env->npe_materialize_watch_active = true;
+            env->npe_materialize_entry_sp = sp;
+            env->npe_materialize_entry_fp = fp;
+            env->npe_materialize_arg_path_hi = internal_data_read(sp, 16);
+            env->npe_materialize_arg_path_lo = internal_data_read(
+                (sp + 2u) & MASK16, 16);
+            env->npe_materialize_arg_mode = internal_data_read(
+                (sp + 4u) & MASK16, 16);
+            snapshot_npe_materialize_far_bytes(
+                env->npe_materialize_arg_path_hi,
+                env->npe_materialize_arg_path_lo,
+                env->npe_materialize_path,
+                DMCU_NPE_MATERIALIZE_PATH_BYTES);
+            trace_npe_materialize_stage(env, 1, from, target, sp, fp);
+        }
+    }
+    if (env->npe_materialize_watch_active) {
+        uint32_t materialize_from = from & MASK24;
+
+        if (materialize_from == 0x299790u && target == 0x3340a8u) {
+            env->npe_materialize_frame_fp = fp;
+            trace_npe_materialize_stage(env, 2, from, target, sp, fp);
+        } else if (target == 0x299794u && word == 0xc620u) {
+            trace_npe_materialize_stage(env, 3, from, target, sp, fp);
+        } else if (materialize_from == 0x29983eu &&
+                   target == 0x3346a2u) {
+            trace_npe_materialize_stage(env, 4, from, target, sp, fp);
+        } else if (target == 0x299842u && word == 0xc620u) {
+            trace_npe_materialize_stage(env, 5, from, target, sp, fp);
+        } else if (materialize_from == 0x299880u &&
+                   target == 0x331894u) {
+            snapshot_npe_materialize_near_bytes(
+                (fp + 0xfea6u) & MASK16,
+                env->npe_materialize_local_pattern,
+                DMCU_NPE_MATERIALIZE_PATH_BYTES);
+            trace_npe_materialize_stage(env, 6, from, target, sp, fp);
+        } else if (target == 0x299884u && word == 0xc620u) {
+            trace_npe_materialize_stage(env, 7, from, target, sp, fp);
+        } else if ((materialize_from == 0x2998beu ||
+                    materialize_from == 0x299984u) &&
+                   target == 0x27cbe4u) {
+            trace_npe_materialize_stage(env, 8, from, target, sp, fp);
+        } else if ((target == 0x2998c2u || target == 0x299988u) &&
+                   word == 0xc620u) {
+            trace_npe_materialize_stage(
+                env, materialize_from == 0x27cf0eu ? 9 : 15,
+                from, target, sp, fp);
+        } else if ((materialize_from == 0x2998eeu ||
+                    materialize_from == 0x2999b4u) &&
+                   target == 0x336c0au) {
+            trace_npe_materialize_stage(env, 10, from, target, sp, fp);
+        } else if (materialize_from == 0x336c10u &&
+                   (target == 0x2998f2u || target == 0x2999b8u) &&
+                   word == 0xc620u) {
+            trace_npe_materialize_stage(env, 11, from, target, sp, fp);
+        } else if (materialize_from == 0x299946u &&
+                   target == 0x33443eu) {
+            trace_npe_materialize_stage(env, 12, from, target, sp, fp);
+        } else if (target == 0x29994au && word == 0xc620u) {
+            trace_npe_materialize_stage(env, 13, from, target, sp, fp);
+        } else if (materialize_from == 0x2999e8u &&
+                   target == 0x18d11eu && word == 0xc620u) {
+            env->npe_materialize_returns++;
+            env->npe_materialize_return_r0 = env->gpr[0] & MASK16;
+            env->npe_materialize_return_r1 = env->gpr[1] & MASK16;
+            trace_npe_materialize_stage(env, 14, from, target, sp, fp);
+        }
+
+        if (target == 0x18d496u) {
+            env->npe_materialize_count_inputs[0] = address_space_lduw_le(
+                &address_space_memory, 0x525182u,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            env->npe_materialize_count_inputs[1] = address_space_lduw_le(
+                &address_space_memory, 0x525184u,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            env->npe_materialize_count_inputs[2] = address_space_lduw_le(
+                &address_space_memory, 0x525758u,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            env->npe_materialize_count_inputs_valid = true;
+        }
+        if (materialize_from == 0x18d4b6u && target == 0x18d4bau) {
+            env->npe_materialize_total_hi = internal_data_read(
+                (fp + 0xfff8u) & MASK16, 16);
+            env->npe_materialize_total_lo = internal_data_read(
+                (fp + 0xfffau) & MASK16, 16);
+            env->npe_materialize_total_valid = true;
+        }
+        if (materialize_from == 0x18da2cu && target == 0x1b2602u) {
+            env->npe_materialize_watch_active = false;
+        }
+    }
+    /* Operation 1 does not traverse the result-list branch at 18:D25A.
+     * Its first meaningful child is the exact 32:FA06 resource predicate at
+     * 18:D020.  Preserve both sides of that one SCALL so a successful D4E8
+     * branch is not conflated with an unobserved list scan. */
+    if (env->npe_operation_callback_watch_active &&
+        (from & MASK24) == 0x18d020u && target == 0x32fa06u &&
+        (word >> 8) == 0xbdu) {
+        env->npe_operation_context_test_calls++;
+        if (env->npe_operation_context_test_calls == 1u) {
+            env->npe_operation_context_test_entry_sp = sp;
+            env->npe_operation_context_test_entry_post_sp =
+                env->gpr[DMCU_SP] & MASK16;
+            env->npe_operation_context_test_entry_fp = fp;
+            env->npe_operation_context_test_arg_hi =
+                internal_data_read(sp, 16);
+            env->npe_operation_context_test_arg_lo =
+                internal_data_read((sp + 2u) & MASK16, 16);
+        }
+    }
+    if (env->npe_operation_callback_watch_active &&
+        env->npe_operation_context_test_calls >
+            env->npe_operation_context_test_returns &&
+        (from & MASK24) == 0x32fa3eu && target == 0x18d024u &&
+        word == 0xc620u) {
+        env->npe_operation_context_test_returns++;
+        env->npe_operation_context_test_return_from = from & MASK24;
+        env->npe_operation_context_test_return_word = word;
+        env->npe_operation_context_test_return_sp = sp;
+        env->npe_operation_context_test_return_post_sp =
+            env->gpr[DMCU_SP] & MASK16;
+        env->npe_operation_context_test_return_fp = fp;
+        env->npe_operation_context_test_result = env->gpr[0] & MASK16;
+    }
+    /* Follow the exact 32:FA06 -> 25:5460 resource/context check without
+     * interpreting any child as an HLE service.  Each slot corresponds to a
+     * source-proven SCALL and its unique post-call PC.  R0:R1 and A2:2AE0
+     * are sampled only after the child has actually returned. */
+    {
+        static const uint32_t child_call_from[
+            DMCU_NPE_RESOURCE_CHECK_CHILD_SLOTS] = {
+            0x255490u, 0x2554d6u, 0x25554au,
+            0x2555b6u, 0x2555dau, 0x2556dcu,
+        };
+        static const uint32_t child_target[
+            DMCU_NPE_RESOURCE_CHECK_CHILD_SLOTS] = {
+            0x31e022u, 0x3307b0u, 0x2916b0u,
+            0x30fe0eu, 0x278ed6u, 0x2e4572u,
+        };
+        static const uint32_t child_return_target[
+            DMCU_NPE_RESOURCE_CHECK_CHILD_SLOTS] = {
+            0x255494u, 0x2554dau, 0x25554eu,
+            0x2555bau, 0x2555deu, 0x2556e0u,
+        };
+        uint16_t current_error;
+        unsigned child;
+
+        if (env->npe_operation_callback_watch_active &&
+            (from & MASK24) == 0x32fa26u && target == 0x255460u &&
+            (word >> 8) == 0xbdu) {
+            env->npe_resource_check_calls++;
+            if (env->npe_resource_check_calls == 1u) {
+                env->npe_resource_check_watch_active = true;
+                env->npe_resource_check_caller = from & MASK24;
+                env->npe_resource_check_entry_sp = sp;
+                env->npe_resource_check_entry_post_sp =
+                    env->gpr[DMCU_SP] & MASK16;
+                env->npe_resource_check_entry_fp = fp;
+                env->npe_resource_check_entry_error =
+                    address_space_lduw_le(
+                        &address_space_memory, 0x00512ae0u,
+                        MEMTXATTRS_UNSPECIFIED, NULL);
+            }
+        }
+
+        current_error = env->npe_resource_check_watch_active ?
+            address_space_lduw_le(
+                &address_space_memory, 0x00512ae0u,
+                MEMTXATTRS_UNSPECIFIED, NULL) : 0u;
+        for (child = 0;
+             env->npe_resource_check_watch_active &&
+             child < DMCU_NPE_RESOURCE_CHECK_CHILD_SLOTS; child++) {
+            if ((from & MASK24) == child_call_from[child] &&
+                target == child_target[child] && (word >> 8) == 0xbdu) {
+                env->npe_resource_check_stage = child + 1u;
+                env->npe_resource_check_child_calls[child]++;
+                env->npe_resource_check_child_call_from[child] =
+                    from & MASK24;
+                env->npe_resource_check_child_call_target[child] = target;
+                env->npe_resource_check_child_call_word[child] = word;
+                env->npe_resource_check_child_call_sp[child] = sp;
+                env->npe_resource_check_child_call_post_sp[child] =
+                    env->gpr[DMCU_SP] & MASK16;
+                env->npe_resource_check_child_call_fp[child] = fp;
+            }
+            if (target == child_return_target[child] &&
+                env->npe_resource_check_child_calls[child] >
+                    env->npe_resource_check_child_returns[child]) {
+                env->npe_resource_check_child_returns[child]++;
+                env->npe_resource_check_child_return_from[child] =
+                    from & MASK24;
+                env->npe_resource_check_child_return_target[child] = target;
+                env->npe_resource_check_child_return_word[child] = word;
+                env->npe_resource_check_child_return_sp[child] = sp;
+                env->npe_resource_check_child_return_post_sp[child] =
+                    env->gpr[DMCU_SP] & MASK16;
+                env->npe_resource_check_child_return_fp[child] = fp;
+                env->npe_resource_check_child_return_r0[child] =
+                    env->gpr[0] & MASK16;
+                env->npe_resource_check_child_return_r1[child] =
+                    env->gpr[1] & MASK16;
+                env->npe_resource_check_child_return_error[child] =
+                    current_error;
+            }
+        }
+
+        if (env->npe_resource_check_watch_active &&
+            (from & MASK24) == 0x255856u && word == 0xc620u) {
+            env->npe_resource_check_returns++;
+            env->npe_resource_check_return_from = from & MASK24;
+            env->npe_resource_check_return_target = target;
+            env->npe_resource_check_return_sp = sp;
+            env->npe_resource_check_return_post_sp =
+                env->gpr[DMCU_SP] & MASK16;
+            env->npe_resource_check_return_fp = fp;
+            env->npe_resource_check_return_r0 = env->gpr[0] & MASK16;
+            env->npe_resource_check_return_r1 = env->gpr[1] & MASK16;
+            env->npe_resource_check_return_error = current_error;
+            env->npe_resource_check_watch_active = false;
+        }
+    }
+    /* Keep a short, read-only record of non-sequential transfers made by the
+     * first Game World operation-context constructor.  The caller currently
+     * receives failure before the object initializer at 18:D7F8, so this
+     * distinguishes the exact child/return boundary without modifying guest
+     * registers, RAM, flags, or control flow. */
+    if (env->npe_render_object_watch_active &&
+        env->npe_render_object_context_calls >
+            env->npe_render_object_context_returns &&
+        target != from &&
+        target != ((from + dmcu_insn_size(word)) & MASK24) &&
+        (((from & MASK24) >= 0x18cfa8u &&
+          (from & MASK24) <= 0x18da2cu) ||
+         (target >= 0x18cfa8u && target <= 0x18da2cu) ||
+         target == 0x1b2602u) &&
+        npe_render_context_control_logs < 256) {
+        qemu_log_mask(
+            LOG_UNIMP,
+            "DMCU NPE context control #%u %02x:%04x>%02x:%04x "
+            "word=%04x sp=%04x fp=%04x r=%04x:%04x ds=%03x:%03x\n",
+            ++npe_render_context_control_logs,
+            dmcu_code_segment(from), dmcu_code_pc(from),
+            dmcu_code_segment(target), dmcu_code_pc(target), word & MASK16,
+            sp & MASK16, fp & MASK16, env->gpr[0] & MASK16,
+            env->gpr[1] & MASK16, env->sfr[DMCU_SFR_DS0] & 0x1ff,
+            env->sfr[DMCU_SFR_DS1] & 0x1ff);
+    }
+    if (env->npe_render_object_watch_active &&
+        (from & MASK24) == 0x18d4e8u && (word >> 8) == 0xacu) {
+        env->npe_render_object_context_branch_count++;
+        env->npe_render_object_context_branch_target = target;
+        env->npe_render_object_context_branch_psw = env->psw & MASK16;
+        env->npe_render_object_context_branch_r0 =
+            env->gpr[0] & MASK16;
+        env->npe_render_object_context_branch_r1 =
+            env->gpr[1] & MASK16;
+        if (target == 0x18d7f8u) {
+            env->npe_render_object_context_init_entries++;
+        }
+    }
+    if (env->npe_render_object_watch_active && target == 0x18da24u &&
+        ((from & MASK24) == 0x18cff0u ||
+         (from & MASK24) == 0x18d098u ||
+         (from & MASK24) == 0x18d7f4u)) {
+        env->npe_render_object_context_failure_count++;
+        env->npe_render_object_context_failure_from = from & MASK24;
+    }
+    if (env->npe_render_object_watch_active &&
+        env->npe_render_object_context_calls && target == 0x30a600u) {
+        env->npe_render_object_context_trampoline_entries++;
+        env->npe_render_object_context_trampoline_from = from & MASK24;
+        env->npe_render_object_context_trampoline_word = word;
+        env->npe_render_object_context_trampoline_sp = sp & MASK16;
+        env->npe_render_object_context_trampoline_fp = fp & MASK16;
+        env->npe_render_object_context_trampoline_r0 =
+            env->gpr[0] & MASK16;
+    }
+    /* The compositor was copied byte-for-byte from 30:9444 to resident
+     * 13:9444.  Observe the four relocation boundaries needed to prove
+     * whether a child return enters the resident epilogue or its source
+     * alias.  This probe is read-only and bounded to the first render object. */
+    if (env->npe_render_object_watch_active &&
+        env->npe_render_object_context_calls && target == 0x139444u) {
+        env->npe_render_object_compositor_entries++;
+        env->npe_render_object_compositor_entry_from = from & MASK24;
+        env->npe_render_object_compositor_entry_word = word;
+        env->npe_render_object_compositor_entry_sp = sp & MASK16;
+        env->npe_render_object_compositor_entry_fp = fp & MASK16;
+    }
+    if (env->npe_render_object_watch_active &&
+        env->npe_render_object_context_calls &&
+        (from & MASK24) == 0x13a5e8u && target == 0x1c188eu) {
+        env->npe_render_object_compositor_child_calls++;
+        env->npe_render_object_compositor_child_from = from & MASK24;
+        env->npe_render_object_compositor_child_word = word;
+        env->npe_render_object_compositor_child_sp = sp & MASK16;
+        env->npe_render_object_compositor_child_fp = fp & MASK16;
+    }
+    if (env->npe_render_object_watch_active &&
+        env->npe_render_object_context_calls && target == 0x13a5ecu &&
+        !((from & MASK24) >= 0x139444u &&
+          (from & MASK24) <= 0x13a600u)) {
+        env->npe_render_object_compositor_resident_returns++;
+        env->npe_render_object_compositor_resident_return_from =
+            from & MASK24;
+        env->npe_render_object_compositor_resident_return_word = word;
+        env->npe_render_object_compositor_resident_return_sp = sp & MASK16;
+        env->npe_render_object_compositor_resident_return_fp = fp & MASK16;
+    }
+    if (env->npe_render_object_watch_active &&
+        env->npe_render_object_context_calls &&
+        target >= 0x309444u && target <= 0x30a600u &&
+        !((from & MASK24) >= 0x309444u &&
+          (from & MASK24) <= 0x30a600u)) {
+        unsigned index;
+
+        if (!env->npe_render_object_compositor_source_entries) {
+            env->npe_render_object_compositor_source_entry_from =
+                from & MASK24;
+            env->npe_render_object_compositor_source_entry_target = target;
+            env->npe_render_object_compositor_source_entry_word = word;
+            env->npe_render_object_compositor_source_entry_sp = sp & MASK16;
+            env->npe_render_object_compositor_source_entry_fp = fp & MASK16;
+            env->npe_render_object_compositor_source_entry_r0 =
+                env->gpr[0] & MASK16;
+            for (index = 0; index < DMCU_NPE_RENDER_OBJECT_STACK_WORDS;
+                 index++) {
+                env->npe_render_object_compositor_source_entry_stack[index] =
+                    internal_data_read((sp + index * 2u) & MASK16, 16);
+            }
+        }
+        env->npe_render_object_compositor_source_entries++;
+    }
+    if (env->npe_operation_callback_watch_active &&
+        env->npe_render_object_context_calls && target == 0x1b2602u) {
+        env->npe_render_object_context_returns++;
+        env->npe_render_object_context_return_from = from & MASK24;
+        env->npe_render_object_context_return_word = word;
+        env->npe_render_object_context_return_sp = sp & MASK16;
+        env->npe_render_object_context_return_fp = fp & MASK16;
+        env->npe_render_object_context_result =
+            env->gpr[0] & MASK16;
+        env->npe_operation_callbacks_installed_valid = true;
+        env->npe_operation_callbacks_object_hi = 0;
+        env->npe_operation_callbacks_object_lo =
+            env->npe_render_object_base;
+        snapshot_npe_operation_callbacks(
+            env->npe_operation_callbacks_object_hi,
+            env->npe_operation_callbacks_object_lo,
+            env->npe_operation_callbacks_installed);
+    }
+
+    /* Record whether the generic renderer and event loop ever dispatch the
+     * two callbacks which 18:CFA8 installed.  22:147A is the constructor
+     * value, 23:147A is the value observed after 1C:D462 layout, and
+     * 28:DDA6 is the input callback.  Only non-sequential entries count, so
+     * ordinary execution through 23:147A cannot masquerade as a callback. */
+    if (env->npe_operation_callback_watch_active && target != sequential) {
+        static const uint32_t callback_target[
+            DMCU_NPE_OPERATION_CALLBACK_SLOTS] = {
+            0x22147au, 0x23147au, 0x28dda6u,
+        };
+        unsigned callback;
+
+        for (callback = 0;
+             callback < DMCU_NPE_OPERATION_CALLBACK_SLOTS; callback++) {
+            if (target == callback_target[callback]) {
+                unsigned index;
+
+                env->npe_operation_callback_calls[callback]++;
+                env->npe_operation_callback_from[callback] = from & MASK24;
+                env->npe_operation_callback_word[callback] = word;
+                env->npe_operation_callback_sp[callback] = sp;
+                env->npe_operation_callback_fp[callback] = fp;
+                for (index = 0;
+                     index < DMCU_NPE_OPERATION_CALLBACK_STACK_WORDS;
+                     index++) {
+                    env->npe_operation_callback_stack[callback][index] =
+                        internal_data_read((sp + index * 2u) & MASK16, 16);
+                }
+                break;
+            }
+        }
+    }
+    if (env->npe_operation_callback_watch_active &&
+        (from & MASK24) == 0x1b2748u && target == 0x111752u &&
+        (word >> 8) == 0xbdu) {
+        env->npe_operation_event_loop_calls++;
+        env->npe_operation_event_loop_entry_sp = sp;
+        env->npe_operation_event_loop_entry_fp = fp;
+    }
+    if (env->npe_operation_callback_watch_active &&
+        env->npe_operation_event_loop_calls >
+            env->npe_operation_event_loop_returns &&
+        target == 0x1b274cu) {
+        env->npe_operation_event_loop_returns++;
+        env->npe_operation_event_loop_return_from = from & MASK24;
+        env->npe_operation_event_loop_return_sp = sp;
+        env->npe_operation_event_loop_return_fp = fp;
+        env->npe_operation_callback_watch_active = false;
+    }
+    if (env->npe_render_object_watch_active &&
+        (from & MASK24) == 0x1b2732u && target == 0x21cef4u &&
+        (word >> 8) == 0xbdu) {
+        env->npe_render_object_calls++;
+        env->npe_render_object_caller = from & MASK24;
+        env->npe_render_object_entry_sp = sp & MASK16;
+        env->npe_render_object_entry_fp = fp & MASK16;
+        env->npe_render_object_arg_hi =
+            internal_data_read(sp & MASK16, 16);
+        env->npe_render_object_arg_lo =
+            internal_data_read((sp + 2u) & MASK16, 16);
+        snapshot_npe_render_object(
+            env, env->npe_render_object_before);
+        env->npe_render_object_before_valid = true;
+    }
+    if (env->npe_render_object_watch_active &&
+        (word >> 8) == 0xacu &&
+        ((from & MASK24) == 0x21cff2u ||
+         (from & MASK24) == 0x21d19cu)) {
+        unsigned branch = (from & MASK24) == 0x21cff2u ? 0u : 1u;
+
+        env->npe_render_object_branch_count[branch]++;
+        env->npe_render_object_branch_from[branch] = from & MASK24;
+        env->npe_render_object_branch_target[branch] = target;
+        env->npe_render_object_branch_psw[branch] = env->psw & MASK16;
+        env->npe_render_object_branch_r0[branch] =
+            env->gpr[0] & MASK16;
+    }
+    if (env->npe_render_object_watch_active &&
+        ((from & MASK24) == 0x1d8a20u ||
+         (from & MASK24) == 0x21d12eu ||
+         (from & MASK24) == 0x21d17au) && target == 0x2c8744u &&
+        (word >> 8) == 0xbdu) {
+        env->npe_render_object_layout_calls++;
+    }
+    if (env->npe_render_object_watch_active &&
+        (from & MASK24) == 0x21d3feu && target == 0x2e2b6eu &&
+        (word >> 8) == 0xbdu) {
+        env->npe_render_object_helper_tail_calls++;
+    }
+    if (env->npe_render_object_watch_active &&
+        (from & MASK24) == 0x21d428u && target == 0x1b2736u &&
+        word == 0xc620u) {
+        env->npe_render_object_returns++;
+        env->npe_render_object_return_from = from & MASK24;
+        env->npe_render_object_return_target = target;
+        env->npe_render_object_return_sp =
+            env->gpr[DMCU_SP] & MASK16;
+        env->npe_render_object_return_fp =
+            env->gpr[DMCU_FP] & MASK16;
+        snapshot_npe_render_object(env, env->npe_render_object_after);
+        env->npe_render_object_after_valid = true;
+        env->npe_render_object_watch_active = false;
+    }
+
+    /* Preserve the first complete decision path through the exact restored
+     * 28:94C2 result/resource scanner.  The generic control ring is useful
+     * after the directory read, but the following modal loop eventually
+     * replaces its earliest evidence.  This bounded trace records only the
+     * scanner's own SCALLs, AJMPs, their returns, and the final RETS.  All
+     * captured values are read-only observations of architectural state.
+     *
+     * Local layout from the exact 45:94C2 source image:
+     *   0 count(-5A), 1 first-handle(-5C), 2:3 first-pointer(-0C:-0A),
+     *   4 second-handle(-5E), 5:6 second-pointer(-08:-06),
+     *   7 table(-60), 8 success(-56), 9 index(-04), 10 flags(-01),
+     *   11:12 temporary object(-54:-52), 13 validation byte(-57).
+     */
+    {
+        const uint32_t scanner_start = 0x2894c2u;
+        const uint32_t scanner_end = 0x2897b6u;
+        uint32_t scanner_from = from & MASK24;
+        bool scanner_entry = target == scanner_start;
+        bool scanner_from_body = scanner_from >= scanner_start &&
+                                 scanner_from < scanner_end;
+        bool scanner_return = target > scanner_start &&
+                              target < scanner_end &&
+                              !scanner_from_body;
+        bool scanner_control = scanner_from_body &&
+                               ((word >> 8) == 0xbdu ||
+                                (word >> 8) == 0xacu ||
+                                word == 0xc620u);
+
+        if (scanner_entry) {
+            env->result_scanner_calls++;
+            if (env->result_scanner_calls == 1u) {
+                env->result_scanner_trace_active = true;
+                env->result_scanner_frame_fp = 0;
+            }
+        }
+        if (env->result_scanner_trace_active &&
+            (scanner_entry || scanner_control || scanner_return) &&
+            env->result_scanner_trace_count <
+                DMCU_RESULT_SCANNER_TRACE_SLOTS) {
+            static const uint16_t local_offsets[
+                DMCU_RESULT_SCANNER_LOCAL_WORDS] = {
+                0xffa6u, 0xffa4u, 0xfff4u, 0xfff6u,
+                0xffa2u, 0xfff8u, 0xfffau, 0xffa0u,
+                0xffaau, 0xfffcu, 0xffffu, 0xffacu,
+                0xffaeu, 0xffa9u,
+            };
+            uint32_t slot = env->result_scanner_trace_count++;
+            bool frame_valid;
+            unsigned local;
+
+            if (!env->result_scanner_frame_fp && scanner_from_body &&
+                word != 0xc620u) {
+                env->result_scanner_frame_fp = fp;
+            }
+            frame_valid = env->result_scanner_frame_fp != 0 &&
+                          fp == env->result_scanner_frame_fp;
+            env->result_scanner_trace_from[slot] = scanner_from;
+            env->result_scanner_trace_target[slot] = target;
+            env->result_scanner_trace_word[slot] = word;
+            env->result_scanner_trace_pre_sp[slot] = sp;
+            env->result_scanner_trace_post_sp[slot] =
+                env->gpr[DMCU_SP] & MASK16;
+            env->result_scanner_trace_fp[slot] = fp;
+            env->result_scanner_trace_r0[slot] = env->gpr[0] & MASK16;
+            env->result_scanner_trace_r1[slot] = env->gpr[1] & MASK16;
+            env->result_scanner_trace_locals_valid[slot] = frame_valid;
+            for (local = 0; local < DMCU_RESULT_SCANNER_LOCAL_WORDS;
+                 local++) {
+                if (!frame_valid) {
+                    env->result_scanner_trace_locals[slot][local] = 0;
+                } else if (local == 10u || local == 13u) {
+                    env->result_scanner_trace_locals[slot][local] =
+                        internal_data_read(
+                            (fp + local_offsets[local]) & MASK16, 8);
+                } else {
+                    env->result_scanner_trace_locals[slot][local] =
+                        internal_data_read(
+                            (fp + local_offsets[local]) & MASK16, 16);
+                }
+            }
+        }
+        if (env->result_scanner_trace_active && scanner_from == 0x2897b4u &&
+            word == 0xc620u) {
+            env->result_scanner_returns++;
+            env->result_scanner_trace_active = false;
+        }
+    }
+
+    /* The scanner's first child should create the result list for selector
+     * 8.  Preserve the architectural inputs and the signed-bound decision
+     * made by exact routine 31:9E18, plus whether it reaches allocator
+     * 1E:6444.  trace_control_transfer() receives the pre-instruction SP/FP
+     * while env contains post-instruction state, so both sides of SCALL,
+     * LINK and RETS can be compared without writing guest state. */
+    {
+        const uint32_t list_create_start = 0x319e18u;
+        uint32_t list_from = from & MASK24;
+        bool list_entry = target == list_create_start &&
+                          list_from == 0x2894d0u;
+
+        if (list_entry) {
+            env->result_list_create_calls++;
+            if (env->result_list_create_calls == 1u) {
+                env->result_list_create_trace_active = true;
+                env->result_list_create_caller = list_from;
+                env->result_list_create_entry_sp = sp;
+                env->result_list_create_entry_post_sp =
+                    env->gpr[DMCU_SP] & MASK16;
+                env->result_list_create_entry_fp = fp;
+                env->result_list_create_entry_arg =
+                    internal_data_read(sp, 16);
+            }
+        }
+        if (env->result_list_create_trace_active &&
+            list_from == list_create_start && word == 0x2e03u) {
+            env->result_list_create_link_sp =
+                env->gpr[DMCU_SP] & MASK16;
+            env->result_list_create_link_old_fp = fp;
+            env->result_list_create_frame_fp =
+                env->gpr[DMCU_FP] & MASK16;
+        }
+        if (env->result_list_create_trace_active &&
+            list_from == 0x319e34u && word == 0xac0eu) {
+            env->result_list_create_frame_arg_word =
+                internal_data_read((fp + 6u) & MASK16, 16);
+            env->result_list_create_frame_arg_byte =
+                internal_data_read((fp + 6u) & MASK16, 8);
+            env->result_list_create_compare_r0 = env->gpr[0] & MASK16;
+            env->result_list_create_compare_psw = env->psw & 0xffffu;
+            env->result_list_create_compare_target = target;
+        }
+        if (env->result_list_create_trace_active &&
+            target == 0x1e6444u) {
+            env->result_list_create_allocator_calls++;
+        }
+        if (target == 0x1e6444u && (word & 0xff00u) == 0xbd00u) {
+            env->pim_current_caller = list_from;
+        }
+        if (env->result_list_create_trace_active &&
+            list_from == 0x319ebeu && word == 0xc620u) {
+            env->result_list_create_returns++;
+            env->result_list_create_return_target = target;
+            env->result_list_create_return_sp = sp;
+            env->result_list_create_return_post_sp =
+                env->gpr[DMCU_SP] & MASK16;
+            env->result_list_create_return_fp = fp;
+            env->result_list_create_return_r0 = env->gpr[0] & MASK16;
+            env->result_list_create_return_r1 = env->gpr[1] & MASK16;
+            env->result_list_create_trace_active = false;
+        }
+
+        /* Resident 1E:6444 has finished building its 0x40-byte NOAHPIM
+         * header and pathname when it reaches the first mode branch at
+         * 1E:6594.  Retain only the latest bounded, read-only snapshot so
+         * missing factory files can be reconstructed from guest data rather
+         * than guessed or copied into the framebuffer. */
+        if (list_from == 0x1e6594u && word == 0xac01u) {
+            uint32_t trace_slot = env->pim_header_snapshots %
+                                  DMCU_PIM_TRACE_SLOTS;
+            unsigned index;
+
+            env->pim_trace_caller[trace_slot] = env->pim_current_caller;
+            env->pim_trace_fp[trace_slot] = fp;
+            env->pim_trace_category[trace_slot] =
+                internal_data_read((fp + 6u) & MASK16, 8);
+            env->pim_trace_mode[trace_slot] =
+                internal_data_read((fp + 8u) & MASK16, 8);
+            for (index = 0; index < sizeof(env->pim_trace_path[trace_slot]);
+                 index++) {
+                env->pim_trace_path[trace_slot][index] = internal_data_read(
+                    (fp - 0x88u + index) & MASK16, 8);
+            }
+            env->pim_header_snapshots++;
+            env->pim_header_fp = fp;
+            env->pim_header_category =
+                internal_data_read((fp + 6u) & MASK16, 8);
+            env->pim_header_mode =
+                internal_data_read((fp + 8u) & MASK16, 8);
+            for (index = 0; index < sizeof(env->pim_header); index++) {
+                env->pim_header[index] = internal_data_read(
+                    (fp - 0x40u + index) & MASK16, 8);
+            }
+            for (index = 0; index < sizeof(env->pim_header_path); index++) {
+                env->pim_header_path[index] = internal_data_read(
+                    (fp - 0x88u + index) & MASK16, 8);
+            }
+        }
+    }
+
+    /* The exact 1B:23B8 browser allocates four 0x100-byte work tables before
+     * it can render a directory.  The first allocator return has been seen
+     * with R0=1, but the corresponding NZ success target was absent from the
+     * stable application trace.  Bind read-only snapshots to the four static
+     * return and branch PCs so an interrupt/register fault can be separated
+     * from condition-code or instruction-flow faults without changing the
+     * guest.  AJMP does not modify PSW, so env->psw here is the state produced
+     * by the immediately preceding CMP.
+     */
+    {
+        static const uint32_t return_pc[
+            DMCU_OPERATION_BROWSER_ALLOC_SLOTS] = {
+            0x1b23f4u, 0x1b2426u, 0x1b2458u, 0x1b248au,
+        };
+        static const uint32_t branch_pc[
+            DMCU_OPERATION_BROWSER_ALLOC_SLOTS] = {
+            0x1b23f8u, 0x1b242au, 0x1b245cu, 0x1b248eu,
+        };
+        uint32_t browser_from = from & MASK24;
+        unsigned slot;
+
+        for (slot = 0; slot < DMCU_OPERATION_BROWSER_ALLOC_SLOTS; slot++) {
+            if (browser_from == 0x314a30u &&
+                target == return_pc[slot]) {
+                env->operation_browser_alloc_returns++;
+                env->operation_browser_alloc_return_from[slot] =
+                    browser_from;
+                env->operation_browser_alloc_return_target[slot] = target;
+                env->operation_browser_alloc_return_sp[slot] = sp;
+                env->operation_browser_alloc_return_post_sp[slot] =
+                    env->gpr[DMCU_SP] & MASK16;
+                env->operation_browser_alloc_return_fp[slot] = fp;
+                env->operation_browser_alloc_return_r0[slot] =
+                    env->gpr[0] & MASK16;
+                env->operation_browser_alloc_return_r1[slot] =
+                    env->gpr[1] & MASK16;
+                env->operation_browser_alloc_return_psw[slot] =
+                    env->psw & 0xffffu;
+                env->operation_browser_alloc_return_in_interrupt[slot] =
+                    env->in_interrupt;
+            }
+            if (browser_from == branch_pc[slot] && word == 0xac02u) {
+                env->operation_browser_alloc_decisions++;
+                env->operation_browser_alloc_decision_from[slot] =
+                    browser_from;
+                env->operation_browser_alloc_decision_sequential[slot] =
+                    sequential & MASK24;
+                env->operation_browser_alloc_decision_target[slot] = target;
+                env->operation_browser_alloc_decision_sp[slot] = sp;
+                env->operation_browser_alloc_decision_post_sp[slot] =
+                    env->gpr[DMCU_SP] & MASK16;
+                env->operation_browser_alloc_decision_fp[slot] = fp;
+                env->operation_browser_alloc_decision_r0[slot] =
+                    env->gpr[0] & MASK16;
+                env->operation_browser_alloc_decision_r1[slot] =
+                    env->gpr[1] & MASK16;
+                env->operation_browser_alloc_decision_psw[slot] =
+                    env->psw & 0xffffu;
+                env->operation_browser_alloc_decision_in_interrupt[slot] =
+                    env->in_interrupt;
+            }
+        }
+    }
+
+    /* The file-browser controller has several branch-specific call sites in
+     * segment 2C which all reach resident 1C:D462 with an object in R0:R1.
+     * Their calls may precede the physical directory-page DMA completion, so
+     * bind this object trace to the exact guest target and controller segment
+     * rather than to NAND timing or one branch address.  Preserve the first
+     * few complete before/after objects without altering guest-visible state. */
+    if (dmcu_code_segment(from) == 0x2cu &&
+        (word >> 8) == 0xbdu &&
+        target == 0x1cd462u) {
+        uint32_t sequence = env->npe_browser_layout_calls++;
+
+        /* Preserve the bounded call/return path beginning at this exact
+         * browser-layout entry.  The earlier NAND-completion trace describes
+         * the parser, but can finish before this controller call. */
+        env->control_trace_count = 0;
+        env->control_trace_frozen = false;
+        env->npe_directory_trace_remaining = DMCU_CONTROL_TRACE_WORDS;
+
+        if (sequence < DMCU_NPE_BROWSER_LAYOUT_TRACE_SLOTS &&
+            env->npe_browser_layout_depth <
+                DMCU_NPE_BROWSER_LAYOUT_TRACE_DEPTH) {
+            uint16_t slot = sequence;
+            uint16_t object_hi = env->gpr[0] & MASK16;
+            uint16_t object_lo = env->gpr[1] & MASK16;
+            uint32_t object = ((uint32_t)object_hi << 16) | object_lo;
+            unsigned index;
+
+            if (env->npe_operation_callback_watch_active) {
+                env->npe_operation_layout_calls++;
+                env->npe_operation_layout_object_hi = object_hi;
+                env->npe_operation_layout_object_lo = object_lo;
+                snapshot_npe_operation_callbacks(
+                    object_hi, object_lo, env->npe_operation_layout_before);
+            }
+
+            env->npe_browser_layout_active[
+                env->npe_browser_layout_depth++] = slot;
+            env->npe_browser_layout_caller[slot] = from & MASK24;
+            env->npe_browser_layout_object[slot] = object & MASK24;
+            env->npe_browser_layout_entry_sp[slot] = sp & MASK16;
+            env->npe_browser_layout_entry_fp[slot] = fp & MASK16;
+            env->npe_browser_layout_return_target[slot] = 0;
+            env->npe_browser_layout_return_sp[slot] = 0;
+            env->npe_browser_layout_return_fp[slot] = 0;
+            env->npe_browser_layout_returned[slot] = false;
+            for (index = 0; index < 4; index++) {
+                env->npe_browser_layout_entry_gpr[slot][index] =
+                    env->gpr[index] & MASK16;
+                env->npe_browser_layout_return_gpr[slot][index] = 0;
+            }
+            env->npe_browser_layout_object_valid[slot] =
+                (object_hi & 0xff00u) == 0;
+            if (env->npe_browser_layout_object_valid[slot]) {
+                for (index = 0;
+                     index < DMCU_NPE_BROWSER_LAYOUT_OBJECT_WORDS; index++) {
+                    env->npe_browser_layout_before[slot][index] =
+                        address_space_lduw_le(
+                            &address_space_memory,
+                            (object + index * 2u) & MASK24,
+                            MEMTXATTRS_UNSPECIFIED, NULL);
+                }
+            }
+        }
+    }
+    /* Besides its local 1C:DBEE epilogue, this branch can finish through the
+     * shared 2E:393A -> 24:1342 tail.  The currently observed Game World arm
+     * uses another shared epilogue at 31:4474; both deliberately return to
+     * the segment-2C call site's next instruction rather than to 1C locally. */
+    if (env->npe_browser_layout_depth &&
+        ((from == 0x1cdbeeu && word == 0xc620u) ||
+         (from == 0x241504u && word == 0xc620u &&
+          target == ((env->npe_browser_layout_caller[
+              env->npe_browser_layout_active[
+                  env->npe_browser_layout_depth - 1u]] + 4u) & MASK24)) ||
+         (from == 0x314474u && word == 0xc620u &&
+          target == ((env->npe_browser_layout_caller[
+              env->npe_browser_layout_active[
+                  env->npe_browser_layout_depth - 1u]] + 4u) & MASK24)))) {
+        uint16_t slot = env->npe_browser_layout_active[
+            --env->npe_browser_layout_depth];
+        unsigned index;
+
+        env->npe_browser_layout_return_target[slot] = target;
+        env->npe_browser_layout_return_sp[slot] =
+            env->gpr[DMCU_SP] & MASK16;
+        env->npe_browser_layout_return_fp[slot] =
+            env->gpr[DMCU_FP] & MASK16;
+        for (index = 0; index < 4; index++) {
+            env->npe_browser_layout_return_gpr[slot][index] =
+                env->gpr[index] & MASK16;
+        }
+        if (env->npe_browser_layout_object_valid[slot]) {
+            uint32_t object = env->npe_browser_layout_object[slot] & MASK24;
+
+            for (index = 0;
+                 index < DMCU_NPE_BROWSER_LAYOUT_OBJECT_WORDS; index++) {
+                env->npe_browser_layout_after[slot][index] =
+                    address_space_lduw_le(
+                        &address_space_memory,
+                        (object + index * 2u) & MASK24,
+                        MEMTXATTRS_UNSPECIFIED, NULL);
+            }
+        }
+        if (env->npe_operation_callback_watch_active &&
+            env->npe_operation_layout_calls >
+                env->npe_operation_layout_returns) {
+            uint32_t object = env->npe_browser_layout_object[slot] & MASK24;
+
+            env->npe_operation_layout_returns++;
+            env->npe_operation_layout_object_hi =
+                (object >> 16) & MASK16;
+            env->npe_operation_layout_object_lo = object & MASK16;
+            snapshot_npe_operation_callbacks(
+                env->npe_operation_layout_object_hi,
+                env->npe_operation_layout_object_lo,
+                env->npe_operation_layout_after);
+        }
+        env->npe_browser_layout_returned[slot] = true;
+    }
+
+    /* The complete 29:24C6/46:24C6 function removes one 14-byte record from
+     * the 51:1F90 foreground ring.  Log only non-empty calls so idle polling
+     * cannot exhaust the trace before a real B0 request arrives. */
+    if ((word >> 8) == 0xbdu && target == 0x2924c6u &&
+        foreground_event_dequeue_logs < 64u) {
+        uint16_t count = address_space_lduw_le(
+            &address_space_memory, 0x511f90u,
+            MEMTXATTRS_UNSPECIFIED, NULL);
+
+        if (count != 0) {
+            qemu_log_mask(
+                LOG_UNIMP,
+                "DMCU foreground event dequeue #%u from=%02x:%04x "
+                "count=%04x sp=%04x fp=%04x "
+                "R0=%04x R1=%04x R2=%04x R3=%04x\n",
+                foreground_event_dequeue_logs + 1u,
+                dmcu_code_segment(from), dmcu_code_pc(from), count,
+                sp & MASK16, fp & MASK16,
+                env->gpr[0] & MASK16, env->gpr[1] & MASK16,
+                env->gpr[2] & MASK16, env->gpr[3] & MASK16);
+            foreground_event_dequeue_logs++;
+        }
+    }
 
     /* These are the first instructions after each nested formatter call.
      * ADD SP leaves R0/R1 untouched, so the values observed here are the
@@ -4559,6 +12023,22 @@ static void trace_control_transfer(CPUDMCUState *env, uint32_t from,
             input_hi, input_lo, input_byte & 0xffu, length,
             env->gpr[0] & MASK16, env->gpr[1] & MASK16);
         file_path_component_steps++;
+    }
+    if (env->file_component_watch_active && target == 0x28d810u) {
+        uint32_t output =
+            (((uint32_t)env->file_component_output_hi << 16) |
+             env->file_component_output_lo) & MASK24;
+        unsigned index;
+
+        for (index = 0; index < DMCU_FILE_RECORD_SELECTOR_BYTES; index++) {
+            env->file_component_output_after_fill[index] =
+                env->file_component_output_hi == 0 ?
+                internal_data_read((env->file_component_output_lo + index) &
+                                   MASK16, 8) :
+                address_space_ldub(&address_space_memory,
+                                   ((output + index) & MASK24) ^ 1u,
+                                   MEMTXATTRS_UNSPECIFIED, NULL);
+        }
     }
 
     /* Bounded branch/call milestones for the recovered operation
@@ -4765,193 +12245,6 @@ static void trace_control_transfer(CPUDMCUState *env, uint32_t from,
             dmcu_code_segment(target), dmcu_code_pc(target));
         foreground_status_return_logs++;
     }
-    static const uint32_t application_targets[
-        DMCU_APPLICATION_TRACE_ENTRIES] = {
-        0x2d7dd2u, /* recovered top-level application dispatcher */
-        0x2d7e52u, /* return from the one-shot application initializer */
-        0x2b2f44u, /* system/storage registry initializer */
-        0x2d7f06u, /* return from the system/storage registry initializer */
-        0x2d7f44u, /* return from 31:706a */
-        0x2d7f48u, /* return from 33:4ee2 */
-        0x2d7f4cu, /* return from 33:0fd6 */
-        0x2d7f62u, /* return from 29:13dc */
-        0x2d7f66u, /* return from 32:cfcc */
-        0x2d7f6au, /* return from 33:6f30 */
-        0x2d7f7cu, /* return from 32:f47a */
-        0x2902d8u, /* storage-capacity scan */
-        0x229738u, /* one-shot application initializer */
-        0x22515eu, /* application main loop */
-        0x225170u, /* return from 32:9a9a */
-        0x225174u, /* return from 33:65c0 */
-        0x225188u, /* return from 29:13dc */
-        0x22518eu, /* return from 33:6f3c */
-        0x225192u, /* return from 32:c86e */
-        0x22519eu, /* return from 2d:b54c */
-        0x2251aau, /* return from 32:50ba */
-        0x2251b4u, /* return from 33:4a84 */
-        0x2251bau, /* return from 32:f65a */
-        0x2251beu, /* return from 08:4360 */
-        0x32512cu, /* resource FILE driver */
-        0x2ebe2eu, /* resource FILE attach */
-        0x2ebe42u, /* resource attach: return from file-size query */
-        0x2ebe6eu, /* resource attach: return from resident file open */
-        0x2ebf4eu, /* resource attach: return from first path check */
-        0x2ebf72u, /* resource attach: return from second path check */
-        0x2ebf94u, /* resource attach: common return */
-        0x30c99eu, /* file-size trampoline */
-        0x31339au, /* file-size record scanner entry */
-        0x3133c8u, /* file-size scanner: return from path resolver */
-        0x3133d0u, /* file-size scanner: path resolver failed */
-        0x3133f6u, /* file-size scanner: return from directory record scan */
-        0x313424u, /* file-size scanner: record/attribute failure */
-        0x31343cu, /* file-size scanner: valid regular-file record */
-        0x31345au, /* file-size scanner: common return */
-        0x30c9a2u, /* resident-file-open wrapper */
-        0x1bce3cu, /* resident resource initializer */
-        0x23a38cu, /* exact application-context selector */
-        0x1bd492u, /* return from application-context selector */
-        0x1f1f1au, /* resident filesystem open routine */
-        0x333376u, /* hardware-state predicate before application loop */
-        0x0e75bau, /* non-returning resident application loop */
-        0x22522au, /* loop: return from 32:f65a */
-        0x22522eu, /* loop: return from 30:8c1c */
-        0x225232u, /* loop: return from 33:5090 */
-        0x225236u, /* loop: return from 33:4ef8 */
-        0x22523au, /* loop: return from 33:5d76 */
-        0x22542au, /* loop: return from 32:2930 */
-        0x22542eu, /* loop: return from 32:342e */
-        0x225432u, /* loop: return from 33:4ee2 */
-        0x225436u, /* loop: return from 33:43ce */
-        0x336f30u, /* top-level post-registry hook entry */
-        0x32f47au, /* top-level timer/config entry */
-        0x030084u, /* inferred scheduler: return from top-level dispatcher */
-        0x2d7f80u, /* unexpected return from non-returning application loop */
-        0x334f50u, /* factory linked reset preamble */
-        0x33603cu, /* factory linked SP/FP/compiler-start preamble */
-        0x114560u, /* linked 261-descriptor compiler initializer */
-        0x077fe4u, /* linked nine-descriptor constant initializer */
-        0x03026au, /* linked exact system main */
-        0x2e2e82u, /* shared compiler epilogue: identify the unwinding caller */
-        0x31d3bau, /* foreground copy helper: capture caller and arguments */
-        0x2fc59au, /* foreground parent reached from the main status loop */
-        0x5f16f6u, /* relocated foreground context/status predicate */
-        0x31345eu, /* foreground asynchronous-state branch */
-        0x22381eu, /* alternate foreground asynchronous-state branch */
-        0x202de0u, /* foreground UI/event loop */
-        0x20be12u, /* modal loading task entry */
-        0x20bee0u, /* modal loading task event-loop head */
-        0x20bf00u, /* return from the resident event dispatcher */
-        0x20c336u, /* modal loading task exit path */
-        0x08441au, /* resident byte-fill primitive */
-        0x301a54u, /* rectangle/region compositor entry */
-        0x332562u, /* foreground event-gate entry */
-        0x202e30u, /* return from the foreground event gate */
-        0x324c34u, /* foreground event-ready predicate */
-        0x202e34u, /* return from the event-ready predicate */
-        0x295126u, /* installed cursor/redraw refresh routine */
-        0x294c86u, /* unrelated flat JPEG-parser exit; should be unreachable */
-        0x294df4u, /* unrelated flat JPEG-parser entry; should be unreachable */
-        0x334eccu, /* exact matrix-index to application-event mapper */
-        0x202e9eu, /* foreground return from the event mapper */
-        0x277d8au, /* resource/text stream worker reached through callback */
-        0x334510u, /* outer resident event-handler dispatch */
-        0x0300a6u, /* return to the caller-constrained outer event loop */
-        0x2b9178u, /* application root-object constructor */
-        0x279892u, /* parent which invokes the root-object constructor */
-        0x503870u, /* one-valued wrapper around the constructor parent */
-        0x503892u, /* zero-valued wrapper around the constructor parent */
-        0x325accu, /* validation checksum which guards resource decoding */
-        0x335906u, /* mode-mask helper: diagnose its far return frame */
-        0x33529eu, /* flat shared epilogue entered by outer paths */
-        0x3352aau, /* flat large copy/convert body: diagnose its caller */
-        0x3357e2u, /* flat copy/convert shared entry A */
-        0x335b9au, /* flat copy/convert shared entry B */
-        0x3358dau, /* flat copy/convert shared callback path */
-        0x1fb496u, /* resident application-event dispatcher */
-        0x1b23f4u, /* return from first operation-0x0b table allocation */
-        0x1b2400u, /* first operation-0x0b allocation succeeded */
-        0x1b2c46u, /* operation-0x0b cleanup path */
-        0x2578eau, /* heap walker requests a descriptor bit */
-        0x2578eeu, /* return from descriptor-bit allocator */
-        0x2579aau, /* heap descriptor allocation failed */
-        0x30251eu, /* descriptor-bit allocator entry */
-        0x302624u, /* descriptor-bit allocator exhausted */
-        0x302626u, /* descriptor-bit allocator epilogue */
-        0x31f2d8u, /* modal loop return from low-level event helper */
-        0x31f2feu, /* modal loop accepted an event and is exiting */
-        0x32c476u, /* modal-object cleanup wrapper */
-        0x2b758eu, /* shared cleanup tail entered with the caller's frame */
-        0x2b54e6u, /* continuation selected by the shared cleanup tail */
-        0x2885eeu, /* first helper called by the shared cleanup tail */
-        0x203390u, /* second helper called by the shared cleanup tail */
-        0x2894c2u, /* result/resource scanner entry */
-        0x3351e0u, /* result scanner resource-handle lookup wrapper */
-        0x3351f2u, /* result scanner handle-to-pointer wrapper */
-        0x3366e2u, /* display/state refresh thunk */
-        0x318f74u, /* result-record preparation/sort wrapper */
-        0x241f02u, /* shared byte-sort tail */
-        0x2ed34au, /* exact post-foreground launch sequence */
-        0x2ed38au, /* return from first launch FILE open */
-        0x2ed3c0u, /* return from second launch FILE open */
-        0x2ed3e0u, /* return from launch FILE-size wrapper */
-        0x2ed404u, /* null primary FILE branch */
-        0x2ed420u, /* primary FILE opened; enter launch-manager path */
-        0x1821f4u, /* exact resident application launch manager */
-        0x18232au, /* return from launch-manager resource opener */
-        0x2fe4c8u, /* application-code registry lookup */
-        0x1824aau, /* return from application-code registry lookup */
-        0x2ed456u, /* return from resident launch manager */
-        0x2ed4a6u, /* launch sequence common epilogue */
-        0x2cc9e8u, /* exact generic-menu application entry */
-        0x2cca00u, /* generic menu: descriptor page decoded */
-        0x2ccb32u, /* generic menu: return from page-table builder */
-        0x2ccb48u, /* generic menu: null page-table failure path */
-        0x2ccb5au, /* generic menu: valid page-table success path */
-        0x2ccbb2u, /* generic menu: return from layout/string copy */
-        0x2ccbb6u, /* generic menu: return from menu event handler */
-        0x2ccbc2u, /* generic menu: cleanup complete */
-        0x2a322au, /* exact menu page-table builder entry */
-        0x2a327cu, /* page builder: static maximum-page decoded */
-        0x2a32f2u, /* page builder: dynamic maximum-page decoded */
-        0x2a330au, /* page builder: requested page is valid */
-        0x2a335au, /* page builder: resident static pointer path */
-        0x2a3376u, /* page builder: first packed pointer decoded */
-        0x2a33aau, /* page builder: successor packed pointer decoded */
-        0x2a33b8u, /* page builder: resource-backed pointer path */
-        0x2a3492u, /* page builder: successful result */
-        0x2aa75au, /* return from resident FILE open in validation */
-        0x25ce1eu, /* return from the validation/file-open wrapper */
-        0x2d78b6u, /* allocator: return from first readiness predicate */
-        0x2d78d6u, /* allocator: return from second readiness predicate */
-        0x2d79b0u, /* allocator: return from capacity preparation */
-        0x2d79e2u, /* allocator: return from heap allocation */
-        0x2d7a12u, /* allocator: return from storage status query */
-        0x25ce2eu, /* return from the resource allocator */
-        0x31f6aeu, /* storage update: return from unit initialization */
-        0x31f6c4u, /* storage update: return from maintenance pass */
-        0x31f6dau, /* storage update: return from final commit */
-        0x2aa952u, /* exact factory-default/catalogue routine entry */
-        0x2d8134u, /* caller return from factory-default/catalogue routine */
-        0x330070u, /* text dispatcher: capture bad modal text-pointer caller */
-        0x32082eu, /* record/text adapter: capture the bad source record */
-        0x2d7facu, /* return from persistent startup-selector byte read */
-        0x3343deu, /* return from persistent startup-selector routine */
-        /* Read-only foreground-cycle boundaries.  These retain the value in
-         * R0 at each producer/consumer boundary without changing the event
-         * queue, application selector, or guest timing. */
-        0x202e12u, /* return from the raw foreground event source */
-        0x202e9eu, /* return from the foreground timer/event mapper */
-        0x1df2ecu, /* exact resident root-menu controller entry */
-        0x1df6d8u, /* root controller item-loop decision point */
-        0x1df900u, /* item loop skipped after the ULE comparison */
-        0x10e4aau, /* exact resident hierarchy root-menu renderer entry */
-        0x202f16u, /* event word copied into the decoder local */
-        0x203190u, /* state-transition flag loaded from frame -0x16 */
-        0x203388u, /* foreground loop exit selected by global 51:2250 */
-        0x31f2b2u, /* return from the modal event-ready predicate */
-        0x31f282u, /* exact modal event-loop entry and its calling frame */
-        0x31f2aeu, /* first direct transfer into the modal loop body */
-    };
 
     /* These four linked segment-33 PCs are live fall-through locations in
      * the flat renderer, while their independently-called timer-idle leaves
@@ -5188,6 +12481,66 @@ static void trace_control_transfer(CPUDMCUState *env, uint32_t from,
         log_application_far_words("transfer-window", 0x0051, 0x1840, 16);
         qemu_log_mask(LOG_UNIMP, "\n");
         application_resource_read_return_logs++;
+    }
+
+    /*
+     * The application-manager initializer reads the factory enable byte at
+     * 10:D03F through the NAND-backed resource window.  Earlier boot reads
+     * exhaust the general 16-entry trace before this call is reached, so
+     * retain one address-specific, observer-only sample.  This distinguishes
+     * an FTL/page failure from a byte-lane mismatch without changing guest
+     * registers, memory, or the return value.
+     */
+    if ((env->pc & MASK24) == 0x25206eu) {
+        uint16_t output_high = internal_data_read(sp, 16);
+        uint16_t output_low = internal_data_read((sp + 2u) & MASK16, 16);
+        uint16_t source_high = internal_data_read((sp + 4u) & MASK16, 16);
+        uint16_t source_low = internal_data_read((sp + 6u) & MASK16, 16);
+        uint16_t length = internal_data_read((sp + 8u) & MASK16, 16);
+
+        if (source_high == 0x0010u && source_low == 0xd03fu &&
+            length == 0x0001u) {
+            qemu_log_mask(
+                LOG_UNIMP,
+                "DMCU factory bootstrap flag read entry from=%02x:%04x "
+                "sp=%04x fp=%04x output=%04x:%04x window=%04x",
+                dmcu_code_segment(from), dmcu_code_pc(from), sp, fp,
+                output_high, output_low,
+                address_space_lduw_le(&address_space_memory, 0x5128e0u,
+                                      MEMTXATTRS_UNSPECIFIED, NULL));
+            log_application_far_words("output-before", output_high,
+                                      output_low, 4);
+            log_application_far_words("transfer-window", 0x0051, 0x1840,
+                                      8);
+            qemu_log_mask(LOG_UNIMP, "\n");
+        }
+    }
+
+    if ((env->pc & MASK24) == 0x2520a8u) {
+        uint16_t output_high = internal_data_read((fp + 6u) & MASK16, 16);
+        uint16_t output_low = internal_data_read((fp + 8u) & MASK16, 16);
+        uint16_t source_high = internal_data_read((fp + 10u) & MASK16, 16);
+        uint16_t source_low = internal_data_read((fp + 12u) & MASK16, 16);
+        uint16_t length = internal_data_read((fp + 14u) & MASK16, 16);
+
+        if (source_high == 0x0010u && source_low == 0xd03fu &&
+            length == 0x0001u) {
+            qemu_log_mask(
+                LOG_UNIMP,
+                "DMCU factory bootstrap flag read return from=%02x:%04x "
+                "sp=%04x fp=%04x result=%04x:%04x window=%04x",
+                dmcu_code_segment(from), dmcu_code_pc(from), sp, fp,
+                env->gpr[0] & MASK16, env->gpr[1] & MASK16,
+                address_space_lduw_le(&address_space_memory, 0x5128e0u,
+                                      MEMTXATTRS_UNSPECIFIED, NULL));
+            log_application_far_words("output-after", output_high,
+                                      output_low, 4);
+            log_application_far_words("page-buffer+38", 0x0051, 0x1038,
+                                      16);
+            log_application_far_words("transfer-window+38", 0x0051,
+                                      0x1878, 16);
+            qemu_log_mask(LOG_UNIMP, "\n");
+        }
     }
 
     if ((env->pc & MASK24) == 0x29ac4eu &&
@@ -6135,6 +13488,113 @@ static void trace_control_transfer(CPUDMCUState *env, uint32_t from,
                           op == 0xcc || op == 0xcd || op == 0xce ||
                           op == 0xc6;
 
+    /* The restored resident E0 handler calls the exact input dispatcher at
+     * 15:F2CA -> 11:1752.  Keep a private control-transfer ring for that
+     * lifecycle: the generic ring may already have been frozen by an older
+     * menu/NPE diagnostic before E0 arrives.  This observer records guest
+     * state only.  It never changes a register, stack word, or control edge.
+     */
+    if (!env->in_interrupt &&
+        (from & MASK24) == dmcu_code_address(0x15, 0xf2ca) &&
+        target == dmcu_code_address(0x11, 0x1752)) {
+        unsigned index;
+
+        env->settings_input_dispatch_entries++;
+        env->settings_input_dispatch_active = true;
+        env->settings_input_trace_count = 0;
+        env->settings_input_region_valid = false;
+        for (index = 0; index < DMCU_SETTINGS_INPUT_GPR_WORDS; index++) {
+            env->settings_input_region_gpr[index] = 0;
+        }
+        for (index = 0; index < DMCU_SETTINGS_INPUT_STACK_WORDS; index++) {
+            env->settings_input_region_stack[index] = 0;
+        }
+        for (index = 0; index < DMCU_SETTINGS_INPUT_FRAME_WORDS; index++) {
+            env->settings_input_region_frame[index] = 0;
+        }
+    }
+    if (!env->in_interrupt && env->settings_input_dispatch_active &&
+        call_or_return && target != (sequential & MASK24)) {
+        uint32_t sequence = env->settings_input_trace_count++;
+        uint32_t trace_slot = sequence % DMCU_SETTINGS_INPUT_TRACE_SLOTS;
+
+        env->settings_input_trace_from[trace_slot] = from & MASK24;
+        env->settings_input_trace_target[trace_slot] = target;
+        env->settings_input_trace_word[trace_slot] = word;
+        env->settings_input_trace_sp[trace_slot] = sp;
+        env->settings_input_trace_fp[trace_slot] = fp;
+    }
+    if (!env->in_interrupt && env->settings_input_dispatch_active &&
+        !env->settings_input_region_valid &&
+        target >= dmcu_code_address(0x33, 0x52aa) &&
+        target <= dmcu_code_address(0x33, 0x5ab8) &&
+        target != (sequential & MASK24)) {
+        unsigned index;
+
+        env->settings_input_region_valid = true;
+        env->settings_input_region_from = from & MASK24;
+        env->settings_input_region_target = target;
+        env->settings_input_region_sequential = sequential & MASK24;
+        env->settings_input_region_word = word;
+        env->settings_input_region_ext = ext;
+        env->settings_input_region_sp = sp;
+        env->settings_input_region_post_sp = env->gpr[DMCU_SP] & MASK16;
+        env->settings_input_region_fp = fp;
+        env->settings_input_region_ds0 =
+            env->sfr[DMCU_SFR_DS0] & 0x01ffu;
+        env->settings_input_region_ds1 =
+            env->sfr[DMCU_SFR_DS1] & 0x01ffu;
+        for (index = 0; index < DMCU_SETTINGS_INPUT_GPR_WORDS; index++) {
+            env->settings_input_region_gpr[index] =
+                env->gpr[index] & MASK16;
+        }
+        for (index = 0; index < DMCU_SETTINGS_INPUT_STACK_WORDS; index++) {
+            env->settings_input_region_stack[index] =
+                internal_data_read((sp + index * 2u) & MASK16, 16);
+        }
+        for (index = 0; index < DMCU_SETTINGS_INPUT_FRAME_WORDS; index++) {
+            env->settings_input_region_frame[index] =
+                internal_data_read((fp + index * 2u) & MASK16, 16);
+        }
+    }
+    if (!env->in_interrupt && env->settings_input_dispatch_active &&
+        target == dmcu_code_address(0x15, 0xf2ce)) {
+        env->settings_input_dispatch_returns++;
+        env->settings_input_dispatch_active = false;
+    }
+
+    /* Preserve the first foreground edge into the low segment-51 window.
+     * This range contains the resource bytes currently reached after the NPE
+     * map is drawn.  Record the pre-transfer state before IRQ returns can
+     * replace the useful caller with 08:4126/4278.  Observation only: no
+     * architectural state, memory, or control flow is changed. */
+    if (!env->npe_low51_entry_valid && !env->in_interrupt &&
+        (env->pc & MASK24) >= dmcu_code_address(0x51, 0x0000) &&
+        (env->pc & MASK24) < dmcu_code_address(0x51, 0x2000) &&
+        ((from & MASK24) < dmcu_code_address(0x51, 0x0000) ||
+         (from & MASK24) >= dmcu_code_address(0x51, 0x2000)) &&
+        (env->pc & MASK24) != (sequential & MASK24)) {
+        unsigned index;
+
+        env->npe_low51_entry_valid = true;
+        env->npe_low51_entry_from = from & MASK24;
+        env->npe_low51_entry_target = env->pc & MASK24;
+        env->npe_low51_entry_sequential = sequential & MASK24;
+        env->npe_low51_entry_word = word;
+        env->npe_low51_entry_ext = ext;
+        env->npe_low51_entry_sp = sp;
+        env->npe_low51_entry_fp = fp;
+        env->npe_low51_entry_ds0 = env->sfr[DMCU_SFR_DS0] & 0x01ffu;
+        env->npe_low51_entry_ds1 = env->sfr[DMCU_SFR_DS1] & 0x01ffu;
+        for (index = 0; index < DMCU_NPE_LOW51_ENTRY_GPR_WORDS; index++) {
+            env->npe_low51_entry_gpr[index] = env->gpr[index] & MASK16;
+        }
+        for (index = 0; index < DMCU_NPE_LOW51_ENTRY_STACK_WORDS; index++) {
+            env->npe_low51_entry_stack[index] =
+                internal_data_read((sp + index * 2u) & MASK16, 16);
+        }
+    }
+
     /* Observer-only ABI monitor for the packed root-resource compositor.
      * The caller has already placed its six words at the pre-call SP; retain
      * those words and the active Harvard data segments without changing the
@@ -6543,7 +14003,11 @@ static void trace_control_transfer(CPUDMCUState *env, uint32_t from,
             env->file_write_last_r2 = env->gpr[2] & MASK16;
             env->file_write_last_r3 = env->gpr[3] & MASK16;
         }
-        for (child = 0; child < ARRAY_SIZE(child_calls); child++) {
+        /* Neither branch can match an inactive watch or a non-SCALL/RETS
+         * instruction. Do not scan the table for those common cases. */
+        for (child = 0; env->file_write_watch_active &&
+             (op == 0xbdu || op == 0xc6u) &&
+             child < ARRAY_SIZE(child_calls); child++) {
             if (env->file_write_watch_active &&
                 control_from == child_calls[child] && op == 0xbdu) {
                 env->file_write_child_calls++;
@@ -6634,6 +14098,111 @@ static void trace_control_transfer(CPUDMCUState *env, uint32_t from,
     }
     if ((from & MASK24) == 0x58b206u && op == 0xc6u) {
         env->provision_stage = 8;
+        env->provision_result_hi = env->gpr[0] & MASK16;
+        env->provision_result_lo = env->gpr[1] & MASK16;
+    }
+    /* VMA03 one-shot PIM checkpoint builder.  Keep persistent stage and
+     * result evidence for the guest-only wrapper in low mask ROM; no guest
+     * state is changed by these observations. */
+    if ((target & MASK24) == 0x027600u && op == 0xbdu) {
+        env->provision_calls++;
+        env->provision_caller = from & MASK24;
+        env->provision_sp = sp;
+        env->provision_stage = 1;
+    }
+    if ((target & MASK24) == 0x027400u && op == 0xbdu) {
+        env->provision_lookup_veneer_calls++;
+    }
+    if ((from & MASK24) == 0x027424u && op == 0xacu) {
+        uint16_t object_hi = internal_data_read((fp + 6u) & MASK16, 16);
+        uint16_t object_lo = internal_data_read((fp + 8u) & MASK16, 16);
+
+        env->provision_lookup_selector = env->gpr[0] & MASK16;
+        env->provision_lookup_branch_target = target & MASK24;
+        env->provision_lookup_object =
+            (((uint32_t)object_hi << 16) | object_lo) & MASK24;
+    }
+    if ((from & MASK24) == 0x027466u && op == 0xbdu) {
+        env->provision_lookup_mode_at_call = address_space_ldub(
+            &address_space_memory,
+            ((env->provision_lookup_object + 0x15u) & MASK24) ^ 1u,
+            MEMTXATTRS_UNSPECIFIED, NULL);
+    }
+    if ((target & MASK24) == 0x02746au && op == 0xc6u) {
+        env->provision_lookup_result = env->gpr[0] & MASK16;
+    }
+    if ((target & MASK24) == 0x1f1f1au &&
+        ((from & MASK24) == 0x0276c4u ||
+         (from & MASK24) == 0x0276eau) && op == 0xbdu) {
+        env->provision_stage = 2;
+    }
+    if (((target & MASK24) == 0x0276c8u ||
+         (target & MASK24) == 0x0276eeu) &&
+        (from & MASK24) == 0x1f2546u && op == 0xc6u) {
+        env->provision_stage = 3;
+        env->provision_open_hi = env->gpr[0] & MASK16;
+        env->provision_open_lo = env->gpr[1] & MASK16;
+        env->provision_result_hi = 0;
+        env->provision_result_lo = address_space_lduw_le(
+            &address_space_memory, 0x00512ae0u,
+            MEMTXATTRS_UNSPECIFIED, NULL);
+        /* A later, normal mode-1 open reuses the generic fopen observer.
+         * Preserve the one-shot mode-0 creation diagnosis here, at its exact
+         * return boundary, so the web status remains attributable. */
+        env->provision_open_stage = env->file_open_stage;
+        env->provision_child_call_mask = env->file_open_child_call_mask;
+        env->provision_child_return_mask = env->file_open_child_return_mask;
+        memcpy(env->provision_child_result_hi,
+               env->file_open_child_result_hi,
+               sizeof(env->provision_child_result_hi));
+        memcpy(env->provision_child_result_lo,
+               env->file_open_child_result_lo,
+               sizeof(env->provision_child_result_lo));
+        memcpy(env->provision_child_error,
+               env->file_open_child_error,
+               sizeof(env->provision_child_error));
+        env->provision_error_writes = env->file_open_error_writes;
+        env->provision_error_first_pc = env->file_open_error_first_pc;
+        env->provision_error_last_pc = env->file_open_error_last_pc;
+        env->provision_error_first_old = env->file_open_error_first_old;
+        env->provision_error_first_value = env->file_open_error_first_value;
+        env->provision_error_last_old = env->file_open_error_last_old;
+        env->provision_error_last_value = env->file_open_error_last_value;
+        env->provision_path_result = env->file_path_resolve_result;
+        env->provision_path_final_result =
+            env->file_path_resolve_final_result;
+        env->provision_path_failure_pc =
+            env->file_path_resolve_failure_pc;
+        env->provision_path_input_hi = env->file_path_resolve_input_hi;
+        env->provision_path_input_lo = env->file_path_resolve_input_lo;
+        env->provision_path_remaining_hi =
+            env->file_path_resolve_remaining_hi;
+        env->provision_path_remaining_lo =
+            env->file_path_resolve_remaining_lo;
+        env->provision_path_selector = env->file_path_resolve_selector;
+        env->provision_path_attribute = env->file_path_resolve_attribute;
+        env->provision_path_child_hi = env->file_path_resolve_child_hi;
+        env->provision_path_child_lo = env->file_path_resolve_child_lo;
+        env->provision_path_remaining_char =
+            env->file_path_resolve_remaining_char;
+        memcpy(env->provision_path_remaining,
+               env->file_path_resolve_remaining,
+               sizeof(env->provision_path_remaining));
+        memcpy(env->provision_path_object,
+               env->file_path_resolve_object,
+               sizeof(env->provision_path_object));
+    }
+    if ((target & MASK24) == 0x17e3eeu &&
+        (from & MASK24) >= 0x027200u &&
+        (from & MASK24) < 0x027400u && op == 0xbdu) {
+        env->provision_stage = 4;
+    }
+    if ((target & MASK24) == 0x24eaecu &&
+        (from & MASK24) == 0x02773au && op == 0xbdu) {
+        env->provision_stage = 5;
+    }
+    if ((target & MASK24) == 0x02773eu && op == 0xc6u) {
+        env->provision_stage = 6;
         env->provision_result_hi = env->gpr[0] & MASK16;
         env->provision_result_lo = env->gpr[1] & MASK16;
     }
@@ -6814,7 +14383,11 @@ static void trace_control_transfer(CPUDMCUState *env, uint32_t from,
 
         if (control_target == 0x1f1f1au && op == 0xbdu) {
             env->file_open_calls++;
-            if (control_from == 0x58b1b4u) {
+            if (control_from == 0x58b1b4u ||
+                control_from == 0x0276c4u ||
+                control_from == 0x0276eau ||
+                (env->result_list_create_trace_active &&
+                 control_from == 0x30ca02u)) {
                 env->file_open_watch_active = true;
                 env->file_open_provision_seen = true;
                 env->file_open_args_captured = false;
@@ -7205,6 +14778,14 @@ file_path_primary_entry_done:
                 internal_data_read((component_fp + 0x0au) & MASK16, 16);
             env->file_component_arg_entry_lo =
                 internal_data_read((component_fp + 0x0cu) & MASK16, 16);
+            env->file_component_output_hi =
+                internal_data_read((component_fp + 0x06u) & MASK16, 16);
+            env->file_component_output_lo =
+                internal_data_read((component_fp + 0x08u) & MASK16, 16);
+            memset(env->file_component_output_after_fill, 0,
+                   sizeof(env->file_component_output_after_fill));
+            memset(env->file_component_output_after_return, 0,
+                   sizeof(env->file_component_output_after_return));
             for (index = 0; index < DMCU_FILE_COMPONENT_FRAME_WORDS;
                  index++) {
                 env->file_component_frame_entry[index] =
@@ -7216,6 +14797,9 @@ file_path_primary_entry_done:
             control_target == 0x2dd96eu && op == 0xc6u &&
             env->file_path_primary_watch_active) {
             uint16_t component_fp = env->file_component_entry_fp;
+            uint32_t output =
+                (((uint32_t)env->file_component_output_hi << 16) |
+                 env->file_component_output_lo) & MASK24;
             unsigned index;
 
             env->file_path_component_result_hi = env->gpr[0] & MASK16;
@@ -7229,6 +14813,16 @@ file_path_primary_entry_done:
                 env->file_component_frame_exit[index] =
                     internal_data_read(
                         (component_fp - 0x10u + index * 2u) & MASK16, 16);
+            }
+            for (index = 0; index < DMCU_FILE_RECORD_SELECTOR_BYTES;
+                 index++) {
+                env->file_component_output_after_return[index] =
+                    env->file_component_output_hi == 0 ?
+                    internal_data_read(
+                        (env->file_component_output_lo + index) & MASK16, 8) :
+                    address_space_ldub(&address_space_memory,
+                                       ((output + index) & MASK24) ^ 1u,
+                                       MEMTXATTRS_UNSPECIFIED, NULL);
             }
             env->file_component_watch_active = false;
         }
@@ -7325,7 +14919,9 @@ file_path_primary_entry_done:
             env->file_path_resolve_final_result = env->gpr[0] & MASK16;
             env->file_path_primary_watch_active = false;
         }
-        for (child = 0; child < ARRAY_SIZE(child_calls); child++) {
+        for (child = 0; env->file_open_watch_active &&
+             (op == 0xbdu || op == 0xc6u) &&
+             child < ARRAY_SIZE(child_calls); child++) {
             if (env->file_open_watch_active &&
                 control_from == child_calls[child] && op == 0xbdu) {
                 env->file_open_child_calls++;
@@ -7455,6 +15051,23 @@ file_path_primary_entry_done:
                 env->file_open_stage = 18;
             }
             env->file_open_watch_active = false;
+        } else if (env->file_open_watch_active &&
+                   env->file_open_caller == 0x30ca02u &&
+                   control_from == 0x1f2546u && op == 0xc6u) {
+            /* The result-list allocator calls fopen through 30:C9A2, so its
+             * natural return is 30:CA06 rather than the provisioning
+             * wrapper's 58:B1B8.  Close the same read-only trace at the
+             * resident RETS boundary and retain the actual fopen result. */
+            env->file_open_returns++;
+            env->file_open_result_hi = env->gpr[0] & MASK16;
+            env->file_open_result_lo = env->gpr[1] & MASK16;
+            env->file_open_error = address_space_lduw_le(
+                &address_space_memory, 0x512ae0u,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            if (env->file_open_stage < 64) {
+                env->file_open_stage = 18;
+            }
+            env->file_open_watch_active = false;
         }
     }
 
@@ -7466,13 +15079,22 @@ file_path_primary_entry_done:
     {
         uint32_t control_from = from & MASK24;
         uint32_t control_target = env->pc & MASK24;
-        uint32_t record = (
-            ((uint32_t)address_space_lduw_le(
-                &address_space_memory, 0x005129c4u,
-                MEMTXATTRS_UNSPECIFIED, NULL) << 16) |
-            address_space_lduw_le(
-                &address_space_memory, 0x005129c6u,
-                MEMTXATTRS_UNSPECIFIED, NULL)) & MASK24;
+        uint32_t record = 0;
+
+        /* This value is consumed at only three resolver boundaries. Do
+         * not issue two diagnostic bus reads for every guest instruction,
+         * including unrelated arithmetic and audio interrupt handlers. */
+        if (control_from == 0x07405au ||
+            ((control_from == 0x0740d6u || control_from == 0x07414eu) &&
+             op == 0xc6u)) {
+            record = (
+                ((uint32_t)address_space_lduw_le(
+                    &address_space_memory, 0x005129c4u,
+                    MEMTXATTRS_UNSPECIFIED, NULL) << 16) |
+                address_space_lduw_le(
+                    &address_space_memory, 0x005129c6u,
+                    MEMTXATTRS_UNSPECIFIED, NULL)) & MASK24;
+        }
 
         if (control_target == 0x074000u && op == 0xbdu) {
             env->storage_driver_calls++;
@@ -7700,7 +15322,8 @@ file_path_primary_entry_done:
             env->file_commit_stage = 40;
             milestone = true;
         }
-        for (child = 0; child < ARRAY_SIZE(close_child_calls); child++) {
+        for (child = 0; (op == 0xbdu || op == 0xc6u) &&
+             child < ARRAY_SIZE(close_child_calls); child++) {
             if (!env->file_commit_watch_active) {
                 break;
             }
@@ -7895,8 +15518,9 @@ file_path_primary_entry_done:
     /* The third fixed registry record currently enters the relocated
      * 5C:BF4E builder but does not return.  Its twelve direct call sites are
      * source-proven and fixed, so a compact call/return milestone replaces
-     * megabytes of transient control logging. */
-    {
+     * megabytes of transient control logging. Every matching event below is
+     * SCALL/RETS; skip the address table for all other instructions. */
+    if (op == 0xbdu || op == 0xc6u) {
         static const uint32_t child_calls[] = {
             0x5cbfc4u, 0x5cc00au, 0x5cc078u, 0x5cc0a2u,
             0x5cc11au, 0x5cc18au, 0x5cc1c2u, 0x5cc330u,
@@ -8063,6 +15687,18 @@ file_path_primary_entry_done:
             address_space_lduw_le(&address_space_memory, output + 0x3cu,
                                   MEMTXATTRS_UNSPECIFIED, NULL);
         env->file_record_candidate_compare_valid[trace] = 0;
+        for (index = 0; index < DMCU_FILE_RECORD_SELECTOR_BYTES; index++) {
+            uint32_t selector =
+                env->file_record_resolve_current_selector & MASK24;
+
+            env->file_record_candidate_selector_data_trace[trace][index] =
+                (selector >> 16) == 0 ?
+                internal_data_read(((selector & MASK16) + index) & MASK16,
+                                   8) :
+                address_space_ldub(&address_space_memory,
+                                   ((selector + index) & MASK24) ^ 1u,
+                                   MEMTXATTRS_UNSPECIFIED, NULL);
+        }
         for (index = 0; index < 0x40; index++) {
             env->file_record_candidate_data_trace[trace][index] =
                 address_space_ldub(&address_space_memory,
@@ -8492,6 +16128,41 @@ file_path_primary_entry_done:
                 (menu_builder_return_watch_base + 2u) & MASK16, 16),
             fp);
     }
+    if ((from & MASK24) == 0x300a3cu) {
+        uint64_t sequence = env->start_menu_dispatch_trace_count++;
+        uint32_t dispatch_slot =
+            sequence % DMCU_START_MENU_DISPATCH_TRACE_SLOTS;
+        uint32_t index;
+
+        env->start_menu_dispatch_trace_target[dispatch_slot] = target;
+        env->start_menu_dispatch_trace_word[dispatch_slot] = word;
+        env->start_menu_dispatch_trace_sp[dispatch_slot] = sp;
+        env->start_menu_dispatch_trace_return_sp[dispatch_slot] =
+            env->gpr[DMCU_SP] & MASK16;
+        env->start_menu_dispatch_trace_fp[dispatch_slot] = fp;
+        env->start_menu_dispatch_trace_event[dispatch_slot] =
+            internal_data_read((fp - 0x15u) & MASK16, 8) & 0xffu;
+        env->start_menu_dispatch_trace_ds0[dispatch_slot] =
+            env->sfr[DMCU_SFR_DS0] & 0x1ffu;
+        env->start_menu_dispatch_trace_ds1[dispatch_slot] =
+            env->sfr[DMCU_SFR_DS1] & 0x1ffu;
+        env->start_menu_dispatch_trace_table_lo[dispatch_slot] =
+            env->gpr[1] & MASK16;
+        for (index = 0; index < ARRAY_SIZE(env->gpr); index++) {
+            env->start_menu_dispatch_trace_gpr[dispatch_slot][index] =
+                env->gpr[index] & MASK16;
+        }
+        for (index = 0; index < DMCU_START_MENU_DISPATCH_STACK_WORDS;
+             index++) {
+            env->start_menu_dispatch_trace_stack[dispatch_slot][index] =
+                internal_data_read((sp + index * 2u) & MASK16, 16);
+        }
+        for (index = 0; index < DMCU_START_MENU_DISPATCH_LOCAL_BYTES;
+             index++) {
+            env->start_menu_dispatch_trace_locals[dispatch_slot][index] =
+                internal_data_read((fp - 0x40u + index) & MASK16, 8);
+        }
+    }
     if ((from & MASK24) == 0x30130cu &&
         menu_builder_return_watch_active) {
         qemu_log_mask(
@@ -8693,20 +16364,8 @@ file_path_primary_entry_done:
      * when a callback/table entry is byte-swapped or otherwise corrupted.
      * Treat that as invalid control at the transfer itself; waiting for the
      * eventual unsupported word loses the source RET beneath timer traffic. */
-    if (call_or_return &&
-        (env->pc & MASK24) != (sequential & MASK24) &&
-        (from & MASK24) < DMCU_PROGRAM_BASE + DMCU_PROGRAM_SIZE &&
-        (((env->pc & MASK24) >=
-          DMCU_PROGRAM_BASE + DMCU_PROGRAM_SIZE) ||
-         ((env->pc & 1u) != 0)) &&
-        !env->invalid_control_valid) {
-        env->invalid_control_valid = true;
-        env->invalid_control_from = from & MASK24;
-        env->invalid_control_to = env->pc & MASK24;
-        env->invalid_control_word = word;
-        env->invalid_control_sp = sp;
-        env->invalid_control_fp = fp;
-        env->invalid_control_in_interrupt = env->in_interrupt;
+    if (trace_invalid_control(env, from, sequential, word, ext, sp, fp,
+                              call_or_return)) {
         /* Keep the immediately preceding call/return chain intact.  Once an
          * invalid target executes, timer interrupts otherwise replace the
          * circular trace with secondary fallout at 00:0000. */
@@ -8910,6 +16569,60 @@ file_path_primary_entry_done:
             env->control_trace_frozen = true;
         }
     }
+    /* 32:47A6 is currently occupied by a reconstructed rectangle-edge
+     * helper, but the flat firmware also contains a larger body that flows
+     * through this address.  Record the immediately preceding instruction
+     * and the frame before LINK executes.  A predecessor of 32:47A4 proves
+     * sequential overlay collision; an unrelated predecessor with a call
+     * word proves a legitimate helper entry. */
+    if ((from & MASK24) == 0x3247a6u && region_edges_entry_logs < 16u) {
+        qemu_log_mask(
+            LOG_UNIMP,
+            "DMCU region-edges entry #%u prev=%02x:%04x>%02x:%04x "
+            "pword=%04x pirq=%u current=%04x irq=%u "
+            "sp=%04x fp=%04x post-sp=%04x post-fp=%04x "
+            "stack=%04x,%04x,%04x,%04x,%04x,%04x,%04x,%04x "
+            "r=%04x,%04x,%04x,%04x\n",
+            ++region_edges_entry_logs,
+            dmcu_code_segment(prior_instruction_from),
+            dmcu_code_pc(prior_instruction_from),
+            dmcu_code_segment(prior_instruction_target),
+            dmcu_code_pc(prior_instruction_target),
+            prior_instruction_word, prior_instruction_in_interrupt,
+            word, env->in_interrupt, sp, fp,
+            env->gpr[DMCU_SP] & MASK16,
+            env->gpr[DMCU_FP] & MASK16,
+            internal_data_read((sp + 0u) & MASK16, 16),
+            internal_data_read((sp + 2u) & MASK16, 16),
+            internal_data_read((sp + 4u) & MASK16, 16),
+            internal_data_read((sp + 6u) & MASK16, 16),
+            internal_data_read((sp + 8u) & MASK16, 16),
+            internal_data_read((sp + 10u) & MASK16, 16),
+            internal_data_read((sp + 12u) & MASK16, 16),
+            internal_data_read((sp + 14u) & MASK16, 16),
+            env->gpr[0] & MASK16, env->gpr[1] & MASK16,
+            env->gpr[2] & MASK16, env->gpr[3] & MASK16);
+    }
+    if ((from & MASK24) == 0x18afb8u && region_mask_return_logs < 16u) {
+        qemu_log_mask(
+            LOG_UNIMP,
+            "DMCU region-mask return #%u target=%02x:%04x word=%04x "
+            "irq=%u sp=%04x fp=%04x post-sp=%04x post-fp=%04x "
+            "stack=%04x,%04x,%04x,%04x,%04x,%04x,%04x,%04x\n",
+            ++region_mask_return_logs,
+            dmcu_code_segment(target), dmcu_code_pc(target), word,
+            env->in_interrupt, sp, fp,
+            env->gpr[DMCU_SP] & MASK16,
+            env->gpr[DMCU_FP] & MASK16,
+            internal_data_read((sp + 0u) & MASK16, 16),
+            internal_data_read((sp + 2u) & MASK16, 16),
+            internal_data_read((sp + 4u) & MASK16, 16),
+            internal_data_read((sp + 6u) & MASK16, 16),
+            internal_data_read((sp + 8u) & MASK16, 16),
+            internal_data_read((sp + 10u) & MASK16, 16),
+            internal_data_read((sp + 12u) & MASK16, 16),
+            internal_data_read((sp + 14u) & MASK16, 16));
+    }
     if (!call_or_return ||
         (env->pc & MASK24) == (sequential & MASK24)) {
         return;
@@ -9027,13 +16740,127 @@ file_path_primary_entry_done:
         env->font_copy_trace_count = 0;
         env->glyph_draw_active_character = 0;
     }
-    for (application = 0;
-         application < DMCU_APPLICATION_TRACE_ENTRIES; application++) {
+    if ((env->pc & MASK24) == 0x1adeaau) {
+        uint16_t entry_sp = env->gpr[DMCU_SP] & MASK16;
+
+        env->foreground_main_entries++;
+        env->foreground_main_entry_from = from & MASK24;
+        env->foreground_main_entry_word = word;
+        env->foreground_main_entry_pre_sp = sp;
+        env->foreground_main_entry_post_sp = entry_sp;
+        env->foreground_main_entry_fp = fp;
+        env->foreground_main_entry_frame[0] =
+            internal_data_read(entry_sp, 16);
+        env->foreground_main_entry_frame[1] =
+            internal_data_read((entry_sp + 2u) & MASK16, 16);
+        env->foreground_main_entry_frame[2] =
+            internal_data_read((entry_sp + 4u) & MASK16, 16);
+    }
+    if ((from & MASK24) == 0x1ae036u) {
+        env->foreground_mode_selects++;
+        env->foreground_mode_select_from = from & MASK24;
+        env->foreground_mode_select_target = env->pc & MASK24;
+        env->foreground_mode_select_word = word;
+        env->foreground_mode_select_mode =
+            internal_data_read((fp - 0x66u) & MASK16, 16);
+        env->foreground_mode_select_event =
+            internal_data_read((fp - 2u) & MASK16, 16);
+        env->foreground_mode_select_pre_sp = sp;
+        env->foreground_mode_select_post_sp =
+            env->gpr[DMCU_SP] & MASK16;
+        env->foreground_mode_select_fp = fp;
+    }
+    if ((from & MASK24) == 0x1ae7bcu) {
+        env->foreground_main_returns++;
+        env->foreground_main_return_from = from & MASK24;
+        env->foreground_main_return_target = env->pc & MASK24;
+        env->foreground_main_return_word = word;
+        env->foreground_main_return_result = env->gpr[0] & MASK16;
+        env->foreground_main_return_pre_sp = sp;
+        env->foreground_main_return_post_sp =
+            env->gpr[DMCU_SP] & MASK16;
+        env->foreground_main_return_fp = fp;
+    }
+    if ((from & MASK24) == 0x18da2cu) {
+        env->foreground_context_returns++;
+        env->foreground_context_return_from = from & MASK24;
+        env->foreground_context_return_target = env->pc & MASK24;
+        env->foreground_context_return_word = word;
+        env->foreground_context_return_result = env->gpr[0] & MASK16;
+        env->foreground_context_return_selector =
+            address_space_ldub(&address_space_memory, 0xa4517eu,
+                               MEMTXATTRS_UNSPECIFIED, NULL);
+        env->foreground_context_return_state =
+            address_space_lduw_le(&address_space_memory, 0x512aaau,
+                                  MEMTXATTRS_UNSPECIFIED, NULL);
+        env->foreground_context_return_resource =
+            address_space_lduw_le(&address_space_memory, 0x512ab6u,
+                                  MEMTXATTRS_UNSPECIFIED, NULL);
+        env->foreground_context_return_pending =
+            address_space_lduw_le(&address_space_memory, 0x512abau,
+                                  MEMTXATTRS_UNSPECIFIED, NULL);
+        env->foreground_context_return_stage =
+            address_space_lduw_le(&address_space_memory, 0x512ac0u,
+                                  MEMTXATTRS_UNSPECIFIED, NULL);
+        env->foreground_context_return_pre_sp = sp;
+        env->foreground_context_return_post_sp =
+            env->gpr[DMCU_SP] & MASK16;
+        env->foreground_context_return_fp = fp;
+    }
+    if ((from & MASK24) == 0x1b2c90u) {
+        env->foreground_owner_returns++;
+        env->foreground_owner_return_from = from & MASK24;
+        env->foreground_owner_return_target = env->pc & MASK24;
+        env->foreground_owner_return_word = word;
+        env->foreground_owner_return_result = env->gpr[0] & MASK16;
+        env->foreground_owner_return_selector =
+            address_space_ldub(&address_space_memory, 0xa4517eu,
+                               MEMTXATTRS_UNSPECIFIED, NULL);
+        env->foreground_owner_return_state =
+            address_space_lduw_le(&address_space_memory, 0x512aaau,
+                                  MEMTXATTRS_UNSPECIFIED, NULL);
+        env->foreground_owner_return_resource =
+            address_space_lduw_le(&address_space_memory, 0x512ab6u,
+                                  MEMTXATTRS_UNSPECIFIED, NULL);
+        env->foreground_owner_return_pending =
+            address_space_lduw_le(&address_space_memory, 0x512abau,
+                                  MEMTXATTRS_UNSPECIFIED, NULL);
+        env->foreground_owner_return_stage =
+            address_space_lduw_le(&address_space_memory, 0x512ac0u,
+                                  MEMTXATTRS_UNSPECIFIED, NULL);
+        env->foreground_owner_return_pre_sp = sp;
+        env->foreground_owner_return_post_sp =
+            env->gpr[DMCU_SP] & MASK16;
+        env->foreground_owner_return_fp = fp;
+    }
+    if ((env->pc & MASK24) >= 0x160000u &&
+        (env->pc & MASK24) < 0x160030u) {
+        env->resident16_prefix_entries++;
+        env->resident16_prefix_entry_from = from & MASK24;
+        env->resident16_prefix_entry_target = env->pc & MASK24;
+        env->resident16_prefix_entry_word = word;
+        env->resident16_prefix_entry_pre_sp = sp;
+        env->resident16_prefix_entry_post_sp =
+            env->gpr[DMCU_SP] & MASK16;
+        env->resident16_prefix_entry_fp = fp;
+    }
+    if ((from & MASK24) >= 0x160000u &&
+        (from & MASK24) < 0x160030u) {
+        env->resident16_prefix_exits++;
+        env->resident16_prefix_exit_from = from & MASK24;
+        env->resident16_prefix_exit_target = env->pc & MASK24;
+        env->resident16_prefix_exit_word = word;
+        env->resident16_prefix_exit_pre_sp = sp;
+        env->resident16_prefix_exit_post_sp =
+            env->gpr[DMCU_SP] & MASK16;
+        env->resident16_prefix_exit_fp = fp;
+    }
+    /* One exact lookup, retaining the old first-match slot numbering. */
+    for (application = dmcu_application_trace_index(target);
+         application < DMCU_APPLICATION_TRACE_ENTRIES;
+         application = DMCU_APPLICATION_TRACE_ENTRIES) {
         unsigned argument;
 
-        if ((env->pc & MASK24) != application_targets[application]) {
-            continue;
-        }
         if ((env->pc & MASK24) == 0x31f2aeu ||
             (env->pc & MASK24) == 0x31f282u) {
             break;
@@ -9200,6 +17027,31 @@ file_path_primary_entry_done:
          * before Web diagnostics can inspect why 10:E4AA was skipped. */
         freeze_after = true;
     }
+    if ((target & MASK24) == 0x32f3c6u &&
+        !env->invalid_control_valid) {
+        /* The menu route reaches this exact application initializer after an
+         * older controller diagnostic has already frozen the generic ring.
+         * Re-arm only at its direct entry so the call, its 30:FE0E child and
+         * the final RETS are retained together.  This changes diagnostic
+         * bookkeeping only; guest registers, memory and control flow remain
+         * untouched.  Never re-arm after the first invalid transfer: corrupt
+         * foreground execution can revisit this address and would otherwise
+         * erase the very caller chain this probe is meant to preserve. */
+        env->control_trace_count = 0;
+        env->control_trace_frozen = false;
+    }
+    if (env->npe_directory_trace_remaining &&
+        (env->in_interrupt ||
+         (from == 0x301b40u && target == 0x187a02u) ||
+         (from == 0x1884d2u && target == 0x301b44u))) {
+        /* A full application-directory sector is copied through these two
+         * byte-at-a-time helpers while the periodic IRQ path runs in between.
+         * Neither path selects or materializes a browser record, and together
+         * they exhausted the bounded post-read trace before foreground code
+         * resumed.  Exclude only those exact transfers while this diagnostic
+         * window is armed; no guest-visible state or normal trace is changed. */
+        return;
+    }
     if (env->control_trace_frozen) {
         return;
     }
@@ -9220,6 +17072,12 @@ file_path_primary_entry_done:
     env->control_trace_sp[slot] = sp;
     env->control_trace_fp[slot] = fp;
     env->control_trace_count++;
+    if (env->npe_directory_trace_remaining) {
+        env->npe_directory_trace_remaining--;
+        if (!env->npe_directory_trace_remaining) {
+            freeze_after = true;
+        }
+    }
     if (freeze_after) {
         env->control_trace_frozen = true;
     }
@@ -10174,7 +18032,12 @@ static bool exec_control(CPUDMCUState *env, uint8_t op, uint8_t arg,
     if (op == 0xad || op == 0xbd) {
         target = dmcu_code_address(arg, ext);
         if (op == 0xbd) {
+            bool target_is_vma03_program =
+                DMCU_CPU(env_cpu(env))->reset_pc == 0x00030000u &&
+                target >= 0x00030000u &&
+                target < 0x00030000u + DMCU_PROGRAM_SIZE;
             bool execute_resident_rom =
+                !target_is_vma03_program &&
                 target >= env->resident_rom_base &&
                 target < env->resident_rom_limit;
             bool execute_auxiliary =
@@ -10191,9 +18054,13 @@ static bool exec_control(CPUDMCUState *env, uint8_t op, uint8_t arg,
                 trace_rom_call(env, target, start, next, false);
             }
 
-            if (target == 0x25206eu || target == 0x2d261cu ||
+            if (target == 0x25206eu || target == 0x5f261cu ||
                 target == 0x2c2ebau) {
                 trace_resource_io_call(env, start, target);
+            }
+            if (target == dmcu_code_address(0x5f, 0x261c) ||
+                target == dmcu_code_address(0x2e, 0x4572)) {
+                trace_npe_loader_memory_call(env, start, target);
             }
             if (target == dmcu_code_address(0x2e, 0x4572) &&
                 !env->resource_io_trace_frozen) {
@@ -10229,6 +18096,8 @@ static bool exec_control(CPUDMCUState *env, uint8_t op, uint8_t arg,
                               rom_argument(env, 4));
             }
             if (target == dmcu_code_address(0x5f, 0xf928)) {
+                env->storage_probe_page_watch_active = true;
+                env->storage_probe_page_watch_count = 0;
                 qemu_log_mask(LOG_UNIMP,
                               "DMCU relocated storage sector probe call "
                               "from %02x:%04x "
@@ -10241,6 +18110,42 @@ static bool exec_control(CPUDMCUState *env, uint8_t op, uint8_t arg,
                               rom_argument(env, 2), rom_argument(env, 3),
                               rom_argument(env, 4), rom_argument(env, 5),
                               rom_argument(env, 6), rom_argument(env, 7));
+            }
+            if (target == dmcu_code_address(0x07, 0x4700) &&
+                start == dmcu_code_address(0x5f, 0xf9d2)) {
+                uint16_t unit = rom_argument(env, 0);
+                uint16_t cluster = rom_argument(env, 1);
+                uint16_t root_hi = address_space_lduw_le(
+                    &address_space_memory, 0x5129c4u,
+                    MEMTXATTRS_UNSPECIFIED, NULL);
+                uint16_t root_lo = address_space_lduw_le(
+                    &address_space_memory, 0x5129c6u,
+                    MEMTXATTRS_UNSPECIFIED, NULL);
+                uint32_t record_slot =
+                    ((((uint32_t)root_hi << 16) | root_lo) +
+                     (uint32_t)unit * 0x26u + 0x22u) & MASK24;
+                uint16_t record_hi = address_space_lduw_le(
+                    &address_space_memory, record_slot,
+                    MEMTXATTRS_UNSPECIFIED, NULL);
+                uint16_t record_lo = address_space_lduw_le(
+                    &address_space_memory, (record_slot + 2u) & MASK24,
+                    MEMTXATTRS_UNSPECIFIED, NULL);
+                uint32_t record =
+                    ((uint32_t)record_hi << 16) | record_lo;
+
+                qemu_log_mask(
+                    LOG_UNIMP,
+                    "DMCU sector probe geometry call unit=%04x "
+                    "cluster=%04x root=%04x:%04x slot=%06x "
+                    "record=%04x:%04x limit=%04x "
+                    "sp=%04x fp=%04x\n",
+                    unit, cluster, root_hi, root_lo, record_slot,
+                    record_hi, record_lo,
+                    address_space_lduw_le(
+                        &address_space_memory, (record + 0x14u) & MASK24,
+                        MEMTXATTRS_UNSPECIFIED, NULL),
+                    env->gpr[DMCU_SP] & MASK16,
+                    env->gpr[DMCU_FP] & MASK16);
             }
             if (target == dmcu_code_address(0x29, 0x02d8)) {
                 qemu_log_mask(LOG_UNIMP,
@@ -10290,6 +18195,29 @@ static bool exec_control(CPUDMCUState *env, uint8_t op, uint8_t arg,
                                   &address_space_memory, 0x005127f2u,
                                   MEMTXATTRS_UNSPECIFIED, NULL));
             }
+            /* The recovered resident-event handler is reached late in the
+             * Game World launch path.  A later failure has been observed at
+             * its balanced RETS, so preserve the exact caller-owned far
+             * return frame before SCALL changes SP.  This is deliberately a
+             * read-only diagnostic: no guest register or stack word is
+             * altered. */
+            if (target == dmcu_code_address(0x29, 0x3dd2)) {
+                uint16_t entry_sp = env->gpr[DMCU_SP] & MASK16;
+
+                qemu_log_mask(
+                    LOG_UNIMP,
+                    "DMCU resident-event helper call from %02x:%04x "
+                    "next=%02x:%04x sp-before=%04x fp=%04x "
+                    "new-frame=%04x:%04x stack=%04x,%04x,%04x,%04x\n",
+                    dmcu_code_segment(start), dmcu_code_pc(start),
+                    dmcu_code_segment(next), dmcu_code_pc(next),
+                    entry_sp, env->gpr[DMCU_FP] & MASK16,
+                    dmcu_code_segment(next), dmcu_code_pc(next),
+                    internal_data_read(entry_sp, 16),
+                    internal_data_read((entry_sp + 2u) & MASK16, 16),
+                    internal_data_read((entry_sp + 4u) & MASK16, 16),
+                    internal_data_read((entry_sp + 6u) & MASK16, 16));
+            }
             if (target == dmcu_code_address(0x2c, 0xfe08) ||
                 target == dmcu_code_address(0x31, 0xcbe8) ||
                 target == dmcu_code_address(0x5f, 0xf928) ||
@@ -10297,6 +18225,7 @@ static bool exec_control(CPUDMCUState *env, uint8_t op, uint8_t arg,
                 target == dmcu_code_address(0x32, 0x6ea8) ||
                 target == dmcu_code_address(0x32, 0x6f12) ||
                 target == dmcu_code_address(0x2e, 0xc104) ||
+                target == dmcu_code_address(0x2d, 0x261c) ||
                 target == dmcu_code_address(0x2c, 0x2eba) ||
                 target == dmcu_code_address(0x2a, 0x1440) ||
                 target == dmcu_code_address(0x2e, 0xbf9a) ||
@@ -10809,6 +18738,49 @@ static bool exec_control(CPUDMCUState *env, uint8_t op, uint8_t arg,
                               env->gpr[DMCU_FP] & MASK16);
             }
 
+            /* 24:11BE is the recovered fixed-width text-box renderer used
+             * immediately after Game World state 0x78.  Snapshot its four
+             * stack arguments and the pointed object before the callee scans
+             * bytes at pointer+0x0A.  This is read-only provenance for bad
+             * glyph input; it does not repair or substitute the string. */
+            if (env->npe_glyph_trace_armed &&
+                target == dmcu_code_address(0x24, 0x11be)) {
+                uint32_t sequence = env->npe_text_box_trace_count++;
+
+                if (sequence < DMCU_NPE_TEXT_BOX_TRACE_SLOTS) {
+                    uint16_t pointer_hi;
+                    uint16_t pointer_lo;
+                    uint32_t pointer;
+                    unsigned index;
+
+                    env->npe_text_box_trace_caller[sequence] = start & MASK24;
+                    env->npe_text_box_trace_sp[sequence] =
+                        env->gpr[DMCU_SP] & MASK16;
+                    env->npe_text_box_trace_fp[sequence] =
+                        env->gpr[DMCU_FP] & MASK16;
+                    for (index = 0; index < 4; index++) {
+                        env->npe_text_box_trace_args[sequence][index] =
+                            rom_argument(env, index) & MASK16;
+                    }
+                    pointer_hi = env->npe_text_box_trace_args[sequence][2];
+                    pointer_lo = env->npe_text_box_trace_args[sequence][3];
+                    pointer = ((uint32_t)pointer_hi << 16) | pointer_lo;
+                    env->npe_text_box_trace_pointer_valid[sequence] =
+                        (pointer_hi & 0xff00u) == 0;
+                    if (env->npe_text_box_trace_pointer_valid[sequence]) {
+                        for (index = 0;
+                             index < DMCU_NPE_TEXT_BOX_TRACE_SAMPLE_BYTES;
+                             index++) {
+                            env->npe_text_box_trace_sample[sequence][index] =
+                                address_space_ldub(
+                                    &address_space_memory,
+                                    (pointer + index) & MASK24,
+                                    MEMTXATTRS_UNSPECIFIED, NULL);
+                        }
+                    }
+                }
+            }
+
             /*
              * 28:FD38 is the ordinary byte-glyph renderer used by the
              * bootstrap UI.  The hierarchy renderer also calls the resident
@@ -10838,6 +18810,53 @@ static bool exec_control(CPUDMCUState *env, uint8_t op, uint8_t arg,
                 env->glyph_draw_active_character =
                     env->glyph_draw_trace_character[trace_slot];
                 env->glyph_draw_trace_count++;
+
+                /*
+                 * The ordinary glyph ring also contains bootstrap and outer
+                 * desktop chrome.  Once the application enters recovered
+                 * Game World state 0x78, keep a separate bounded record of
+                 * subsequent guest glyph calls and their frame chains.  This
+                 * distinguishes stale framebuffer pixels from text actually
+                 * redrawn by the operation without changing guest registers,
+                 * memory, or renderer arguments.
+                 */
+                if (env->npe_glyph_trace_armed) {
+                    uint32_t npe_index = env->npe_glyph_trace_count++;
+                    uint32_t npe_slot = npe_index %
+                                        DMCU_NPE_GLYPH_TRACE_SLOTS;
+                    uint16_t frame = env->gpr[DMCU_FP] & MASK16;
+                    unsigned depth;
+
+                    env->npe_glyph_trace_caller[npe_slot] = start & MASK24;
+                    env->npe_glyph_trace_target[npe_slot] = target & MASK24;
+                    env->npe_glyph_trace_x[npe_slot] =
+                        rom_argument(env, 0) & MASK16;
+                    env->npe_glyph_trace_y[npe_slot] =
+                        rom_argument(env, 1) & MASK16;
+                    env->npe_glyph_trace_character[npe_slot] =
+                        rom_argument(env, 2) & MASK16;
+                    env->npe_glyph_trace_sp[npe_slot] =
+                        env->gpr[DMCU_SP] & MASK16;
+                    env->npe_glyph_trace_fp[npe_slot] = frame;
+                    memset(env->npe_glyph_trace_chain[npe_slot], 0,
+                           sizeof(env->npe_glyph_trace_chain[npe_slot]));
+                    for (depth = 0;
+                         depth < DMCU_NPE_GLYPH_TRACE_FRAMES && frame;
+                         depth++) {
+                        uint16_t parent = internal_data_read(frame, 16);
+                        uint16_t cs = internal_data_read(
+                            (frame + 2u) & MASK16, 16);
+                        uint16_t pc = internal_data_read(
+                            (frame + 4u) & MASK16, 16);
+
+                        env->npe_glyph_trace_chain[npe_slot][depth] =
+                            ((cs & 0xffu) << 16) | pc;
+                        if (!parent || parent == frame) {
+                            break;
+                        }
+                        frame = parent;
+                    }
+                }
 
                 /*
                  * "开始" is part of the outer desktop chrome and is drawn
@@ -10946,7 +18965,8 @@ static bool exec_control(CPUDMCUState *env, uint8_t op, uint8_t arg,
                 }
                 return true;
             }
-            if (!env->rom_hle_enabled && target < DMCU_PROGRAM_BASE &&
+            if (!env->rom_hle_enabled && !target_is_vma03_program &&
+                target < DMCU_PROGRAM_BASE &&
                 !execute_auxiliary &&
                 (!execute_resident_rom || env->soc_rom_skeleton)) {
                 trace_rom_call(env, target, start, next, true);
@@ -11179,7 +19199,29 @@ static bool exec_control(CPUDMCUState *env, uint8_t op, uint8_t arg,
                               env->gpr[DMCU_FP] & MASK16,
                               rom_argument(env, 0), rom_argument(env, 1));
             }
+            if (start == dmcu_code_address(0x29, 0x4094)) {
+                qemu_log_mask(
+                    LOG_UNIMP,
+                    "DMCU resident-event helper RETS sp=%04x fp=%04x "
+                    "frame=%04x,%04x below=%04x,%04x,%04x,%04x\n",
+                    return_sp, env->gpr[DMCU_FP] & MASK16,
+                    internal_data_read(return_sp, 16),
+                    internal_data_read((return_sp + 2u) & MASK16, 16),
+                    internal_data_read((return_sp + 4u) & MASK16, 16),
+                    internal_data_read((return_sp + 6u) & MASK16, 16),
+                    internal_data_read((return_sp + 8u) & MASK16, 16),
+                    internal_data_read((return_sp + 10u) & MASK16, 16));
+            }
             env->pc = far_return_pop(env);
+            if (start == dmcu_code_address(0x29, 0x4094)) {
+                qemu_log_mask(
+                    LOG_UNIMP,
+                    "DMCU resident-event helper returned to %02x:%04x "
+                    "sp-after=%04x fp=%04x\n",
+                    dmcu_code_segment(env->pc), dmcu_code_pc(env->pc),
+                    env->gpr[DMCU_SP] & MASK16,
+                    env->gpr[DMCU_FP] & MASK16);
+            }
             /*
              * The resident 06:5800 cleanup has just copied the original
              * application body back over the temporary 2D:3460 bootstrap
@@ -11235,20 +19277,61 @@ static bool exec_control(CPUDMCUState *env, uint8_t op, uint8_t arg,
                 qemu_log_mask(LOG_UNIMP,
                               "DMCU foreground state wrapper code sync\n");
             }
-            /* The late 1A:0000 application-region installer writes a large
+            /* The late 0A:0000 application-region installer writes a large
              * set of recovered routines through the DMCU data alias.  The
              * real SoC exposes coherent program RAM, but QEMU can retain a
              * translation made from the previous code view.  This matters
              * for the relocated 5F:1A5A numeric leaf: the data diagnostic
              * already reads its installed RETS while a stale TB continues
-             * into the old 5F:1BBA body.  Synchronize at the installer's
-             * balanced RETS, before any caller can enter the new overlays. */
-            if (start == dmcu_code_address(0x1a, 0x41f4)) {
+             * into the old 5F:1BBA body.  The current 0x4222-byte installer
+             * ends with its balanced RETS at 0A:4220; synchronize there,
+             * before any caller can enter the new overlays. */
+            if (start == dmcu_code_address(0x0a, 0x4220)) {
                 env->overlay_code_syncs++;
                 tb_flush(env_cpu(env));
                 tlb_flush(env_cpu(env));
                 qemu_log_mask(LOG_UNIMP,
                               "DMCU late application overlay code sync\n");
+            }
+            /* The dedicated 09:E000 operation installer publishes linked
+             * 29:CE22 and 29:D0BA through their writable data aliases.  The
+             * former flat address is executed during startup before its final
+             * source-46 body is installed, so TCG can retain an old source-29
+             * translation even though guest RAM already contains 2E05.  Real
+             * DMCU program RAM is coherent; synchronize at the installer's
+             * own balanced RETS after every word store has completed. */
+            if (start == dmcu_code_address(0x09, 0xf4c0)) {
+                env->overlay_code_syncs++;
+                tb_flush(env_cpu(env));
+                tlb_flush(env_cpu(env));
+                qemu_log_mask(
+                    LOG_UNIMP,
+                    "DMCU operation-one action/UI overlay code sync\n");
+            }
+            /* ROM-01 calls the dedicated 1A:F100 installer after the final
+             * broad foreground publish.  It replaces flat 30:9794 with the
+             * exact five-word far-byte-search body.  The physical DMCU code
+             * RAM is coherent with its data alias; expose those guest stores
+             * to QEMU instruction fetch at the installer's balanced RETS. */
+            if (start == dmcu_code_address(0x1a, 0xf4cc)) {
+                env->overlay_code_syncs++;
+                tb_flush(env_cpu(env));
+                tlb_flush(env_cpu(env));
+                qemu_log_mask(LOG_UNIMP,
+                              "DMCU Game World byte-search code sync\n");
+            }
+            /* The operation-7 wrapper calls the bounded 1A:7600 publisher,
+             * whose current exact payload ends at this RETS.  It has just
+             * copied source 4E:A3F4 over the collided logical 31:A3F4 body.
+             * Real writable program RAM is coherent with its data alias;
+             * discard any flat 31:A3F4 translation before operation 1 enters
+             * the newly published callback. */
+            if (start == dmcu_code_address(0x1a, 0x78ec)) {
+                env->overlay_code_syncs++;
+                tb_flush(env_cpu(env));
+                tlb_flush(env_cpu(env));
+                qemu_log_mask(LOG_UNIMP,
+                              "DMCU new-journey closure code sync\n");
             }
             /* The recovered generic-menu manager performs another coherent
              * RAM-to-RAM overlay exchange after the bootstrap foreground has
@@ -11372,22 +19455,39 @@ static bool exec_control(CPUDMCUState *env, uint8_t op, uint8_t arg,
             uint32_t pc;
             uint32_t frame_sp = env->gpr[DMCU_SP] & MASK16;
 
-            env->psw = pop(env) & 15;
-            cs = pop(env);
+            /* A guest may construct a RETI frame with PUSH REG[01], or
+             * with literal PSR words as the original callback dispatcher
+             * does.  Never interpret that word as our private TCG flags. */
+            dmcu_sfr_write_word(env, DMCU_SFR_PSW, pop(env));
+            cs = dmcu_sfr_read_word(env, DMCU_SFR_SOCR) & DMCU_SOCR_NSEG ?
+                 dmcu_code_segment(start) : pop(env);
             pc = pop(env);
             env->pc = dmcu_code_address(cs, pc);
-            /*
-             * The NP560 timer vector at 08:41E0 deliberately uses RETI to
-             * enter its application callback from a synthetic interrupt
-             * frame.  The original hardware interrupt remains active until
-             * the callback returns to the vector epilogue and that epilogue
-             * executes its second RETI.  Clearing in_interrupt here allowed
-             * the 64 Hz source to nest while the vector's single save area
-             * (08:049A..04D8) was still live, eventually corrupting the
-             * interrupted PC to 00:0000.
-             */
+            if ((env->interrupt_last_entry_pc & MASK24) >=
+                    dmcu_code_address(0x5f, 0xf928) &&
+                (env->interrupt_last_entry_pc & MASK24) <
+                    dmcu_code_address(0x5f, 0xfe80)) {
+                qemu_log_mask(
+                    LOG_UNIMP,
+                    "DMCU sector-probe RETI from %02x:%04x "
+                    "entry=%02x:%04x frame-sp=%04x "
+                    "frame=%04x,%04x,%04x target=%02x:%04x "
+                    "sp-after=%04x fp=%04x irq=%u\n",
+                    dmcu_code_segment(start), dmcu_code_pc(start),
+                    dmcu_code_segment(env->interrupt_last_entry_pc),
+                    dmcu_code_pc(env->interrupt_last_entry_pc), frame_sp,
+                    internal_data_read((frame_sp + 0u) & MASK16, 16),
+                    internal_data_read((frame_sp + 2u) & MASK16, 16),
+                    internal_data_read((frame_sp + 4u) & MASK16, 16),
+                    dmcu_code_segment(env->pc), dmcu_code_pc(env->pc),
+                    env->gpr[DMCU_SP] & MASK16,
+                    env->gpr[DMCU_FP] & MASK16, env->in_interrupt);
+            }
+            /* A synthetic RETI can enter a guest callback without consuming
+             * the hardware frame. Retire only the matching frame, regardless
+             * of the ISR address; further requests use live PSR/ICR rules. */
             if (env->in_interrupt &&
-                start != dmcu_code_address(0x08, 0x41e0)) {
+                frame_sp == env->interrupt_frame_base) {
                 if (env->interrupt_repeat_saved) {
                     if (env->interrupt_repeat_pc ==
                             dmcu_code_address(0x2e, 0x46bc) &&
@@ -11412,17 +19512,19 @@ static bool exec_control(CPUDMCUState *env, uint8_t op, uint8_t arg,
                         }
                         env->far_copy_repeat_gpr_mismatch_mask = mismatch;
                     }
-                    if (env->repeat_count) {
+                    if (env->repeat_count || env->single_repeat_count) {
                         env->interrupt_repeat_conflicts++;
                     }
                     env->repeat_pc = env->interrupt_repeat_pc;
                     env->repeat_end = env->interrupt_repeat_end;
                     env->repeat_count = env->interrupt_repeat_count;
                     env->repeat_block = env->interrupt_repeat_block;
+                    env->single_repeat_pc = env->interrupt_single_repeat_pc;
+                    env->single_repeat_count =
+                        env->interrupt_single_repeat_count;
                     env->interrupt_repeat_saved = false;
                     env->interrupt_repeat_restores++;
                 }
-                env->in_interrupt = false;
                 env->interrupt_returns++;
                 env->interrupt_last_return_from = start & MASK24;
                 env->interrupt_last_return_pc = env->pc & MASK24;
@@ -11448,7 +19550,10 @@ static bool exec_control(CPUDMCUState *env, uint8_t op, uint8_t arg,
                     }
                     env->interrupt_bad_returns++;
                 }
-                env->interrupt_frame_watch_active = false;
+                /* Finish diagnostics against this frame before restoring
+                 * its parent's bookkeeping. Never replace the popped PC
+                 * or PSR with the diagnostic expected values. */
+                dmcu_interrupt_complete(env);
             }
         } else {
             return false;
@@ -11486,6 +19591,134 @@ static bool exec_compare_update(CPUDMCUState *env, uint8_t op,
         right = op < 0x80 ? ext : data_read(env, ext, 16);
         alu_sub(env, left, right, 0, 16, false);
         sfr_write(env, arg, left + delta, 16);
+    }
+    return true;
+}
+
+static bool exec_mac(CPUDMCUState *env, uint8_t op, uint8_t arg,
+                     uint16_t ext)
+{
+    const uint64_t mask40 = (UINT64_C(1) << 40) - 1;
+    const int64_t min40 = -(INT64_C(1) << 39);
+    const int64_t max40 = (INT64_C(1) << 39) - 1;
+    unsigned kind = (arg >> 4) & 3;
+    unsigned signs = (arg >> 2) & 3;
+    uint64_t raw, operand, rounded;
+    int64_t acc, product = 0, result;
+    bool carry = false, overflow, saturated = false;
+    bool subtract = arg & 1;
+    uint32_t socr;
+    uint32_t x = 0, y = 0, xaddr = 0, yaddr = 0;
+    uint32_t xnext = 0, ynext = 0, move_addr = 0;
+    unsigned xr = 0, yr = 0, xmode = 0, ymode = 0;
+    int32_t xstep = 0, ystep = 0;
+
+    if (op != 0xbe || (ext & 0xf0f0)) {
+        return false;
+    }
+    if ((kind == 1 && (arg & 2)) ||
+        (kind >= 2 && (arg & 3)) || (kind == 2 && ext)) {
+        return false;
+    }
+    if (kind == 0) {
+        xr = 8 + ((ext >> 8) & 3);
+        yr = 12 + (ext & 3);
+        xmode = (ext >> 10) & 3;
+        ymode = (ext >> 2) & 3;
+        /* Only XM0, XM2 and YM2 have factory register-map evidence.
+         * Do not guess the remaining modifiers or XC/YC register numbers. */
+        if ((xr != 8 && xr != 10) || yr != 14 ||
+            xmode == 3 || ymode == 3) {
+            return false;
+        }
+        xaddr = env->gpr[xr] & MASK16;
+        yaddr = env->gpr[yr] & MASK16;
+        if ((xaddr & 1) || (yaddr & 1) ||
+            yaddr < 0x8000 || yaddr >= 0xc000 ||
+            !pointer_circular_valid(env, xr, xaddr) ||
+            !pointer_circular_valid(env, yr, yaddr)) {
+            /* Invalid/unknown accesses stop before operand or .m effects.
+             * Architectural EXR fault delivery remains to be implemented. */
+            return false;
+        }
+        xstep = xmode == 1 ? 2 : xmode == 2 ? -2 : 0;
+        ystep = ymode == 1 ? 2 : ymode == 2 ? -2 : 0;
+        /* Capture the AGU results before any bus side effect. In
+         * particular .m can target the modifier's own SFR address. */
+        xnext = pointer_postincrement(env, xr, xaddr, xstep);
+        ynext = pointer_postincrement(env, yr, yaddr, ystep);
+        move_addr = pointer_postincrement(env, xr, xaddr, -xstep);
+    }
+
+    /* CN1916884A pp40-48: kind 01=MAC, 10=RNDST, 11=MULS.
+     * AR is the low byte of R5 followed by R6:R7. R5's high byte is
+     * the independent SE register (fig. 5), not accumulator sign padding. */
+    raw = ((uint64_t)(env->gpr[5] & 0xff) << 32) |
+          ((uint64_t)(env->gpr[6] & MASK16) << 16) |
+          (env->gpr[7] & MASK16);
+    acc = raw & (UINT64_C(1) << 39) ? (int64_t)raw - (INT64_C(1) << 40)
+                                  : (int64_t)raw;
+    socr = sfr_read(env, DMCU_SFR_SOCR, 16);
+    if (kind != 2) {
+        if (kind == 0) {
+            /* Fig. 9: X can use the DS-selected bus, Y is internal Y-RAM.
+             * Read both operands before .m can overwrite an aliased value. */
+            x = pointer_read(env, xr, xaddr, 16);
+            y = internal_data_read(yaddr, 16);
+            if ((arg & 2) && xstep) {
+                pointer_write(env, xr, move_addr, x, 16);
+            }
+        } else {
+            x = reg_read(env, ext >> 8, 16);
+            y = reg_read(env, ext, 16);
+        }
+        int64_t left = signs & 2 ? (int64_t)x : (int64_t)sext16(x);
+        int64_t right = signs & 1 ? (int64_t)y : (int64_t)sext16(y);
+
+        product = left * right;
+        if (!signs && (socr & DMCU_SOCR_FR)) {
+            product *= 2;
+        }
+    }
+    if (kind == 3) {
+        result = product;
+    } else {
+        operand = (uint64_t)product & mask40;
+        carry = subtract ? raw < operand : raw + operand > mask40;
+        result = subtract ? acc - product : acc + product;
+    }
+    overflow = result < min40 || result > max40;
+    if (arg & 0x80) {
+        rounded = ((uint64_t)result & mask40) + 0x8000;
+        carry |= rounded > mask40;
+        result += 0x8000;
+        overflow |= result < min40 || result > max40;
+        result &= ~INT64_C(0xffff);
+    }
+    if ((arg & 0x40) || (socr & DMCU_SOCR_MAS)) {
+        if (result > INT32_MAX) {
+            result = INT32_MAX;
+            saturated = true;
+        } else if (result < INT32_MIN) {
+            result = INT32_MIN;
+            saturated = true;
+        }
+    }
+    raw = (uint64_t)result & mask40;
+    reg_write(env, 5, (env->gpr[5] & 0xff00) | (raw >> 32), 16);
+    env->gpr[6] = (raw >> 16) & MASK16;
+    env->gpr[7] = raw & MASK16;
+    set_flag(env, DMCU_PSW_Z, raw == 0);
+    set_flag(env, DMCU_PSW_N, raw & (UINT64_C(1) << 39));
+    set_flag(env, DMCU_PSW_C, carry);
+    set_flag(env, DMCU_PSW_V, overflow);
+    /* Preserve priority, CIRQ, MX and all unrelated PSR bits. */
+    env->sfr[DMCU_SFR_PSW] &= ~(DMCU_PSR_MV | DMCU_PSR_MS);
+    env->sfr[DMCU_SFR_PSW] |= (overflow ? DMCU_PSR_MV : 0) |
+                             (saturated ? DMCU_PSR_MS : 0);
+    if (kind == 0) {
+        env->gpr[xr] = xnext;
+        env->gpr[yr] = ynext;
     }
     return true;
 }
@@ -11546,8 +19779,10 @@ static bool exec_exponent(CPUDMCUState *env, uint8_t op, uint8_t arg)
     signed_value = kind < 2 || (kind >= 4 && kind < 6);
     if (indirect) {
         uint32_t addr = env->gpr[arg & 15];
+        uint32_t next = pointer_postincrement(env, arg & 15, addr, 2);
+
         value = pointer_read(env, arg & 15, addr, 16);
-        env->gpr[arg & 15] = (addr + 2) & MASK16;
+        env->gpr[arg & 15] = next;
     } else {
         value = reg_read(env, arg, 16);
     }
@@ -11576,12 +19811,156 @@ static bool exec_exponent(CPUDMCUState *env, uint8_t op, uint8_t arg)
     return true;
 }
 
+uint32_t HELPER(fetch_extension)(CPUDMCUState *env, uint32_t start)
+{
+    /* A 32-bit instruction at CS:FFFE has its extension at CS:0000.
+     * TCG only tracks contiguous instruction pages. Read this noncontiguous
+     * extension on every execution instead of caching an untracked constant.
+     * Use the CODE MMU index, never the current DS0/DS1 data mapping. */
+    return cpu_lduw_code(env, dmcu_code_advance(start, 2));
+}
+
+/* Sparse original file/MP3 boundaries only. Host hardware watchpoints were
+ * perturbing the audio clock heavily while the playlist save ran. This
+ * bounded observer never changes guest state and does not sample each FAT
+ * lookup or each audio IRQ. Locals are FP-64 .. FP-2, raw internal words. */
+static void audio_file_observe(CPUDMCUState *env, uint32_t pc)
+{
+    DMCUAudioFileEvent *e;
+    unsigned i;
+    switch (pc) {
+    case 0x321614: /* original FAT loop entry */
+    case 0x32169a: /* after UNLINK, before RETS */
+    case 0x17e9c0: /* caller receives loop count */
+    case 0x17eece: /* original file write ERROR cleanup (normal release: 17:EEB4) */
+    case 0x32c194: /* file wrapper receives bytes written */
+    case 0x29247c: /* playlist payload write returned */
+    case 0x29248e: /* playlist close returned */
+    case 0x20f9a2: /* optional filesystem callback, release BIT8D.0 */
+    case 0x20f9c2: /* callback returned, reacquire BIT8D.0 */
+    case 0x16eb0a: /* MP3 file supply */
+    case 0x16ec34: /* registered file supply callback */
+        break;
+    default:
+        return;
+    }
+    e = &env->audio_file_trace[env->audio_file_count++ % DMCU_AUDIO_FILE_TRACE_SLOTS];
+    e->pc = pc;
+    e->previous_pc = env->completed_instruction_pc;
+    e->sp = env->gpr[DMCU_SP];
+    e->fp = env->gpr[DMCU_FP];
+    e->ds0 = env->sfr[DMCU_SFR_DS0];
+    e->ds1 = env->sfr[DMCU_SFR_DS1];
+    e->psw = env->psw;
+    e->in_interrupt = env->in_interrupt;
+    for (i = 0; i < ARRAY_SIZE(e->gpr); i++) {
+        e->gpr[i] = env->gpr[i];
+    }
+    for (i = 0; i < ARRAY_SIZE(e->stack); i++) {
+        e->stack[i] = internal_data_read((e->sp + i * 2u) & MASK16, 16);
+    }
+    for (i = 0; i < ARRAY_SIZE(e->locals); i++) {
+        e->locals[i] = internal_data_read((e->fp - 64u + i * 2u) & MASK16, 16);
+    }
+    e->flags[0] = internal_data_read(0xf012, 16); /* BIT89 */
+    e->flags[1] = internal_data_read(0xf014, 16); /* BIT8A */
+    e->flags[2] = internal_data_read(0xf01a, 16); /* BIT8D */
+}
+
+/* Exact observer lookup; do not linearly scan 78 UI checkpoints on every
+ * unrelated CPU instruction. All event IDs and capture boundaries are kept. */
+static unsigned np560_sound_trace_kind(uint32_t pc)
+{
+    switch (pc) {
+    case 0x1df78au: return 100; /* root confirm receives event/object */
+    case 0x1df79au: return 101;
+    case 0x1df812u: return 102;
+    case 0x1df816u: return 103;
+    case 0x2fc59au: return 110; /* generic foreground parent */
+    case 0x2fc5d4u: return 111;
+    case 0x2fc61eu: return 112;
+    case 0x2fc62cu: return 113;
+    case 0x2fc652u: return 114;
+    case 0x2fc698u: return 115; /* direct settings-selector branch */
+    case 0x31345eu: return 116; /* state-0x55 descriptor resolver */
+    case 0x3134d8u: return 117; /* state table lookup */
+    case 0x3134eeu: return 118; /* resolved 50:FFDC descriptor */
+    case 0x3134f0u: return 119; /* descriptor segment is available */
+    case 0x313510u: return 120; /* hand descriptor to 2E:DB9C */
+    case 0x2edb9cu: return 121; /* descriptor-object construction */
+    case 0x0f3906u: return 122; /* generic lifecycle block */
+    case 0x0f3932u: return 123; /* incidental 10:D013 read */
+    case 0x0f3936u: return 124;
+    case 0x15f0eeu: return 130; /* six-way parent candidate */
+    case 0x15f2ceu: return 131; /* internal event return */
+    case 0x15f2d0u: return 132; /* returned event in RB1 */
+    case 0x15f2d6u: return 133; /* application-status query */
+    case 0x15f2dau: return 134; /* status result in R0 */
+    case 0x15f2dcu: return 135; /* branch on status */
+    case 0x15f2e0u: return 136; /* nonzero status: mark exit */
+    case 0x15f2e6u: return 137; /* synthesize local event 0x8E */
+    case 0x15f2eau: return 138; /* store synthesized event */
+    case 0x15f2eeu: return 139; /* compare local event with 0x86 */
+    case 0x15f2fau: return 140; /* accepted confirm path */
+    case 0x15f306u: return 141; /* selected-index query */
+    case 0x15f30au: return 142; /* selected-index query returned */
+    case 0x15f31au: return 143; /* modal redraw */
+    case 0x15f31eu: return 144; /* modal redraw returned */
+    case 0x15f326u: return 145; /* foreground-state commit */
+    case 0x15f32cu: return 146; /* selected index available */
+    case 0x15f35cu: return 147; /* selected table word in R0 */
+    case 0x15f360u: return 148; /* computed RET */
+    case 0x15fe40u: return 149; /* non-confirm event branch */
+    case 0x15fe4cu: return 150; /* event-0x8E exit branch */
+    case 0x15fe50u: return 151; /* modal loop tail */
+    case 0x15fe54u: return 152; /* modal exit cleanup */
+    case 0x15fefau: return 153; /* six-way parent epilogue */
+    case 0x15f36eu: return 160; /* index 0: D019 / kind 0x58 */
+    case 0x15f556u: return 161; /* index 1: D012 / kind 0x51 */
+    case 0x15f73au: return 162; /* index 2: D015 / kind 0x54 */
+    case 0x15f8aau: return 163; /* index 3: D014 / kind 0x53 */
+    case 0x15fb8au: return 164; /* index 4: D01C / kind 0x68 */
+    case 0x15fa1au: return 165; /* index 5: D017 / kind 0x56 */
+    case 0x14b768u: return 170; /* object persistence dispatcher */
+    case 0x14b772u: return 171; /* linked frame, object args valid */
+    case 0x14b816u: return 172; /* callback event dispatch */
+    case 0x14b868u: return 173; /* event 0x86 confirm */
+    case 0x14b8e0u: return 174; /* object kind in R0 */
+    case 0x14b92eu: return 175; /* kind-table target in R0 */
+    case 0x14b930u: return 176; /* computed RET */
+    case 0x14b932u: return 177; /* first object-kind case follows */
+    case 0x14ba5cu: return 180; /* kind 0x52 / D013 case */
+    case 0x14babau: return 181; /* D013 writer */
+    case 0x14bb28u: return 182; /* kind 0x55 / D016 case */
+    case 0x14bb74u: return 183; /* D016 writer */
+    case 0x14bd58u: return 184; /* kind 0x56 / D017 case */
+    case 0x14bda4u: return 185; /* D017 writer */
+    case 0x15fceau: return 186; /* index 4 / D01C writer */
+    case 0x32ebaeu: return 187; /* generic persistent-byte writer */
+    case 0x19c876u: return 200; /* sound-settings five-item selector */
+    case 0x19ca3eu: return 201;
+    case 0x19cc2eu: return 202;
+    case 0x19cc38u: return 203;
+    case 0x19cc3cu: return 204;
+    case 0x19cc54u: return 205;
+    case 0x19cc74u: return 206;
+    case 0x19cc78u: return 207;
+    case 0x19cc94u: return 208;
+    case 0x1ba454u: return 210; /* sound-effects switch editor */
+    case 0x1ba46cu: return 211;
+    case 0x1bac7au: return 212;
+    case 0x1bacbeu: return 213;
+    default: return 0;
+    }
+}
+
 uint32_t HELPER(exec)(CPUDMCUState *env, uint32_t word0, uint32_t word1)
 {
     static unsigned resident_allocator_trace_steps;
     static unsigned result_heap_failure_logs;
     static unsigned result_heap_return_logs;
     static unsigned storage_sector_probe_trace_steps;
+    static unsigned storage_page_read_midbody_entries;
     static unsigned application_input_callback_trace_steps;
     static unsigned resource_data_control_entries;
     static unsigned menu_result_data_control_entries;
@@ -11592,11 +19971,16 @@ uint32_t HELPER(exec)(CPUDMCUState *env, uint32_t word0, uint32_t word1)
     static bool state50_branch_trace_active;
     static unsigned state50_branch_trace_steps;
     static unsigned resident_event_path_trace_steps;
+    static unsigned resource_release_trace_steps;
+    static bool start_event_state_import_active;
+    static unsigned start_event_state_import_steps;
+    static bool start_event_dispatch_active;
+    static unsigned start_event_dispatch_steps;
     uint8_t op = word0 >> 8;
     uint8_t arg = word0;
     uint16_t ext = word1;
     uint32_t start = env->pc & MASK24;
-    uint32_t next = (start + dmcu_insn_size(word0)) & MASK24;
+    uint32_t next = dmcu_code_advance(start, dmcu_insn_size(word0));
     uint32_t value, left, right;
     uint32_t old_sp = env->gpr[DMCU_SP] & MASK16;
     uint32_t old_fp = env->gpr[DMCU_FP] & MASK16;
@@ -11605,18 +19989,433 @@ uint32_t HELPER(exec)(CPUDMCUState *env, uint32_t word0, uint32_t word1)
     bool was_ignoring_ds = env->ignore_ds_count != 0;
     bool was_critical = env->critical_count != 0;
     bool address_space_changed;
+    bool execute_vma03_program =
+        DMCU_CPU(env_cpu(env))->reset_pc == 0x00030000u &&
+        start >= 0x00030000u &&
+        start < 0x00030000u + DMCU_PROGRAM_SIZE;
     bool execute_resident_rom =
-        start >= env->resident_rom_base && start < env->resident_rom_limit;
+        !execute_vma03_program && start >= env->resident_rom_base &&
+        start < env->resident_rom_limit;
     bool execute_auxiliary =
         start >= env->auxiliary_code_base && start < env->auxiliary_code_limit;
     bool skeleton_hole = env->soc_rom_skeleton && execute_resident_rom &&
                          word0 == 0x0f00;
     unsigned trace_slot = env->exec_trace_count % DMCU_EXEC_TRACE_WORDS;
 
+    env->irq_state_changed = false;
+
+    if (unlikely(env->instruction_clock_enabled)) {
+        dmcu_instruction_clock_step(env, word0);
+    }
+
     /* Data helpers run after env->pc has advanced to the fall-through PC.
      * Keep the actual instruction start separately so watchpoints can report
      * both the writer and its next PC without a two-byte ambiguity. */
     env->current_instruction_pc = start;
+    audio_file_observe(env, start);
+
+    if (start == dmcu_code_address(0x0c, 0x0000)) {
+        unsigned index;
+
+        env->vma03_handle_entries++;
+        if (env->vma03_handle_entries == 1) {
+            env->vma03_handle_previous_pc =
+                env->completed_instruction_pc & MASK24;
+            env->vma03_handle_previous_word =
+                env->completed_instruction_word & MASK16;
+            env->vma03_handle_entry_sp = old_sp;
+            env->vma03_handle_entry_fp = old_fp;
+            for (index = 0; index < 8; index++) {
+                env->vma03_handle_entry_stack[index] = internal_data_read(
+                    (old_sp + index * 2u) & MASK16, 16);
+            }
+        }
+    } else if (start == dmcu_code_address(0x31, 0xce52)) {
+        env->vma03_handle_constructor_31_entries++;
+    } else if (start == dmcu_code_address(0x32, 0x2fb2)) {
+        env->vma03_handle_constructor_32_entries++;
+    }
+
+    /* Observer-only progress marker for the original VMA03 reminder-init
+     * buffer clear.  It distinguishes one slow finite clear from an outer
+     * caller that repeatedly recreates the same 0x600-word object. */
+    if (start == dmcu_code_address(0x30, 0x638e)) {
+        env->vma03_clear_entries++;
+    } else if (start == dmcu_code_address(0x30, 0x638c)) {
+        env->vma03_clear_exits++;
+    } else if (start >= dmcu_code_address(0x30, 0x639e) &&
+               start <= dmcu_code_address(0x30, 0x6440)) {
+        env->vma03_clear_max_counter = MAX(
+            env->vma03_clear_max_counter,
+            internal_data_read((old_fp - 2u) & MASK16, 16));
+    }
+
+    {
+        static const uint32_t matrix_pipeline_stage_pc[10] = {
+            0x27e5acu, /* installed raw scanner raises A2:2A5C */
+            0x27e5b0u, /* installed scanner obtains the physical index */
+            0x27e5e8u, /* installed scanner submits the completion job */
+            0x32241au, /* completion-job scheduler entry */
+            0x3338f8u, /* exact wrapper clears gate and calls worker */
+            0x28f4a4u, /* exact key-completion worker */
+            0x324c34u, /* timer/event-ready predicate */
+            0x29bddcu, /* NPE caller of the ROM03 direction veneer */
+            0x03411cu, /* ROM03 veneer retargeted by reconstructed ROM */
+            0x1a7b00u, /* exact relocated horizontal-direction helper */
+        };
+        unsigned stage;
+
+        for (stage = 0; stage < ARRAY_SIZE(matrix_pipeline_stage_pc);
+             stage++) {
+            if (start == matrix_pipeline_stage_pc[stage]) {
+                env->matrix_pipeline_stage_count[stage]++;
+                env->matrix_pipeline_stage_sp[stage] = old_sp;
+                env->matrix_pipeline_stage_fp[stage] = old_fp;
+                break;
+            }
+        }
+    }
+
+    /* A single raw matrix scan has been observed to reach the exact
+     * 33:38F8 completion wrapper twice for short-lived modal events.  Retain
+     * the wrapper and worker entries, their immediately preceding executed
+     * PC, and the guest event slots so the duplicate caller can be identified
+     * without suppressing either invocation.  This ring is observation-only:
+     * it never acknowledges an IRQ or changes guest memory/registers. */
+    if (start == 0x3338f8u || start == 0x28f4a4u) {
+        uint32_t sequence = env->matrix_completion_trace_count++;
+        unsigned slot = sequence % DMCU_MATRIX_COMPLETION_TRACE_SLOTS;
+        unsigned previous_slot = env->exec_trace_count ?
+            (env->exec_trace_count - 1u) % DMCU_EXEC_TRACE_WORDS : 0;
+        unsigned index;
+
+        env->matrix_completion_trace_pc[slot] = start;
+        env->matrix_completion_trace_previous_pc[slot] =
+            env->exec_trace_count ? env->exec_trace_pc[previous_slot] : 0;
+        env->matrix_completion_trace_sp[slot] = old_sp;
+        env->matrix_completion_trace_fp[slot] = old_fp;
+        env->matrix_completion_trace_ds0[slot] = old_ds0;
+        env->matrix_completion_trace_ds1[slot] = old_ds1;
+        env->matrix_completion_trace_gate[slot] = address_space_lduw_le(
+            &address_space_memory, 0x512a5cu,
+            MEMTXATTRS_UNSPECIFIED, NULL);
+        env->matrix_completion_trace_index[slot] = address_space_lduw_le(
+            &address_space_memory, 0x512a8au,
+            MEMTXATTRS_UNSPECIFIED, NULL);
+        env->matrix_completion_trace_candidate[slot] = address_space_lduw_le(
+            &address_space_memory, 0x5128d8u,
+            MEMTXATTRS_UNSPECIFIED, NULL);
+        env->matrix_completion_trace_mapped[slot] = address_space_lduw_le(
+            &address_space_memory, 0x5128dau,
+            MEMTXATTRS_UNSPECIFIED, NULL);
+        env->matrix_completion_trace_critical[slot] =
+            env->critical_count & MASK16;
+        env->matrix_completion_trace_sfr[slot][0] = env->sfr[0x27] & MASK16;
+        env->matrix_completion_trace_sfr[slot][1] = env->sfr[0x39] & MASK16;
+        env->matrix_completion_trace_sfr[slot][2] = env->sfr[0x41] & MASK16;
+        for (index = 0; index < DMCU_MATRIX_COMPLETION_TRACE_STACK_WORDS;
+             index++) {
+            env->matrix_completion_trace_stack[slot][index] =
+                internal_data_read((old_sp + index * 2u) & MASK16, 16);
+        }
+    }
+
+    /* Retain decisive instruction checkpoints for the state-0x55 descriptor
+     * resolver, generic 0F:2094 lifecycle path, 14:B768 persistence
+     * dispatcher, six-way parent candidate and five-item sound selector in
+     * one chronological ring.  The kind numbers identify the
+     * checkpoint family; all sampled A0/A4 bytes and registers remain
+     * guest-owned.  This observer is deliberately read-only: it does not
+     * synthesize a selection, event,
+     * resource write, register value or control-flow edge. */
+    {
+        unsigned kind = np560_sound_trace_kind(start);
+
+        if (kind) {
+            uint32_t sequence = env->sound_settings_trace_count++;
+            uint32_t sound_slot =
+                sequence % DMCU_SOUND_SETTINGS_TRACE_SLOTS;
+
+            env->sound_settings_trace_pc[sound_slot] = start;
+            env->sound_settings_trace_target[sound_slot] = 0;
+            env->sound_settings_trace_kind[sound_slot] =
+                kind;
+            env->sound_settings_trace_event[sound_slot] =
+                address_space_ldub(&address_space_memory,
+                                   0x507e38u ^ 1u,
+                                   MEMTXATTRS_UNSPECIFIED, NULL);
+            env->sound_settings_trace_selection[sound_slot] =
+                address_space_ldub(&address_space_memory,
+                                   0x52573eu ^ 1u,
+                                   MEMTXATTRS_UNSPECIFIED, NULL);
+            env->sound_settings_trace_highlight[sound_slot] =
+                address_space_ldub(&address_space_memory,
+                                   0x525674u ^ 1u,
+                                   MEMTXATTRS_UNSPECIFIED, NULL);
+            env->sound_settings_trace_cursor[sound_slot] =
+                address_space_ldub(&address_space_memory,
+                                   0x5256acu ^ 1u,
+                                   MEMTXATTRS_UNSPECIFIED, NULL);
+            env->sound_settings_trace_switch_state[sound_slot] =
+                address_space_ldub(&address_space_memory,
+                                   0x5256c0u ^ 1u,
+                                   MEMTXATTRS_UNSPECIFIED, NULL);
+            env->sound_settings_trace_switch_aux[sound_slot] =
+                address_space_ldub(&address_space_memory,
+                                   0x52568cu ^ 1u,
+                                   MEMTXATTRS_UNSPECIFIED, NULL);
+            env->sound_settings_trace_switch_step[sound_slot] =
+                address_space_ldub(&address_space_memory,
+                                   0x52567eu ^ 1u,
+                                   MEMTXATTRS_UNSPECIFIED, NULL);
+            env->sound_settings_trace_r0[sound_slot] =
+                env->gpr[0] & MASK16;
+            env->sound_settings_trace_r1[sound_slot] =
+                env->gpr[1] & MASK16;
+            env->sound_settings_trace_sp[sound_slot] = old_sp;
+            env->sound_settings_trace_post_sp[sound_slot] = old_sp;
+            env->sound_settings_trace_fp[sound_slot] = old_fp;
+            env->sound_settings_trace_return_cs[sound_slot] =
+                internal_data_read(old_sp, 16);
+            env->sound_settings_trace_return_pc[sound_slot] =
+                internal_data_read((old_sp + 2u) & MASK16, 16);
+        }
+    }
+
+    /* The exact 32:F3C6 application initializer is a closed LINK/UNLINK
+     * function, yet the Game World route has observed its final RETS pop an
+     * odd 10:D019 target.  Preserve the entry and pre-RETS frames in the
+     * structured diagnostics so the producer can be identified without
+     * enabling the extremely noisy per-page LOG_UNIMP stream.  This observer
+     * is read-only and retains the most recent invocation. */
+    if (start == dmcu_code_address(0x32, 0xf3c6)) {
+        unsigned index;
+
+        env->application_init_f3c6_entries++;
+        env->application_init_f3c6_entry_sp = old_sp;
+        env->application_init_f3c6_entry_fp = old_fp;
+        for (index = 0; index < 4; index++) {
+            env->application_init_f3c6_entry_gpr[index] =
+                env->gpr[index] & MASK16;
+        }
+        for (index = 0; index < DMCU_APPLICATION_INIT_F3C6_STACK_WORDS;
+             index++) {
+            env->application_init_f3c6_entry_stack[index] =
+                internal_data_read((old_sp + index * 2u) & MASK16, 16);
+        }
+    } else if (start == dmcu_code_address(0x30, 0xfe0e) &&
+               env->application_init_f3c6_entries >
+                   env->application_init_f3c6_returns) {
+        env->application_init_f3c6_child_entries++;
+    } else if (start == dmcu_code_address(0x32, 0xf400)) {
+        unsigned index;
+
+        env->application_init_f3c6_returns++;
+        env->application_init_f3c6_return_sp = old_sp;
+        env->application_init_f3c6_return_fp = old_fp;
+        for (index = 0; index < 4; index++) {
+            env->application_init_f3c6_return_gpr[index] =
+                env->gpr[index] & MASK16;
+        }
+        for (index = 0; index < DMCU_APPLICATION_INIT_F3C6_STACK_WORDS;
+             index++) {
+            env->application_init_f3c6_return_stack[index] =
+                internal_data_read((old_sp + index * 2u) & MASK16, 16);
+        }
+    }
+
+    /* A failed NPE launch can enter 5F:2766, the sector read call in the
+     * middle of the relocated framed 5F:261C page reader, without
+     * executing that reader's LINK.  Capture the inherited frame on the very
+     * first instruction at the call site.  This observer is intentionally
+     * read-only and bounded because a bad entry repeats once per sector. */
+    if (start == dmcu_code_address(0x5f, 0x2766) &&
+        storage_page_read_midbody_entries < 2u) {
+        qemu_log_mask(
+            LOG_UNIMP,
+            "DMCU storage page-read midbody #%u irq=%u "
+            "last-irq=%02x:%04x sp=%04x fp=%04x "
+            "r=%04x,%04x,%04x,%04x "
+            "stack=%04x,%04x,%04x,%04x,%04x,%04x,%04x,%04x "
+            "frame=%04x,%04x,%04x,%04x,%04x,%04x\n",
+            ++storage_page_read_midbody_entries, env->in_interrupt,
+            dmcu_code_segment(env->interrupt_last_entry_pc),
+            dmcu_code_pc(env->interrupt_last_entry_pc), old_sp, old_fp,
+            env->gpr[0] & MASK16, env->gpr[1] & MASK16,
+            env->gpr[2] & MASK16, env->gpr[3] & MASK16,
+            internal_data_read((old_sp + 0u) & MASK16, 16),
+            internal_data_read((old_sp + 2u) & MASK16, 16),
+            internal_data_read((old_sp + 4u) & MASK16, 16),
+            internal_data_read((old_sp + 6u) & MASK16, 16),
+            internal_data_read((old_sp + 8u) & MASK16, 16),
+            internal_data_read((old_sp + 10u) & MASK16, 16),
+            internal_data_read((old_sp + 12u) & MASK16, 16),
+            internal_data_read((old_sp + 14u) & MASK16, 16),
+            internal_data_read((old_fp + 0u) & MASK16, 16),
+            internal_data_read((old_fp + 2u) & MASK16, 16),
+            internal_data_read((old_fp + 4u) & MASK16, 16),
+            internal_data_read((old_fp + 6u) & MASK16, 16),
+            internal_data_read((old_fp + 8u) & MASK16, 16),
+            internal_data_read((old_fp + 10u) & MASK16, 16));
+    }
+
+    if (env->clock_resource_release_active) {
+        uint32_t slot = env->clock_resource_release_active - 1u;
+
+        if (start == dmcu_code_address(0x2e, 0x0af8)) {
+            /* 0AF6 LINK has completed: this is the stable outer frame whose
+             * FP-6 local carries the allocated handle through both workers. */
+            env->clock_resource_release_resource_sp[slot] = old_sp;
+            env->clock_resource_release_resource_fp[slot] = old_fp;
+        } else if (start == dmcu_code_address(0x2e, 0x0c64)) {
+            snapshot_clock_resource_release(
+                env, CLOCK_RESOURCE_RELEASE_PRE_8B26, start, next,
+                word0, ext, old_sp, old_fp, old_sp, old_fp,
+                false, 0xffffu);
+        } else if (start == dmcu_code_address(0x30, 0x8b26)) {
+            /* SCALL's two-word return frame precedes argument zero here. */
+            snapshot_clock_resource_release(
+                env, CLOCK_RESOURCE_RELEASE_ENTRY_8B26, start, next,
+                word0, ext, old_sp, old_fp, old_sp, old_fp,
+                true, internal_data_read((old_sp + 4u) & MASK16, 16));
+        } else if (start == dmcu_code_address(0x30, 0x3a56)) {
+            snapshot_clock_resource_release(
+                env, CLOCK_RESOURCE_RELEASE_ENTRY_3A56, start, next,
+                word0, ext, old_sp, old_fp, old_sp, old_fp,
+                true, internal_data_read((old_sp + 4u) & MASK16, 16));
+        } else if (start == dmcu_code_address(0x2e, 0x0c7c)) {
+            snapshot_clock_resource_release(
+                env, CLOCK_RESOURCE_RELEASE_EXIT, start, next,
+                word0, ext, old_sp, old_fp, old_sp, old_fp,
+                false, 0xffffu);
+            env->clock_resource_release_active = 0;
+        }
+    }
+
+    /* Bound the first bad clock pixel between the exact guest operations.
+     * 31:590E calls the 44x15 clock-background resource blit, while 31:596E
+     * calls the ordinary text renderer.  Snapshot both native framebuffer
+     * pages immediately before and after each call.  This records hashes and
+     * counts only; it neither clears pixels nor changes renderer state. */
+    if (start == dmcu_code_address(0x31, 0x590e)) {
+        uint32_t sequence = env->clock_raster_cycle_count++;
+        uint32_t slot = sequence % DMCU_CLOCK_RASTER_TRACE_SLOTS;
+
+        env->clock_raster_active_sequence = sequence + 1u;
+        env->clock_raster_sequence[slot] = sequence + 1u;
+        env->clock_raster_valid[slot] = 0;
+        memset(env->clock_raster_text[slot], 0,
+               sizeof(env->clock_raster_text[slot]));
+        snapshot_clock_raster_stage(env, slot, 0);
+    } else if (env->clock_raster_active_sequence) {
+        uint32_t sequence = env->clock_raster_active_sequence - 1u;
+        uint32_t slot = sequence % DMCU_CLOCK_RASTER_TRACE_SLOTS;
+        unsigned stage = DMCU_CLOCK_RASTER_TRACE_STAGES;
+
+        if (start == dmcu_code_address(0x31, 0x5912)) {
+            stage = 1;
+        } else if (start == dmcu_code_address(0x31, 0x596e)) {
+            uint16_t pointer_hi = internal_data_read(
+                (old_sp + 4u) & MASK16, 16);
+            uint16_t pointer_lo = internal_data_read(
+                (old_sp + 6u) & MASK16, 16);
+            unsigned index;
+
+            stage = 2;
+            for (index = 0; index < DMCU_CLOCK_RASTER_TEXT_BYTES; index++) {
+                env->clock_raster_text[slot][index] = pointer_hi == 0 ?
+                    internal_data_read((pointer_lo + index) & MASK16, 8) :
+                    address_space_ldub(
+                        &address_space_memory,
+                        ((((uint32_t)pointer_hi << 16) | pointer_lo) +
+                         index) & MASK24,
+                        MEMTXATTRS_UNSPECIFIED, NULL);
+            }
+        } else if (start == dmcu_code_address(0x31, 0x5972)) {
+            stage = 3;
+        }
+        if (stage < DMCU_CLOCK_RASTER_TRACE_STAGES) {
+            snapshot_clock_raster_stage(env, slot, stage);
+            if (stage == DMCU_CLOCK_RASTER_TRACE_STAGES - 1u) {
+                env->clock_raster_active_sequence = 0;
+            }
+        }
+    }
+
+    /* Arm a narrow, observer-only trace for the Start-key (0xB0) record
+     * passed by 28:84CC to the exact resident state importer at 1F:F470.
+     * At function entry SCALL's two-word return address precedes the far
+     * input pointer, hence old_sp+4/+6.  Other idle/UI imports are ignored so
+     * they cannot overwrite the one lifecycle transition under study. */
+    if (start == dmcu_code_address(0x1f, 0xf470)) {
+        uint16_t input_hi = internal_data_read((old_sp + 4u) & MASK16, 16);
+        uint16_t input_lo = internal_data_read((old_sp + 6u) & MASK16, 16);
+        uint32_t input = ((uint32_t)input_hi << 16) | input_lo;
+        uint16_t event = input_hi == 0x0051u ?
+            address_space_lduw_le(&address_space_memory,
+                                  (input + 8u) & MASK24,
+                                  MEMTXATTRS_UNSPECIFIED, NULL) : 0xffffu;
+
+        if (event == 0x00b0u) {
+            start_event_state_import_active = true;
+            start_event_state_import_steps = 0;
+            qemu_log_mask(
+                LOG_UNIMP,
+                "DMCU B0 state import begin input=%04x:%04x "
+                "record=%04x,%04x,%04x,%04x,%04x,%04x,%04x "
+                "count=%04x sp=%04x fp=%04x\n",
+                input_hi, input_lo,
+                address_space_lduw_le(&address_space_memory, input + 0u,
+                                      MEMTXATTRS_UNSPECIFIED, NULL),
+                address_space_lduw_le(&address_space_memory, input + 2u,
+                                      MEMTXATTRS_UNSPECIFIED, NULL),
+                address_space_lduw_le(&address_space_memory, input + 4u,
+                                      MEMTXATTRS_UNSPECIFIED, NULL),
+                address_space_lduw_le(&address_space_memory, input + 6u,
+                                      MEMTXATTRS_UNSPECIFIED, NULL),
+                address_space_lduw_le(&address_space_memory, input + 8u,
+                                      MEMTXATTRS_UNSPECIFIED, NULL),
+                address_space_lduw_le(&address_space_memory, input + 10u,
+                                      MEMTXATTRS_UNSPECIFIED, NULL),
+                address_space_lduw_le(&address_space_memory, input + 12u,
+                                      MEMTXATTRS_UNSPECIFIED, NULL),
+                address_space_lduw_le(&address_space_memory, 0x512250u,
+                                      MEMTXATTRS_UNSPECIFIED, NULL),
+                old_sp, old_fp);
+        }
+    }
+
+    /* Bounded observer for the root-window close path.  A2:2250 is raised by
+     * 26:3AAA when a foreground object is registered and must be lowered by
+     * the 2B:593E -> 2C:79B8 release chain before 20:3388 can return to the
+     * resident manager.  Keep the trace in the optional unimplemented log so
+     * it never changes guest state or floods normal runs. */
+    if ((start == dmcu_code_address(0x20, 0x31f4) ||
+         start == dmcu_code_address(0x22, 0xfd9e) ||
+         start == dmcu_code_address(0x28, 0xf4a4) ||
+         start == dmcu_code_address(0x2b, 0x593e) ||
+         start == dmcu_code_address(0x2c, 0x79b8) ||
+         start == dmcu_code_address(0x2c, 0x7ba8) ||
+         start == dmcu_code_address(0x32, 0x8268) ||
+         start == dmcu_code_address(0x20, 0x3388)) &&
+        resource_release_trace_steps < 32) {
+        qemu_log_mask(
+            LOG_UNIMP,
+            "DMCU resource release trace #%u pc=%02x:%04x from=%02x:%04x "
+            "count=%04x pending=%04x sp=%04x fp=%04x arg=%04x:%04x\n",
+            resource_release_trace_steps + 1,
+            dmcu_code_segment(start), dmcu_code_pc(start),
+            dmcu_code_segment(env->completed_instruction_pc),
+            dmcu_code_pc(env->completed_instruction_pc),
+            address_space_lduw_le(&address_space_memory, 0x512250u,
+                                  MEMTXATTRS_UNSPECIFIED, NULL),
+            address_space_lduw_le(&address_space_memory, 0x512abau,
+                                  MEMTXATTRS_UNSPECIFIED, NULL),
+            old_sp, old_fp,
+            internal_data_read((old_fp + 6u) & MASK16, 16),
+            internal_data_read((old_fp + 8u) & MASK16, 16));
+        resource_release_trace_steps++;
+    }
 
     if (env->file_component_watch_active && start == 0x28daacu) {
         uint16_t component_fp = env->file_component_entry_fp;
@@ -12165,12 +20964,12 @@ uint32_t HELPER(exec)(CPUDMCUState *env, uint32_t word0, uint32_t word1)
                             &env->native_refresh_preflush_front_hash);
     }
 
-    if (start == dmcu_code_address(0x08, 0x4264) && env->in_interrupt) {
+    if (start == dmcu_code_address(0x08, 0x4258) && env->in_interrupt) {
         env->irq_save_fp_restores++;
         env->irq_save_fp_restore_entry = env->interrupt_entries;
         env->irq_save_fp_restore_pc = start;
-        env->irq_save_fp_restore_expected = env->irq_save_fp_saved_value;
-        env->irq_save_fp_restore_value = internal_data_read(0x04d6, 16);
+        env->irq_save_fp_restore_expected = env->irq_save_fp_save_expected;
+        env->irq_save_fp_restore_value = internal_data_read(0x04d0, 16);
         env->irq_save_fp_restore_fp = old_fp;
     }
 
@@ -12200,7 +20999,7 @@ uint32_t HELPER(exec)(CPUDMCUState *env, uint32_t word0, uint32_t word1)
     /*
      * 25:206E does not dereference 10:Dxxx as a flat ROM far pointer.  Its
      * 28:12A8 child divides the address by the 0x200-byte transfer window,
-     * asks 2D:261C/2C:2EBA for the corresponding FTL page, and copies from
+     * asks 5F:261C/2C:2EBA for the corresponding FTL page, and copies from
      * 51:1840.  Trace the bounded intermediate results while reconstructing
      * that NAND-backed resource path; this is diagnostic only and never
      * changes guest registers or memory.
@@ -12214,8 +21013,8 @@ uint32_t HELPER(exec)(CPUDMCUState *env, uint32_t word0, uint32_t word1)
     if ((start == 0x29ac7au || start == 0x29aca2u ||
          start == 0x29acd2u || start == 0x29ad04u ||
          start == 0x29ad30u || start == 0x29ad82u ||
-         start == 0x29aee8u || start == 0x2d262cu ||
-         start == 0x2d276au || start == 0x2d27e4u ||
+         start == 0x29aee8u || start == 0x5f262cu ||
+         start == 0x5f276au || start == 0x5f27e4u ||
          start == 0x2c2f5cu || start == 0x2c2f60u ||
          start == 0x2c2f7eu || start == 0x2c2faau ||
          start == 0x2c3008u) &&
@@ -12694,6 +21493,158 @@ uint32_t HELPER(exec)(CPUDMCUState *env, uint32_t word0, uint32_t word1)
                 address_space_lduw_le(&address_space_memory, 0x512a4eu,
                                       MEMTXATTRS_UNSPECIFIED, NULL);
         }
+    }
+    /* Exact source 3B:F734 is relocated to 1E:F734 for the state-50/modal
+     * input worker.  At 1E:F8E4 its mapped event has already been copied to
+     * frame local FP-0x0A and is about to enter the original dispatch tree.
+     * Count that read-only boundary separately from root KEYMAPRET so Web
+     * probes do not mistake a legitimate modal consumer for a lost key. */
+    if (start == dmcu_code_address(0x1e, 0xf8e4)) {
+        uint16_t modal_event =
+            internal_data_read((old_fp - 0x02u) & MASK16, 16);
+
+        env->matrix_modal_dispatches++;
+        env->matrix_modal_event_last = modal_event;
+        if (modal_event == 0x0086u && env->npe_game_draw_calls > 0u) {
+            /* Re-arm the observer-only foreground/control rings at the exact
+             * action-key dispatch in an already-running NPE game.  This keeps
+             * the action path separate from the million-edge loader trace and
+             * lets a later transfer into the low segment-51 resource window
+             * preserve its real predecessor instead of an IRQ return. */
+            env->npe_low51_entry_valid = false;
+            env->npe_low51_exec_valid = false;
+            env->npe_low51_exec_history_count = 0;
+            env->npe_game_ui_reentry_valid = false;
+            env->npe_game_ui_reentry_history_count = 0;
+            env->npe_game_action_trace_armed = true;
+            env->npe_game_linked_loader_valid = false;
+            env->npe_game_linked_loader_history_count = 0;
+            env->foreground_trace_count = 0;
+            env->control_trace_count = 0;
+            env->control_trace_frozen = false;
+        }
+        if (env->npe_glyph_trace_armed && modal_event == 0x0086u) {
+            /* The common worker also belongs to live 1F:D5B2.  Preserve the
+             * already-active phase-2 loader ring for that caller; only a
+             * standalone modal decoder owns a fresh phase-1 ring. */
+            if (!env->npe_loader_event_watch_active) {
+                env->npe_control_trace_count = 0;
+                env->npe_control_trace_frozen = false;
+            }
+            env->npe_modal_control_trace_pending = true;
+            env->npe_modal_control_trace_active = false;
+            env->npe_modal_control_trace_caller = 0;
+            env->npe_modal_control_trace_result = 0;
+            env->npe_modal_control_trace_outputs_valid = false;
+            env->npe_modal_control_trace_type = 0;
+            env->npe_modal_control_trace_code = 0;
+            env->npe_modal_control_trace_decoder_valid = false;
+            env->npe_modal_control_trace_decoder_caller = 0;
+            env->npe_modal_control_trace_decoder_result = 0;
+        }
+    }
+    if (env->npe_game_action_trace_armed &&
+        !env->npe_game_linked_loader_valid && !env->in_interrupt &&
+        start >= dmcu_code_address(0x29, 0xbdbe) &&
+        start < dmcu_code_address(0x29, 0xd0ba)) {
+        uint32_t count = MIN(env->foreground_trace_count,
+                             (uint32_t)DMCU_NPE_UI_REENTRY_HISTORY_WORDS);
+        uint32_t first = env->foreground_trace_count - count;
+        uint32_t index;
+
+        /* 0C:BDBE owns the immutable loader copy.  Execution in the linked
+         * 29:BDBE..D0B9 source overlap after an action event is the earlier
+         * alias escape which eventually falls into the unrelated 29:D0BA UI
+         * overlay.  Freeze diagnostic history at its first instruction. */
+        env->npe_game_linked_loader_valid = true;
+        env->npe_game_linked_loader_pc = start & MASK24;
+        env->npe_game_linked_loader_word = word0 & MASK16;
+        env->npe_game_linked_loader_sp = old_sp & MASK16;
+        env->npe_game_linked_loader_fp = old_fp & MASK16;
+        env->npe_game_linked_loader_history_count = count;
+        for (index = 0; index < count; index++) {
+            uint32_t source = (first + index) % DMCU_FOREGROUND_TRACE_WORDS;
+
+            env->npe_game_linked_loader_history_pc[index] =
+                env->foreground_trace_pc[source];
+            env->npe_game_linked_loader_history_word[index] =
+                env->foreground_trace_word[source] & MASK16;
+            env->npe_game_linked_loader_history_sp[index] =
+                env->foreground_trace_sp[source] & MASK16;
+        }
+        for (index = 0; index < DMCU_NPE_UI_REENTRY_STACK_WORDS; index++) {
+            env->npe_game_linked_loader_stack[index] =
+                internal_data_read((old_sp + index * 2u) & MASK16, 16);
+        }
+        env->control_trace_frozen = true;
+    }
+    if (!env->npe_game_ui_reentry_valid && !env->in_interrupt &&
+        env->npe_game_ui_init_rets_seen > 0u &&
+        start >= dmcu_code_address(0x29, 0xd0ba) &&
+        start < dmcu_code_address(0x29, 0xd34e)) {
+        uint32_t count = MIN(env->foreground_trace_count,
+                             (uint32_t)DMCU_NPE_UI_REENTRY_HISTORY_WORDS);
+        uint32_t first = env->foreground_trace_count - count;
+        uint32_t index;
+
+        /* The first 29:D34E return has already consumed the only observed
+         * 1D:8EF0 call frame.  Reaching any initializer instruction again is
+         * the earliest bounded anomaly, so preserve both foreground history
+         * and current stack before the second pass can overwrite evidence.
+         * This is observer-only: no architectural state or guest memory is
+         * changed. */
+        env->npe_game_ui_reentry_valid = true;
+        env->npe_game_ui_reentry_pc = start & MASK24;
+        env->npe_game_ui_reentry_word = word0 & MASK16;
+        env->npe_game_ui_reentry_sp = old_sp & MASK16;
+        env->npe_game_ui_reentry_fp = old_fp & MASK16;
+        env->npe_game_ui_reentry_history_count = count;
+        for (index = 0; index < count; index++) {
+            uint32_t source = (first + index) % DMCU_FOREGROUND_TRACE_WORDS;
+
+            env->npe_game_ui_reentry_history_pc[index] =
+                env->foreground_trace_pc[source];
+            env->npe_game_ui_reentry_history_word[index] =
+                env->foreground_trace_word[source] & MASK16;
+            env->npe_game_ui_reentry_history_sp[index] =
+                env->foreground_trace_sp[source] & MASK16;
+        }
+        for (index = 0; index < DMCU_NPE_UI_REENTRY_STACK_WORDS; index++) {
+            env->npe_game_ui_reentry_stack[index] =
+                internal_data_read((old_sp + index * 2u) & MASK16, 16);
+        }
+        env->control_trace_frozen = true;
+    }
+    if (!env->npe_low51_exec_valid && !env->in_interrupt &&
+        env->npe_game_draw_calls > 0u &&
+        start >= dmcu_code_address(0x51, 0x0000) &&
+        start < dmcu_code_address(0x51, 0x2000)) {
+        uint32_t count = MIN(env->foreground_trace_count,
+                             (uint32_t)DMCU_NPE_LOW51_EXEC_HISTORY_WORDS);
+        uint32_t first = env->foreground_trace_count - count;
+        uint32_t index;
+
+        /* The low 51 bank contains the streamed NPE resource window in the
+         * current game.  Capture the first foreground instruction plus the
+         * complete bounded predecessor ring and stop only diagnostic control
+         * logging.  No architectural register, memory or PC is changed. */
+        env->npe_low51_exec_valid = true;
+        env->npe_low51_exec_pc = start & MASK24;
+        env->npe_low51_exec_word = word0 & MASK16;
+        env->npe_low51_exec_sp = old_sp & MASK16;
+        env->npe_low51_exec_fp = old_fp & MASK16;
+        env->npe_low51_exec_history_count = count;
+        for (index = 0; index < count; index++) {
+            uint32_t source = (first + index) % DMCU_FOREGROUND_TRACE_WORDS;
+
+            env->npe_low51_exec_history_pc[index] =
+                env->foreground_trace_pc[source];
+            env->npe_low51_exec_history_word[index] =
+                env->foreground_trace_word[source] & MASK16;
+            env->npe_low51_exec_history_sp[index] =
+                env->foreground_trace_sp[source] & MASK16;
+        }
+        env->control_trace_frozen = true;
     }
     if (!env->in_interrupt && !env->missing_rom_valid) {
         unsigned foreground_slot = env->foreground_trace_count %
@@ -13330,7 +22281,56 @@ uint32_t HELPER(exec)(CPUDMCUState *env, uint32_t word0, uint32_t word1)
                       rom_argument(env, 4), rom_argument(env, 5));
     }
 
-    if (!env->rom_hle_enabled && start < DMCU_PROGRAM_BASE &&
+    if (start == dmcu_code_address(0x29, 0x4092)) {
+        uint16_t frame = old_fp & MASK16;
+
+        qemu_log_mask(
+            LOG_UNIMP,
+            "DMCU resident-event helper pre-UNLINK sp=%04x fp=%04x "
+            "saved-fp=%04x return=%04x:%04x below=%04x,%04x,%04x,%04x\n",
+            old_sp, old_fp,
+            internal_data_read(frame, 16),
+            internal_data_read((frame + 2u) & MASK16, 16),
+            internal_data_read((frame + 4u) & MASK16, 16),
+            internal_data_read((frame + 6u) & MASK16, 16),
+            internal_data_read((frame + 8u) & MASK16, 16),
+            internal_data_read((frame + 10u) & MASK16, 16),
+            internal_data_read((frame + 12u) & MASK16, 16));
+    }
+    if (start == dmcu_code_address(0x5f, 0x2766)) {
+        static unsigned resident_event_bad_continuation_logs;
+
+        if (resident_event_bad_continuation_logs < 4u) {
+            qemu_log_mask(
+                LOG_UNIMP,
+                "DMCU page-loop checkpoint at 5F:2766 "
+                "sp=%04x fp=%04x word=%04x "
+                "stack=%04x,%04x,%04x,%04x,%04x,%04x\n",
+                old_sp, old_fp, word0 & MASK16,
+                internal_data_read(old_sp, 16),
+                internal_data_read((old_sp + 2u) & MASK16, 16),
+                internal_data_read((old_sp + 4u) & MASK16, 16),
+                internal_data_read((old_sp + 6u) & MASK16, 16),
+                internal_data_read((old_sp + 8u) & MASK16, 16),
+                internal_data_read((old_sp + 10u) & MASK16, 16));
+            resident_event_bad_continuation_logs++;
+        }
+    }
+
+    /* A registered HLE gate is a deliberate marker in a reconstructed
+     * 01/02 ROM hole. Its following RETS remains an ordinary CPU return.
+     * Every other hole still takes the strict missing-ROM path below. */
+    if (skeleton_hole && start >= 0x10000 && start < 0x30000) {
+        DMCUCPU *cpu = DMCU_CPU(env_cpu(env));
+        if (cpu->rom_service &&
+            cpu->rom_service(cpu->rom_service_opaque, env, start)) {
+            env->pc = next;
+            goto complete;
+        }
+    }
+
+    if (!env->rom_hle_enabled && !execute_vma03_program &&
+        start < DMCU_PROGRAM_BASE &&
         !execute_auxiliary && (!execute_resident_rom || skeleton_hole)) {
         CPUState *cs = env_cpu(env);
 
@@ -13380,17 +22380,54 @@ uint32_t HELPER(exec)(CPUDMCUState *env, uint32_t word0, uint32_t word1)
     }
 
     np560_hle_tick(env);
+    /* Reject before executing the target: e.g. REP; LINK must not corrupt
+     * FP/SP first, and REP; JBC must not clear its bit before failing.
+     * The manual establishes IREP/EXR bit 6 but not its vector or EXR SFR
+     * address. Stop explicitly until those are recovered; do not invent a
+     * TRAP vector, clear the repeat and carry on, or claim exception entry.
+     * Explicit ROM-hole handling above keeps its more specific diagnosis.
+     */
+    if (env->single_repeat_count && start == env->single_repeat_pc &&
+        forbidden_rep_target(word0)) {
+        env->unsupported_repeat_reason = 1;
+        unsupported(env, start, word0);
+    }
+    if (is_repeat_instruction(word0) &&
+        (dmcu_sfr_read_word(env, DMCU_SFR_PSW) & DMCU_PSR_CIRQ)) {
+        env->unsupported_repeat_reason = 2;
+        unsupported(env, start, word0);
+    }
     if (np560_native_tick(env, start)) {
-        return false;
+        return DMCU_EXEC_EXIT;
     }
     env->pc = next;
 
+    if (!instruction_y_addresses_valid(env, op, arg, ext)) {
+        unsupported(env, start, word0);
+    }
+
+    {
+        uint32_t pointers = instruction_agu_pointer_mask(op, arg);
+        static const unsigned known_agu[] = { 8, 10, 14 };
+
+        for (unsigned i = 0; i < ARRAY_SIZE(known_agu); i++) {
+            unsigned reg = known_agu[i];
+
+            if ((pointers & (1u << reg)) &&
+                !pointer_circular_valid(env, reg, env->gpr[reg])) {
+                unsupported(env, start, word0);
+            }
+        }
+    }
+
+    env->instruction_clock_data_active = env->instruction_clock_enabled;
     if (exec_alu(env, op, arg, ext) ||
         exec_move(env, op, arg, ext) ||
         exec_shift(env, op, arg) ||
         exec_bit(env, op, arg, ext) ||
         exec_control(env, op, arg, ext, start, next) ||
         exec_compare_update(env, op, arg, ext) ||
+        exec_mac(env, op, arg, ext) ||
         exec_divide(env, op, arg) ||
         exec_exponent(env, op, arg)) {
         goto complete;
@@ -13410,10 +22447,24 @@ uint32_t HELPER(exec)(CPUDMCUState *env, uint32_t word0, uint32_t word1)
     }
     if (op == 0xc0 || op == 0xc1) {
         int64_t product;
+        bool overflow = false;
+
         left = env->gpr[arg >> 4] & MASK16;
         right = env->gpr[arg & 15] & MASK16;
-        product = op == 0xc0 ? (int64_t)sext16(left) * sext16(right)
-                             : (uint64_t)left * right;
+        if (op == 0xc0) {
+            product = (int64_t)sext16(left) * sext16(right);
+            /* CN1916884A p32 and the SOCR.FR definition: signed MUL,
+             * like signed-signed MAC, shifts the product left once in
+             * fractional mode. UMUL (p33) has no fractional operation.
+             * Multiply in int64_t so negative values and -32768 squared
+             * avoid signed-shift/32-bit-overflow undefined behavior. */
+            if (sfr_read(env, DMCU_SFR_SOCR, 16) & DMCU_SOCR_FR) {
+                product *= 2;
+            }
+            overflow = product < INT32_MIN || product > INT32_MAX;
+        } else {
+            product = (int64_t)left * right;
+        }
         /* MUL/UMUL expose their 32-bit result in R6:R7.  R5 is not an
          * extension register: vendor helpers deliberately retain far-pointer
          * bases in R4:R5 across these instructions without saving R5. */
@@ -13421,6 +22472,10 @@ uint32_t HELPER(exec)(CPUDMCUState *env, uint32_t word0, uint32_t word1)
         env->gpr[7] = product & MASK16;
         set_flag(env, DMCU_PSW_Z, (uint32_t)product == 0);
         set_flag(env, DMCU_PSW_N, product & 0x80000000u);
+        /* MUL reports double-word overflow; UMUL explicitly clears V.
+         * The C rows in both source tables incorrectly name V, so leave
+         * that independently unverified flag unchanged for now. */
+        set_flag(env, DMCU_PSW_V, overflow);
         goto complete;
     }
     if (op == 0x1f) {
@@ -13460,6 +22515,18 @@ uint32_t HELPER(exec)(CPUDMCUState *env, uint32_t word0, uint32_t word1)
     if (op == 0xc7 && arg == 0) {
         goto complete;
     }
+    if (word0 == 0x3fff) {
+        /* CN1916884A p115: RESET resets the DMCU, preserving memory.
+         * Request it at the system boundary, outside the running TB: the
+         * board must reset the on-chip devices after the shared CPU/SFRs.
+         * Never execute the fall-through instruction while it is pending.
+         */
+        CPUState *cs = env_cpu(env);
+
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+        cs->exception_index = EXCP_HLT;
+        cpu_loop_exit(cs);
+    }
     if (op == 0x3f && arg <= 3) {
         /*
          * CRIT #imm2 prevents hardware interrupts during the following
@@ -13471,21 +22538,17 @@ uint32_t HELPER(exec)(CPUDMCUState *env, uint32_t word0, uint32_t word1)
     }
     if (op == 0x3f && arg >= 0x10 && arg <= 0x13) {
         env->ignore_ds_count = (arg & 3) + 1;
-        tlb_flush(env_cpu(env));
+        tlb_flush_by_mmuidx(env_cpu(env), 1u << MMU_DATA_IDX);
         goto complete;
     }
     if (op == 0xbf && arg == 0) {
-        env->repeat_pc = next;
-        env->repeat_end = next;
-        env->repeat_count = (uint32_t)ext + 1;
-        env->repeat_block = false;
+        env->single_repeat_pc = next;
+        env->single_repeat_count = (uint32_t)ext + 1;
         goto complete;
     }
     if (op == 0xcf && (arg >> 4) == 0) {
-        env->repeat_pc = next;
-        env->repeat_end = next;
-        env->repeat_count = (env->gpr[arg & 15] & MASK16) + 1;
-        env->repeat_block = false;
+        env->single_repeat_pc = next;
+        env->single_repeat_count = (env->gpr[arg & 15] & MASK16) + 1;
         goto complete;
     }
     if (op == 0xae || (op == 0xaf && (arg >> 4) == 0)) {
@@ -13496,12 +22559,183 @@ uint32_t HELPER(exec)(CPUDMCUState *env, uint32_t word0, uint32_t word1)
         goto complete;
     }
     if (op == 0x0f) {
-        qemu_log_mask(LOG_UNIMP, "DMCU TRAP %02x stubbed\n", arg);
+        /* TRAP is synchronous, not an ICR.RQ write. Return after the two-byte
+         * instruction, with 16-bit PC wrap confined to the caller's CS. */
+        dmcu_software_trap(env, dmcu_code_address(dmcu_code_segment(start),
+                                                 dmcu_code_pc(next)), arg);
         goto complete;
     }
     unsupported(env, start, word0);
 
 complete:
+    env->instruction_clock_data_active = false;
+    if (start_event_state_import_active &&
+        dmcu_code_segment(start) == 0x1f &&
+        (start == dmcu_code_address(0x1f, 0xf488) ||
+         start == dmcu_code_address(0x1f, 0xf4e4) ||
+         start == dmcu_code_address(0x1f, 0xf510) ||
+         start == dmcu_code_address(0x1f, 0xf7c6) ||
+         start == dmcu_code_address(0x1f, 0xf7da) ||
+         start == dmcu_code_address(0x1f, 0xf7dc) ||
+         start == dmcu_code_address(0x1f, 0xf800) ||
+         start == dmcu_code_address(0x1f, 0xf81e) ||
+         start == dmcu_code_address(0x1f, 0xf85e) ||
+         start == dmcu_code_address(0x1f, 0xf886) ||
+         start == dmcu_code_address(0x1f, 0xf8ae) ||
+         start == dmcu_code_address(0x1f, 0xf8c2) ||
+         start == dmcu_code_address(0x1f, 0xf8d0) ||
+         start == dmcu_code_address(0x1f, 0xf8e2) ||
+         start == dmcu_code_address(0x1f, 0xf8f4) ||
+         start == dmcu_code_address(0x1f, 0xf90a) ||
+         start == dmcu_code_address(0x1f, 0xf95c) ||
+         start == dmcu_code_address(0x1f, 0xf98a) ||
+         start == dmcu_code_address(0x1f, 0xf9ce) ||
+         start == dmcu_code_address(0x1f, 0xf9d2) ||
+         start == dmcu_code_address(0x1f, 0xfa1c) ||
+         start == dmcu_code_address(0x1f, 0xfa30) ||
+         start == dmcu_code_address(0x1f, 0xfa36))) {
+        qemu_log_mask(
+            LOG_UNIMP,
+            "DMCU B0 state import step #%u pc=%02x:%04x>"
+            "%02x:%04x psw=%x r=%04x,%04x,%04x,%04x "
+            "sp=%04x fp=%04x local=%04x,%04x,%04x,%04x "
+            "tmp=%04x,%04x,%04x,%04x,%04x,%04x "
+            "state=%04x,%04x,%04x,%04x,%04x,%04x,%04x,%04x\n",
+            ++start_event_state_import_steps,
+            dmcu_code_segment(start), dmcu_code_pc(start),
+            dmcu_code_segment(env->pc), dmcu_code_pc(env->pc),
+            env->psw & 15u,
+            env->gpr[0] & MASK16, env->gpr[1] & MASK16,
+            env->gpr[2] & MASK16, env->gpr[3] & MASK16,
+            env->gpr[DMCU_SP] & MASK16, env->gpr[DMCU_FP] & MASK16,
+            internal_data_read((env->gpr[DMCU_FP] - 2u) & MASK16, 16),
+            internal_data_read((env->gpr[DMCU_FP] - 6u) & MASK16, 16),
+            internal_data_read((env->gpr[DMCU_FP] - 10u) & MASK16, 16),
+            internal_data_read((env->gpr[DMCU_FP] - 14u) & MASK16, 16),
+            address_space_lduw_le(&address_space_memory, 0x512a2au,
+                                  MEMTXATTRS_UNSPECIFIED, NULL),
+            address_space_lduw_le(&address_space_memory, 0x512a38u,
+                                  MEMTXATTRS_UNSPECIFIED, NULL),
+            address_space_lduw_le(&address_space_memory, 0x512a3au,
+                                  MEMTXATTRS_UNSPECIFIED, NULL),
+            address_space_lduw_le(&address_space_memory, 0x5129a4u,
+                                  MEMTXATTRS_UNSPECIFIED, NULL),
+            address_space_lduw_le(&address_space_memory, 0x5129a6u,
+                                  MEMTXATTRS_UNSPECIFIED, NULL),
+            address_space_lduw_le(&address_space_memory, 0x5129a8u,
+                                  MEMTXATTRS_UNSPECIFIED, NULL),
+            address_space_lduw_le(&address_space_memory, 0x512250u,
+                                  MEMTXATTRS_UNSPECIFIED, NULL),
+            address_space_lduw_le(&address_space_memory, 0x512252u,
+                                  MEMTXATTRS_UNSPECIFIED, NULL),
+            address_space_lduw_le(&address_space_memory, 0x512254u,
+                                  MEMTXATTRS_UNSPECIFIED, NULL),
+            address_space_lduw_le(&address_space_memory, 0x512256u,
+                                  MEMTXATTRS_UNSPECIFIED, NULL),
+            address_space_lduw_le(&address_space_memory, 0x512258u,
+                                  MEMTXATTRS_UNSPECIFIED, NULL),
+            address_space_lduw_le(&address_space_memory, 0x51225au,
+                                  MEMTXATTRS_UNSPECIFIED, NULL),
+            address_space_lduw_le(&address_space_memory, 0x51225cu,
+                                  MEMTXATTRS_UNSPECIFIED, NULL),
+            address_space_lduw_le(&address_space_memory, 0x51225eu,
+                                  MEMTXATTRS_UNSPECIFIED, NULL));
+        if (start == dmcu_code_address(0x1f, 0xfa36)) {
+            /* A nonempty imported record returns a far guest callback to the
+             * 28:82F4 dispatcher.  Earlier diagnostics assumed that callback
+             * was always 32:F15C, but a clean Start-key replay returns the
+             * exact menu-page builder at 27:571A.  Trace any non-null callback
+             * returned to either of the dispatcher's two import continuations;
+             * this remains observer-only and does not alter guest state. */
+            if (((env->gpr[0] | env->gpr[1]) & MASK16) != 0 &&
+                (env->pc == dmcu_code_address(0x28, 0x83e6) ||
+                 env->pc == dmcu_code_address(0x28, 0x84d0))) {
+                start_event_dispatch_active = true;
+                start_event_dispatch_steps = 0;
+                qemu_log_mask(
+                    LOG_UNIMP,
+                    "DMCU B0 post-import begin callback=%04x:%04x "
+                    "sp=%04x fp=%04x\n",
+                    env->gpr[0] & MASK16, env->gpr[1] & MASK16,
+                    env->gpr[DMCU_SP] & MASK16,
+                    env->gpr[DMCU_FP] & MASK16);
+            }
+            start_event_state_import_active = false;
+        }
+    }
+    if (start_event_dispatch_active) {
+        bool trace_start_dispatch =
+            start == dmcu_code_address(0x31, 0x5300) ||
+            start == dmcu_code_address(0x31, 0x53b8) ||
+            (dmcu_code_segment(start) == 0x33 &&
+             dmcu_code_pc(start) >= 0x280au &&
+             dmcu_code_pc(start) <= 0x2830u) ||
+            start == dmcu_code_address(0x27, 0x571a) ||
+            start == dmcu_code_address(0x27, 0x571c) ||
+            start == dmcu_code_address(0x27, 0x5a66) ||
+            start == dmcu_code_address(0x28, 0x83e6) ||
+            start == dmcu_code_address(0x28, 0x83fe) ||
+            start == dmcu_code_address(0x28, 0x8402) ||
+            start == dmcu_code_address(0x28, 0x840e) ||
+            start == dmcu_code_address(0x28, 0x8412) ||
+            start == dmcu_code_address(0x28, 0x8416) ||
+            start == dmcu_code_address(0x28, 0x8420) ||
+            start == dmcu_code_address(0x28, 0x8424) ||
+            start == dmcu_code_address(0x28, 0x8480) ||
+            start == dmcu_code_address(0x28, 0x8482) ||
+            start == dmcu_code_address(0x28, 0x84d0) ||
+            start == dmcu_code_address(0x28, 0x84d8) ||
+            start == dmcu_code_address(0x28, 0x84e4) ||
+            start == dmcu_code_address(0x28, 0x84e8) ||
+            start == dmcu_code_address(0x28, 0x84ec) ||
+            start == dmcu_code_address(0x28, 0x84f2) ||
+            start == dmcu_code_address(0x28, 0x84f8) ||
+            start == dmcu_code_address(0x28, 0x8500) ||
+            start == dmcu_code_address(0x28, 0x850a) ||
+            start == dmcu_code_address(0x28, 0x850e) ||
+            start == dmcu_code_address(0x28, 0x8516) ||
+            start == dmcu_code_address(0x28, 0x855a) ||
+            start == dmcu_code_address(0x28, 0x856a) ||
+            start == dmcu_code_address(0x32, 0xd964) ||
+            start == dmcu_code_address(0x32, 0xd99e) ||
+            start == dmcu_code_address(0x32, 0xd9a8) ||
+            start == dmcu_code_address(0x32, 0xf15c) ||
+            start == dmcu_code_address(0x32, 0xf166) ||
+            start == dmcu_code_address(0x33, 0x66ec) ||
+            start == dmcu_code_address(0x33, 0x66ee) ||
+            start == dmcu_code_address(0x33, 0x66f2) ||
+            start == dmcu_code_address(0x33, 0x66f4);
+
+        if (trace_start_dispatch && start_event_dispatch_steps < 512u) {
+            qemu_log_mask(
+                LOG_UNIMP,
+                "DMCU B0 post-import step #%u pc=%02x:%04x>"
+                "%02x:%04x psw=%x r=%04x,%04x,%04x,%04x "
+                "sp=%04x fp=%04x mode=%04x root=%04x,%04x,%04x,%04x,%04x\n",
+                ++start_event_dispatch_steps,
+                dmcu_code_segment(start), dmcu_code_pc(start),
+                dmcu_code_segment(env->pc), dmcu_code_pc(env->pc),
+                env->psw & 15u,
+                env->gpr[0] & MASK16, env->gpr[1] & MASK16,
+                env->gpr[2] & MASK16, env->gpr[3] & MASK16,
+                env->gpr[DMCU_SP] & MASK16, env->gpr[DMCU_FP] & MASK16,
+                address_space_lduw_le(&address_space_memory, 0x512a40u,
+                                      MEMTXATTRS_UNSPECIFIED, NULL),
+                address_space_lduw_le(&address_space_memory, 0x514a40u,
+                                      MEMTXATTRS_UNSPECIFIED, NULL),
+                address_space_lduw_le(&address_space_memory, 0x514a42u,
+                                      MEMTXATTRS_UNSPECIFIED, NULL),
+                address_space_lduw_le(&address_space_memory, 0x514a44u,
+                                      MEMTXATTRS_UNSPECIFIED, NULL),
+                address_space_lduw_le(&address_space_memory, 0x514a46u,
+                                      MEMTXATTRS_UNSPECIFIED, NULL),
+                address_space_lduw_le(&address_space_memory, 0x514a48u,
+                                      MEMTXATTRS_UNSPECIFIED, NULL));
+        }
+        if (start_event_dispatch_steps >= 512u) {
+            start_event_dispatch_active = false;
+        }
+    }
     if (env->root_resource_trace_active == 1u) {
         int math_stage = -1;
 
@@ -13708,6 +22942,523 @@ complete:
         env->ui_record_flow_count++;
     }
 
+    /* Preserve the one-shot application-state import independently of the
+     * high-frequency UI-record flow ring.  A real Start key becomes a 0x0107
+     * record before 1F:F470 imports it; the surrounding 28:82F4 polling loop
+     * overwrites the generic 96-slot trace almost immediately.  These samples
+     * are observer-only and never alter the record, flags or control flow. */
+    if (start == dmcu_code_address(0x1f, 0xf470)) {
+        static const uint32_t global_addresses[10] = {
+            0x512250u, 0x512252u, 0x512254u, 0x512256u, 0x512258u,
+            0x51225au, 0x51225cu, 0x51225eu, 0x512260u, 0x512a3au,
+        };
+        uint16_t fp = env->gpr[DMCU_FP] & MASK16;
+        uint16_t pointer_hi = internal_data_read((fp + 6u) & MASK16, 16);
+        uint16_t pointer_lo = internal_data_read((fp + 8u) & MASK16, 16);
+        uint32_t physical = ((pointer_hi & 0xffu) << 16) | pointer_lo;
+        unsigned index;
+
+        env->state_import_calls++;
+        env->state_import_active = false;
+        if ((pointer_hi & 0xff00u) == 0 && physical <= 0xffffe0u) {
+            uint16_t first = address_space_lduw_le(
+                &address_space_memory, physical,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+
+            if (first != 0) {
+                static const uint32_t history_global_addresses
+                    [DMCU_STATE_IMPORT_HISTORY_GLOBAL_WORDS] = {
+                        0x512250u, 0x512252u, 0x512254u, 0x512256u,
+                        0x512258u, 0x51225au, 0x51225cu, 0x51225eu,
+                        0x512260u, 0x512a3au, 0x512a38u, 0x512aaau,
+                        0x512aa2u, 0x512a54u, 0x512abau,
+                    };
+                uint32_t history_slot = env->state_import_history_count %
+                    DMCU_STATE_IMPORT_HISTORY_SLOTS;
+
+                env->state_import_nonempty_calls++;
+                env->state_import_active = true;
+                env->state_import_dispatch_history_active = false;
+                env->state_import_history_active_slot = history_slot;
+                env->state_import_history_count++;
+                env->state_import_pointer_hi = pointer_hi;
+                env->state_import_pointer_lo = pointer_lo;
+                for (index = 0; index < ARRAY_SIZE(env->state_import_input);
+                     index++) {
+                    env->state_import_input[index] = address_space_lduw_le(
+                        &address_space_memory, physical + index * 2u,
+                        MEMTXATTRS_UNSPECIFIED, NULL);
+                }
+                memset(env->state_import_history_input[history_slot], 0,
+                       sizeof(env->state_import_history_input[history_slot]));
+                for (index = 0;
+                     index < DMCU_STATE_IMPORT_HISTORY_INPUT_WORDS; index++) {
+                    env->state_import_history_input[history_slot][index] =
+                        address_space_lduw_le(
+                            &address_space_memory, physical + index * 2u,
+                            MEMTXATTRS_UNSPECIFIED, NULL);
+                }
+                env->state_import_history_compare_count[history_slot] = 0;
+                env->state_import_history_match_count[history_slot] = 0;
+                env->state_import_history_mismatch_count[history_slot] = 0;
+                env->state_import_history_result_hi[history_slot] = 0;
+                env->state_import_history_result_lo[history_slot] = 0;
+                env->state_import_history_return_target[history_slot] = 0;
+                env->state_import_history_mode[history_slot] = 0xffffu;
+                env->state_import_history_root_hi[history_slot] = 0;
+                env->state_import_history_root_lo[history_slot] = 0;
+                env->state_import_history_selector_count[history_slot] = 0;
+                memset(env->state_import_history_selector_node_hi[history_slot],
+                       0, sizeof(env->state_import_history_selector_node_hi[history_slot]));
+                memset(env->state_import_history_selector_node_lo[history_slot],
+                       0, sizeof(env->state_import_history_selector_node_lo[history_slot]));
+                memset(env->state_import_history_selector_node_key[history_slot],
+                       0, sizeof(env->state_import_history_selector_node_key[history_slot]));
+                memset(env->state_import_history_selector_lookup_key[history_slot],
+                       0, sizeof(env->state_import_history_selector_lookup_key[history_slot]));
+                memset(env->state_import_history_dispatch[history_slot], 0,
+                       sizeof(env->state_import_history_dispatch[history_slot]));
+                env->state_import_history_menu_state[history_slot] = 0xffffu;
+                for (index = 0;
+                     index < DMCU_STATE_IMPORT_HISTORY_GLOBAL_WORDS; index++) {
+                    env->state_import_history_globals[history_slot][index] =
+                        address_space_lduw_le(
+                            &address_space_memory,
+                            history_global_addresses[index],
+                            MEMTXATTRS_UNSPECIFIED, NULL);
+                }
+                env->state_import_compare_count = 0;
+                env->state_import_match_count = 0;
+                env->state_import_mismatch_count = 0;
+                env->state_import_last_compare_left = 0;
+                env->state_import_last_compare_right = 0;
+                env->state_import_last_compare_index = 0;
+                env->state_import_result_hi = 0;
+                env->state_import_result_lo = 0;
+                env->state_import_return_target = 0;
+                for (index = 0; index < ARRAY_SIZE(global_addresses);
+                     index++) {
+                    env->state_import_globals[index] = address_space_lduw_le(
+                        &address_space_memory, global_addresses[index],
+                        MEMTXATTRS_UNSPECIFIED, NULL);
+                }
+            }
+        }
+    }
+    if (env->state_import_active &&
+        start == dmcu_code_address(0x1f, 0xf7dc)) {
+        uint32_t history_slot = env->state_import_history_active_slot;
+
+        env->state_import_compare_count++;
+        env->state_import_history_compare_count[history_slot]++;
+        env->state_import_last_compare_left = env->gpr[0] & MASK16;
+        env->state_import_last_compare_right = env->gpr[2] & MASK16;
+        env->state_import_last_compare_index = address_space_lduw_le(
+            &address_space_memory, 0x512a38u,
+            MEMTXATTRS_UNSPECIFIED, NULL);
+    }
+    if (env->state_import_active &&
+        start == dmcu_code_address(0x1f, 0xf7e2)) {
+        env->state_import_match_count++;
+        env->state_import_history_match_count
+            [env->state_import_history_active_slot]++;
+    }
+    if (env->state_import_active &&
+        start == dmcu_code_address(0x1f, 0xf95c)) {
+        env->state_import_mismatch_count++;
+        env->state_import_history_mismatch_count
+            [env->state_import_history_active_slot]++;
+    }
+    if (env->state_import_active &&
+        start == dmcu_code_address(0x1f, 0xfa30)) {
+        static const uint32_t global_addresses[10] = {
+            0x512250u, 0x512252u, 0x512254u, 0x512256u, 0x512258u,
+            0x51225au, 0x51225cu, 0x51225eu, 0x512260u, 0x512a3au,
+        };
+        unsigned index;
+
+        env->state_import_result_hi = env->gpr[0] & MASK16;
+        env->state_import_result_lo = env->gpr[1] & MASK16;
+        for (index = 0; index < ARRAY_SIZE(global_addresses); index++) {
+            env->state_import_globals[index] = address_space_lduw_le(
+                &address_space_memory, global_addresses[index],
+                MEMTXATTRS_UNSPECIFIED, NULL);
+        }
+    }
+    if (env->state_import_active &&
+        start == dmcu_code_address(0x1f, 0xfa36)) {
+        uint32_t history_slot = env->state_import_history_active_slot;
+
+        env->state_import_result_hi = env->gpr[0] & MASK16;
+        env->state_import_result_lo = env->gpr[1] & MASK16;
+        env->state_import_return_target = env->pc & MASK24;
+        env->state_import_history_result_hi[history_slot] =
+            env->gpr[0] & MASK16;
+        env->state_import_history_result_lo[history_slot] =
+            env->gpr[1] & MASK16;
+        env->state_import_history_return_target[history_slot] =
+            env->pc & MASK24;
+        if (((env->gpr[0] | env->gpr[1]) & MASK16) != 0 &&
+            (env->pc == dmcu_code_address(0x28, 0x83e6) ||
+             env->pc == dmcu_code_address(0x28, 0x84d0))) {
+            env->state_import_dispatch_history_active = true;
+            start_event_dispatch_active = true;
+            start_event_dispatch_steps = 0;
+            qemu_log_mask(
+                LOG_UNIMP,
+                "DMCU state-import dispatch begin callback=%04x:%04x "
+                "return=%02x:%04x sp=%04x fp=%04x\n",
+                env->gpr[0] & MASK16, env->gpr[1] & MASK16,
+                dmcu_code_segment(env->pc), dmcu_code_pc(env->pc),
+                env->gpr[DMCU_SP] & MASK16,
+                env->gpr[DMCU_FP] & MASK16);
+        }
+        env->state_import_active = false;
+    }
+    if (env->state_import_dispatch_history_active &&
+        start == dmcu_code_address(0x32, 0xd9a8) &&
+        env->pc == dmcu_code_address(0x28, 0x8402)) {
+        env->state_import_history_mode[env->state_import_history_active_slot] =
+            env->gpr[0] & MASK16;
+    }
+    if (env->state_import_dispatch_history_active &&
+        start == dmcu_code_address(0x31, 0x536e)) {
+        uint32_t history_slot = env->state_import_history_active_slot;
+        uint16_t sequence =
+            env->state_import_history_selector_count[history_slot]++;
+
+        if (sequence < DMCU_STATE_SELECTOR_TRACE_SLOTS) {
+            uint16_t fp = env->gpr[DMCU_FP] & MASK16;
+
+            env->state_import_history_selector_node_hi[history_slot][sequence] =
+                internal_data_read((fp - 4u) & MASK16, 16);
+            env->state_import_history_selector_node_lo[history_slot][sequence] =
+                internal_data_read((fp - 2u) & MASK16, 16);
+            env->state_import_history_selector_node_key[history_slot][sequence] =
+                env->gpr[0] & MASK16;
+            env->state_import_history_selector_lookup_key[history_slot][sequence] =
+                env->gpr[1] & MASK16;
+        }
+    }
+    if (env->state_import_dispatch_history_active &&
+        start == dmcu_code_address(0x31, 0x53b8) &&
+        env->pc == dmcu_code_address(0x28, 0x8424)) {
+        uint32_t history_slot = env->state_import_history_active_slot;
+
+        env->state_import_history_root_hi[history_slot] =
+            env->gpr[0] & MASK16;
+        env->state_import_history_root_lo[history_slot] =
+            env->gpr[1] & MASK16;
+    }
+    if (env->state_import_dispatch_history_active &&
+        start == dmcu_code_address(0x28, 0x8480)) {
+        static const uint32_t dispatch_addresses
+            [DMCU_STATE_IMPORT_HISTORY_DISPATCH_WORDS] = {
+                0x512978u, 0x51297au, 0x51297cu, 0x51297eu,
+                0x5128bcu, 0x5128beu, 0x5128c0u, 0x5128c2u,
+                0x512aa0u, 0x512aaau, 0x512aa2u, 0x512a54u,
+                0x512abau,
+            };
+        uint32_t history_slot = env->state_import_history_active_slot;
+        unsigned index;
+
+        for (index = 0;
+             index < DMCU_STATE_IMPORT_HISTORY_DISPATCH_WORDS; index++) {
+            env->state_import_history_dispatch[history_slot][index] =
+                address_space_lduw_le(
+                    &address_space_memory, dispatch_addresses[index],
+                    MEMTXATTRS_UNSPECIFIED, NULL);
+        }
+    }
+    if (env->state_import_dispatch_history_active &&
+        start == dmcu_code_address(0x27, 0x5a66) &&
+        env->pc == dmcu_code_address(0x28, 0x8482)) {
+        env->state_import_history_menu_state
+            [env->state_import_history_active_slot] =
+                address_space_lduw_le(
+                    &address_space_memory, 0x512aa0u,
+                    MEMTXATTRS_UNSPECIFIED, NULL);
+        env->state_import_dispatch_history_active = false;
+    }
+
+    /* The type-0003 import continuation invokes its recovered callback by
+     * constructing a far return frame and executing RETS at 28:856A.  Record
+     * the target which is actually reached.  If it is the Start callback,
+     * retain only control-flow boundaries until its matching 28:856C return;
+     * this avoids the large and timing-sensitive LOG_UNIMP trace. */
+    if (start == dmcu_code_address(0x28, 0x856a)) {
+        static const uint32_t entry_globals[8] = {
+            0x512a40u, 0x512978u, 0x51297au, 0x51297cu,
+            0x51297eu, 0x512aaau, 0x512abau, 0x512aa0u,
+        };
+        uint32_t index;
+
+        env->start_callback_dispatch_count++;
+        env->start_callback_last_target = env->pc & MASK24;
+        if (env->pc == dmcu_code_address(0x32, 0xf15c)) {
+            env->start_callback_f15c_count++;
+            env->start_callback_trace_active = true;
+            env->start_callback_running = true;
+            env->start_callback_trace_complete = false;
+            env->start_callback_trace_overflow = false;
+            env->start_callback_instruction_count = 0;
+            env->start_callback_current_pc = start;
+            env->start_callback_current_next = env->pc & MASK24;
+            env->start_callback_trace_count = 0;
+            env->start_late31_entry_trace_count = 0;
+            env->start_gpio_scan_trace_count = 0;
+            env->start_page_renderer_trace_active = false;
+            env->start_page_renderer_trace_count = 0;
+            env->start_page_return_write_count = 0;
+            env->start_object_watch_active = false;
+            env->start_object_write_count = 0;
+            env->start_object_renderer_entries = 0;
+            env->start_object_input_entries = 0;
+            env->start_object_context_entries = 0;
+            env->start_object_context_test_entries = 0;
+            env->start_object_callback_b19c_entries = 0;
+            env->start_object_callback_5896_entries = 0;
+            for (index = 0; index < 4; index++) {
+                env->start_callback_entry_gpr[index] =
+                    env->gpr[index] & MASK16;
+            }
+            env->start_callback_entry_sp = env->gpr[DMCU_SP] & MASK16;
+            env->start_callback_entry_fp = env->gpr[DMCU_FP] & MASK16;
+            for (index = 0; index < ARRAY_SIZE(entry_globals); index++) {
+                env->start_callback_entry_globals[index] =
+                    address_space_lduw_le(&address_space_memory,
+                                          entry_globals[index],
+                                          MEMTXATTRS_UNSPECIFIED, NULL);
+            }
+        }
+    }
+    if (env->start_callback_running) {
+        env->start_callback_instruction_count++;
+        env->start_callback_current_pc = start;
+        env->start_callback_current_next = env->pc & MASK24;
+    }
+    if (env->start_callback_running &&
+        start != dmcu_code_address(0x33, 0x4d2a) &&
+        env->pc == dmcu_code_address(0x33, 0x4d2a)) {
+        uint64_t sequence = env->menu_context_release_trace_count++;
+        uint32_t slot = sequence % DMCU_MENU_CONTEXT_RELEASE_TRACE_SLOTS;
+        uint32_t index;
+        uint16_t sp = env->gpr[DMCU_SP] & MASK16;
+
+        env->menu_context_release_trace_from[slot] = start;
+        env->menu_context_release_trace_return[slot] = 0;
+        env->menu_context_release_trace_sp[slot] = sp;
+        env->menu_context_release_trace_fp[slot] =
+            env->gpr[DMCU_FP] & MASK16;
+        env->menu_context_release_trace_return_sp[slot] = 0;
+        env->menu_context_release_trace_return_fp[slot] = 0;
+        for (index = 0;
+             index < DMCU_MENU_CONTEXT_RELEASE_STACK_WORDS; index++) {
+            env->menu_context_release_trace_stack[slot][index] =
+                internal_data_read(sp + index * 2u, 16);
+        }
+    }
+    if (env->start_callback_running &&
+        start == dmcu_code_address(0x33, 0x4d3e) &&
+        env->menu_context_release_trace_count) {
+        uint32_t slot = (env->menu_context_release_trace_count - 1u) %
+                        DMCU_MENU_CONTEXT_RELEASE_TRACE_SLOTS;
+
+        env->menu_context_release_trace_return[slot] = env->pc & MASK24;
+        env->menu_context_release_trace_return_sp[slot] =
+            env->gpr[DMCU_SP] & MASK16;
+        env->menu_context_release_trace_return_fp[slot] =
+            env->gpr[DMCU_FP] & MASK16;
+    }
+    /* Capture only genuine entries from outside the suspect late-31 range.
+     * Returns (including the 08:4126 IRQ return) are deliberately excluded:
+     * they would otherwise replace the useful caller records with ordinary
+     * child-function and timer returns.  This observer never changes PC,
+     * stack, registers, memory, or exception behavior. */
+    if (env->start_callback_running && env->pc != next && op != 0xc6 &&
+        dmcu_code_segment(env->pc) == 0x31u &&
+        dmcu_code_pc(env->pc) >= 0xc000u &&
+        dmcu_code_pc(env->pc) <= 0xe740u &&
+        !(dmcu_code_segment(start) == 0x31u &&
+          dmcu_code_pc(start) >= 0xc000u &&
+          dmcu_code_pc(start) <= 0xe740u)) {
+        uint64_t sequence = env->start_late31_entry_trace_count++;
+        uint32_t slot = sequence % DMCU_START_LATE31_ENTRY_TRACE_SLOTS;
+        uint32_t index;
+        uint16_t sp = env->gpr[DMCU_SP] & MASK16;
+
+        env->start_late31_entry_trace_from[slot] = start;
+        env->start_late31_entry_trace_target[slot] = env->pc & MASK24;
+        env->start_late31_entry_trace_word[slot] = word0 & MASK16;
+        env->start_late31_entry_trace_sp[slot] = sp;
+        env->start_late31_entry_trace_fp[slot] =
+            env->gpr[DMCU_FP] & MASK16;
+        for (index = 0; index < 4; index++) {
+            env->start_late31_entry_trace_gpr[slot][index] =
+                env->gpr[index] & MASK16;
+        }
+        for (index = 0; index < DMCU_START_LATE31_ENTRY_STACK_WORDS;
+             index++) {
+            env->start_late31_entry_trace_stack[slot][index] =
+                internal_data_read(sp + index * 2u, 16);
+        }
+    }
+    if (env->start_callback_running &&
+        start != dmcu_code_address(0x31, 0xd9aa) &&
+        env->pc == dmcu_code_address(0x31, 0xd9aa)) {
+        uint64_t sequence = env->start_gpio_scan_trace_count++;
+        uint32_t slot = sequence % DMCU_START_BOUNDED_CALL_TRACE_SLOTS;
+        uint32_t index;
+        uint16_t sp = env->gpr[DMCU_SP] & MASK16;
+
+        env->start_gpio_scan_trace_from[slot] = start;
+        env->start_gpio_scan_trace_return[slot] = 0;
+        env->start_gpio_scan_trace_sp[slot] = sp;
+        env->start_gpio_scan_trace_fp[slot] = env->gpr[DMCU_FP] & MASK16;
+        env->start_gpio_scan_trace_return_sp[slot] = 0;
+        env->start_gpio_scan_trace_return_fp[slot] = 0;
+        for (index = 0; index < DMCU_START_BOUNDED_CALL_STACK_WORDS;
+             index++) {
+            env->start_gpio_scan_trace_stack[slot][index] =
+                internal_data_read(sp + index * 2u, 16);
+        }
+    }
+    if (env->start_callback_running &&
+        start == dmcu_code_address(0x31, 0xda40) &&
+        env->start_gpio_scan_trace_count) {
+        uint32_t slot = (env->start_gpio_scan_trace_count - 1u) %
+                        DMCU_START_BOUNDED_CALL_TRACE_SLOTS;
+
+        env->start_gpio_scan_trace_return[slot] = env->pc & MASK24;
+        env->start_gpio_scan_trace_return_sp[slot] =
+            env->gpr[DMCU_SP] & MASK16;
+        env->start_gpio_scan_trace_return_fp[slot] =
+            env->gpr[DMCU_FP] & MASK16;
+    }
+    if (start != dmcu_code_address(0x18, 0x4e62) &&
+        env->pc == dmcu_code_address(0x18, 0x4e62)) {
+        uint64_t sequence = env->start_page_renderer_trace_count++;
+        uint32_t slot = sequence % DMCU_START_BOUNDED_CALL_TRACE_SLOTS;
+        uint32_t index;
+        uint16_t sp = env->gpr[DMCU_SP] & MASK16;
+
+        env->start_page_renderer_trace_active = true;
+        env->start_page_renderer_trace_active_slot = slot;
+        env->start_page_renderer_trace_active_sequence = sequence + 1u;
+        env->start_page_renderer_return_frame_base = sp;
+        env->start_page_renderer_trace_from[slot] = start;
+        env->start_page_renderer_trace_return[slot] = 0;
+        env->start_page_renderer_trace_sp[slot] = sp;
+        env->start_page_renderer_trace_fp[slot] =
+            env->gpr[DMCU_FP] & MASK16;
+        env->start_page_renderer_trace_return_sp[slot] = 0;
+        env->start_page_renderer_trace_return_fp[slot] = 0;
+        for (index = 0; index < 2; index++) {
+            uint16_t frame_word = internal_data_read(sp + index * 2u, 16);
+
+            env->start_page_renderer_trace_frame_initial[slot][index] =
+                frame_word;
+            env->start_page_renderer_trace_frame_final[slot][index] =
+                frame_word;
+        }
+        for (index = 0; index < DMCU_START_BOUNDED_CALL_STACK_WORDS;
+             index++) {
+            env->start_page_renderer_trace_stack[slot][index] =
+                internal_data_read(sp + index * 2u, 16);
+        }
+    }
+    if (start == dmcu_code_address(0x18, 0x5962) &&
+        env->start_page_renderer_trace_active) {
+        uint32_t slot = env->start_page_renderer_trace_active_slot;
+        uint16_t base = env->start_page_renderer_return_frame_base;
+        uint32_t index;
+
+        env->start_page_renderer_trace_return[slot] = env->pc & MASK24;
+        env->start_page_renderer_trace_return_sp[slot] =
+            env->gpr[DMCU_SP] & MASK16;
+        env->start_page_renderer_trace_return_fp[slot] =
+            env->gpr[DMCU_FP] & MASK16;
+        for (index = 0; index < 2; index++) {
+            env->start_page_renderer_trace_frame_final[slot][index] =
+                internal_data_read(base + index * 2u, 16);
+        }
+        env->start_page_renderer_trace_active = false;
+    }
+    if (env->start_callback_running &&
+        start == dmcu_code_address(0x32, 0xf15c) && word0 == 0x6810u) {
+        env->start_object_watch_active = true;
+        env->start_object_watch_base =
+            (env->gpr[DMCU_FP] - 0x4eu) & MASK16;
+        env->start_object_watch_entry_sp = env->gpr[DMCU_SP] & MASK16;
+        env->start_object_watch_entry_fp = env->gpr[DMCU_FP] & MASK16;
+    }
+    if (env->start_object_watch_active) {
+        if (start == dmcu_code_address(0x21, 0xcef4)) {
+            env->start_object_renderer_entries++;
+        } else if (start == dmcu_code_address(0x11, 0x1752)) {
+            env->start_object_input_entries++;
+        } else if (start == dmcu_code_address(0x18, 0xcfa8)) {
+            env->start_object_context_entries++;
+        } else if (start == dmcu_code_address(0x32, 0xfa06)) {
+            env->start_object_context_test_entries++;
+        } else if (start == dmcu_code_address(0x32, 0xb19c)) {
+            env->start_object_callback_b19c_entries++;
+        } else if (start == dmcu_code_address(0x33, 0x5896)) {
+            env->start_object_callback_5896_entries++;
+        }
+        if (start == dmcu_code_address(0x11, 0x1886)) {
+            env->start_object_watch_active = false;
+        }
+    }
+    if (env->start_callback_trace_active) {
+        bool call_or_return =
+            op == 0x0f || op == 0xbc || op == 0xbd ||
+            (op == 0xc6 &&
+             (arg == 0x00 || arg == 0x10 || arg == 0x20));
+        bool outer_pc =
+            dmcu_code_segment(start) == 0x32u &&
+            dmcu_code_pc(start) >= 0xf15cu &&
+            dmcu_code_pc(start) <= 0xfe50u;
+        bool outer_branch =
+            outer_pc &&
+            (op == 0x9a || op == 0x9b || op == 0x9c || op == 0x9d ||
+             op == 0xac || op == 0xad || op == 0xcc || op == 0xcd ||
+             op == 0xce || (op >= 0xd0 && op <= 0xde));
+
+        if (call_or_return || outer_branch ||
+            start == dmcu_code_address(0x32, 0xf15c) ||
+            start == dmcu_code_address(0x28, 0x856a)) {
+            uint32_t slot = env->start_callback_trace_count;
+            uint32_t index;
+
+            if (slot < DMCU_START_CALLBACK_TRACE_SLOTS) {
+                env->start_callback_trace_pc[slot] = start;
+                env->start_callback_trace_next[slot] = env->pc & MASK24;
+                env->start_callback_trace_word[slot] = word0 & MASK16;
+                env->start_callback_trace_psw[slot] = env->psw & 15u;
+                for (index = 0; index < 4; index++) {
+                    env->start_callback_trace_gpr[slot][index] =
+                        env->gpr[index] & MASK16;
+                }
+                env->start_callback_trace_sp[slot] =
+                    env->gpr[DMCU_SP] & MASK16;
+                env->start_callback_trace_fp[slot] =
+                    env->gpr[DMCU_FP] & MASK16;
+                env->start_callback_trace_count++;
+            } else {
+                env->start_callback_trace_overflow = true;
+                env->start_callback_trace_active = false;
+            }
+        }
+    }
+    if (env->start_callback_running &&
+        start != dmcu_code_address(0x28, 0x856a) &&
+        env->pc == dmcu_code_address(0x28, 0x856c)) {
+        env->start_callback_trace_complete = true;
+        env->start_callback_trace_active = false;
+        env->start_callback_running = false;
+    }
+
     /* Keep the last architecturally completed instruction separate from the
      * circular execution trace.  This is especially useful at IRQ entry:
      * env->pc must name either this instruction's result or a later complete
@@ -13888,13 +23639,30 @@ complete:
         (env->gpr[DMCU_SP] & MASK16) == 0x0000u &&
         old_fp == 0xfff8u &&
         (env->gpr[DMCU_FP] & MASK16) == 0xfff8u;
+    /* The exact factory compiler-start preamble at 33:603c is another
+     * intentional high-to-low SP transition, not a damaged return frame.
+     * Source 50:603c contains MOV SP,#1000; MOV FP,#1000; SJMP 11:4560,
+     * and analyse_np560_boot_contract.py verifies both the words and the
+     * unique linked transfer.  Match the complete first instruction state
+     * so an unrelated write of a low SP remains a hard diagnostic failure.
+     */
+    bool benign_sp_initialization =
+        (start & MASK24) == 0x33603cu &&
+        (env->pc & MASK24) == 0x336040u &&
+        (word0 & MASK16) == 0x68ffu &&
+        (ext & MASK16) == 0x1000u &&
+        old_sp == 0xfffeu &&
+        (env->gpr[DMCU_SP] & MASK16) == 0x1000u &&
+        old_fp == 0x0000u &&
+        (env->gpr[DMCU_FP] & MASK16) == 0x0000u;
+    bool benign_sp_crossing = benign_sp_wrap || benign_sp_initialization;
 
     if (benign_sp_wrap) {
         env->benign_sp_wraps++;
         env->benign_sp_wrap_pc = start & MASK24;
         env->benign_sp_wrap_word = word0 & MASK16;
     }
-    if (!benign_sp_wrap && !env->first_low_sp_valid && old_sp >= 0x8000 &&
+    if (!benign_sp_crossing && !env->first_low_sp_valid && old_sp >= 0x8000 &&
         (env->gpr[DMCU_SP] & MASK16) < 0x8000) {
         unsigned int n;
 
@@ -13933,7 +23701,7 @@ complete:
                       env->gpr[DMCU_FP] & MASK16,
                       env->gpr[DMCU_SP] & MASK16, word0 & MASK16);
     }
-    if (!benign_sp_wrap && old_sp >= 0x8000 &&
+    if (!benign_sp_crossing && old_sp >= 0x8000 &&
         (env->gpr[DMCU_SP] & MASK16) < 0x8000) {
         qemu_log_mask(LOG_UNIMP,
                       "DMCU SP crossed 8000 at %02x:%04x: %04x -> %04x "
@@ -13943,7 +23711,7 @@ complete:
     }
     if (was_ignoring_ds && env->ignore_ds_count) {
         if (!--env->ignore_ds_count) {
-            tlb_flush(env_cpu(env));
+            tlb_flush_by_mmuidx(env_cpu(env), 1u << MMU_DATA_IDX);
         }
     }
     if (was_critical && env->critical_count) {
@@ -13958,11 +23726,17 @@ complete:
         old_ds0 != (env->sfr[DMCU_SFR_DS0] & 0x1ff) ||
         old_ds1 != (env->sfr[DMCU_SFR_DS1] & 0x1ff) ||
         was_ignoring_ds != (env->ignore_ds_count != 0);
-    if (!env->repeat_count) {
-        trace_control_transfer(env, start, next, word0, old_sp, old_fp);
-        return env->pc == next && !address_space_changed;
+    /* Finish SRC before testing RC's end boundary. If the repeated
+     * instruction is the last instruction of the block, only its final
+     * iteration may advance the outer loop. No unbounded nesting stack:
+     * the architecture exposes one single-instruction and one block engine.
+     */
+    if (env->single_repeat_count && start == env->single_repeat_pc) {
+        if (--env->single_repeat_count) {
+            env->pc = env->single_repeat_pc;
+        }
     }
-    if (env->repeat_block) {
+    if (!env->single_repeat_count && env->repeat_count) {
         if (env->pc == env->repeat_end) {
             if (--env->repeat_count) {
                 env->pc = env->repeat_pc;
@@ -13970,13 +23744,22 @@ complete:
                 env->repeat_block = false;
             }
         }
-    } else if (start == env->repeat_pc) {
-        if (--env->repeat_count) {
-            env->pc = env->repeat_pc;
-        }
     }
-    trace_control_transfer(env, start, next, word0, old_sp, old_fp);
-    return env->pc == next && !address_space_changed;
+    trace_control_transfer(env, start, next, word0, ext, old_sp, old_fp);
+    /* CRIT masks only its following instruction window (CN1916884A p113).
+     * An already-pending IRQ must be reconsidered at the first unprotected
+     * boundary, not after the remaining register-only instructions in this
+     * TB. IGNDS expiration already exits through address_space_changed.
+     * This does not set SOCR.IE or acknowledge a pending request. */
+    if (address_space_changed || (was_critical && !env->critical_count) ||
+        env->irq_state_changed) {
+        return DMCU_EXEC_EXIT;
+    }
+    /* Ordinary branches/calls/returns and repeat back-edges need a new TB,
+     * but no extra host scheduling pass. The successor's standard TCG
+     * prologue still checks asynchronous exit requests and icount. IRQ
+     * register changes and protected-window expiry took the EXIT above. */
+    return env->pc == next ? DMCU_EXEC_NEXT : DMCU_EXEC_LOOKUP;
 }
 
 hwaddr dmcu_cpu_get_phys_page_debug(CPUState *cs, vaddr addr)

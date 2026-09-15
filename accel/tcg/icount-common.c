@@ -105,6 +105,38 @@ void icount_update(CPUState *cpu)
                          &timers_state.vm_clock_lock);
 }
 
+void icount_account_extra_ns(CPUState *cpu, uint64_t ns)
+{
+    int64_t remaining, used;
+
+    assert(use_icount == 1 && timers_state.icount_time_shift == 0);
+    assert(replay_mode == REPLAY_MODE_NONE);
+    assert(current_cpu == cpu && cpu->running && cpu->neg.can_do_io);
+    assert(ns <= INT64_MAX);
+
+    seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                       &timers_state.vm_clock_lock);
+    icount_update_locked(cpu);
+    assert(timers_state.qemu_icount_bias <= INT64_MAX - (int64_t)ns);
+    qatomic_set_i64(&timers_state.qemu_icount_bias,
+                    timers_state.qemu_icount_bias + (int64_t)ns);
+    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                         &timers_state.vm_clock_lock);
+
+    /* One budget unit is one ns, but is NOT another executed instruction.
+     * Reduce the budget and its remaining counters together. Charging just
+     * the decrementer would inflate raw icount; changing just the clock
+     * would run past a timer with the old instruction budget still active.
+     * Preserve the asynchronously written high half of icount_decr.
+     */
+    remaining = cpu->neg.icount_decr.u16.low + cpu->icount_extra;
+    used = MIN((int64_t)ns, remaining);
+    cpu->icount_budget -= used;
+    remaining -= used;
+    cpu->neg.icount_decr.u16.low = MIN(remaining, 0xffff);
+    cpu->icount_extra = remaining - cpu->neg.icount_decr.u16.low;
+}
+
 static int64_t icount_get_raw_locked(void)
 {
     CPUState *cpu = current_cpu;

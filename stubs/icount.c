@@ -10,6 +10,10 @@ void icount_update(CPUState *cpu)
 {
     abort();
 }
+void icount_account_extra_ns(CPUState *cpu, uint64_t ns)
+{
+    abort();
+}
 void icount_configure(QemuOpts *opts, Error **errp)
 {
     /* signal error */

@@ -73,7 +73,7 @@ int dmcu_print_insn(bfd_vma addr, disassemble_info *info)
     lo = op & 15;
     wide = is_32bit(word);
     size = wide ? 4 : 2;
-    if (wide && read_word(addr + 2, info, &ext)) {
+    if (wide && read_word(dmcu_code_advance(addr, 2), info, &ext)) {
         return -1;
     }
 
@@ -223,6 +223,16 @@ int dmcu_print_insn(bfd_vma addr, disassemble_info *info)
     case 0xc7:
         info->fprintf_func(info->stream, arg == 0 ? "nop" : ".word 0x%04x",
                            word);
+        break;
+    case 0x3f:
+        if (arg == 0xff) {
+            info->fprintf_func(info->stream, "reset");
+        } else if (arg <= 3 || (arg >= 0x10 && arg <= 0x13)) {
+            info->fprintf_func(info->stream, "%s #%u",
+                               arg & 0x10 ? "ignds" : "crit", arg & 3);
+        } else {
+            info->fprintf_func(info->stream, ".word 0x%04x", word);
+        }
         break;
     default:
         if (op >= 0xd0 && op <= 0xde) {

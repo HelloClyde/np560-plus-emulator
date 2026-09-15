@@ -4,10 +4,10 @@
 #define TARGET_LONG_BITS 32
 /*
  * This is QEMU's translation/memory-dispatch granularity, not a hardware MMU
- * page size (the DMCU has no paged MMU).  A 2-KiB target page leaves ample
- * section-index space for the sparse writable code overlays recovered from
- * NP560.PRG; subpage dispatch still preserves the small SFR windows.  Eleven
- * bits also satisfies QEMU's 25-bit physical-address TB page-table geometry.
+ * page size (the DMCU has no paged MMU).  A 2-KiB target page preserves the
+ * independently dispatched unbanked low and SFR windows.  Writable program
+ * overlays are consolidated at exact contiguous source/destination
+ * boundaries so their physical-section indices remain within this geometry.
  */
 #define TARGET_PAGE_BITS 11
 #define TARGET_PHYS_ADDR_SPACE_BITS 25
