@@ -28,7 +28,7 @@ try {
 
     $paths = @{}
     foreach ($item in @(
-        @{ Name = 'script'; Path = (Join-Path $PSScriptRoot 'test_np560_runtime_overlays.py') },
+        @{ Name = 'script'; Path = (Join-Path $PSScriptRoot 'tests/test_np560_runtime_overlays.py') },
         @{ Name = 'firmware'; Path = (Join-Path $project 'NP560+V3.80版系统升级程序\NP560.PRG') },
         @{ Name = 'initializer_rom'; Path = $initializerRom },
         @{ Name = 'overlay_install_rom'; Path = $overlayInstallRom },

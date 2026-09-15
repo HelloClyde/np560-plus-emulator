@@ -51,7 +51,7 @@ HLE ROM 仍为 `5194ab5b2e25a65184bd1b54abc4f8fcf65a5b009dd519ab3deaba4f731a77da
 
 ## 验证
 
-- `scripts/test_np560_sfr_device_lock.py --icr`：隔离 GDB 只读检查实际设备回调处的
+- `scripts/tests/test_np560_sfr_device_lock.py --icr`：隔离 GDB 只读检查实际设备回调处的
   线程锁状态，覆盖 ICR 直接写、word/byte AND/OR、BCLR/BSET、内存别名和 DTUC。
   before-v1 对旧构建明确失败（ICR 未走设备同步入口），after-v1 对初修构建通过。
   新增内存源/目的 ALU 后，after-v2 对最新构建通过，十次 ICR 写和全部相关读写均持锁。

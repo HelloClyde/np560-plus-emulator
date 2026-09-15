@@ -33,7 +33,7 @@ Y0/Y1 modifier、可变增量和位反转仍未补齐；本轮没有猜寄存器
 
 核心 SHA-256：`97094f4ac11498050c7c444ec75339898a905cba6d0ffe4ff64038aa4c58af4e`。
 
-`scripts/test_np560_y_pointer.py` 复用现有短时 QEMU 运行器，验证内部/外部视图分离、
+`scripts/tests/test_np560_y_pointer.py` 复用现有短时 QEMU 运行器，验证内部/外部视图分离、
 读写、前减量/偏移、byte lane、双指针复制、ALU/移位、Y2 循环和边界停机。
 `tmp/np560-y-pointer-v1/report.json` 全部定向场景通过，隔离进程均 exit 0。
 所有准备由 guest 指令完成，无 NAND、宿主 RAM 写入或在线实例修改。

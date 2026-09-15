@@ -69,7 +69,7 @@ Web 在设备信息区域显示设备名和 ID，保存状态继续取自真实�
 - `scripts/web/np560_web.py`：设备创建/启动入口，启动参数约束及设备身份输出。
 - `scripts/run-np560-web.ps1`：Windows 配置入口；同时将固件默认路径初始化移到参数解析之后，
   并使用 UTF-8 BOM 兼容 Windows PowerShell 5.1 的中文路径读取。
-- `scripts/test_np560_device_config.py`：创建不复制 NAND、不覆盖设备/日志、输入变化拒绝、路径别名保护和重复加载。
+- `scripts/tests/test_np560_device_config.py`：创建不复制 NAND、不覆盖设备/日志、输入变化拒绝、路径别名保护和重复加载。
   WSL 及 Windows Python 均通过。已有 Web 生命周期与前端检查在 WSL 通过。
   Windows 沙箱直接运行旧前端 Node 检查曾因 `lstat C:\Users\ASUS` 返回 EPERM 失败，
   并非输入控制器断言失败；随后在实际 WSL 环境执行通过，没有修改断言。

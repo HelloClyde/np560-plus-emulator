@@ -64,7 +64,7 @@ RETI 也把弹出的字直接赋给该内部字段。这不是原厂 PSR 的格�
 
 验证与身份：
 
-- `scripts/test_np560_interrupt_psr.py` 覆盖 guest 合成帧的全部低标志组合与 MX/MS/MV
+- `scripts/tests/test_np560_interrupt_psr.py` 覆盖 guest 合成帧的全部低标志组合与 MX/MS/MV
   高位；另由已有板级 tick 实际压栈，ISR 读取该帧并清零 live PSR，要求 RETI 真正恢复。
 - 旧构建对合成 PSR `01C0` 读回 `0000`；实际硬件帧应为 `01C4`，却压入 `0002`。
   两项负向对照均实际失败。新版通过合成帧和实际入口/返回检查。
@@ -175,7 +175,7 @@ ACD8 与 `01:B6DE/B7AA/B816/B84E` 的缺口仍然存在。
 
 ### 前一版位寻址构建（历史）
 
-- `scripts/test_np560_bit_sfr_addressing.py`：旧二进制实际错误进入 BAD0 分支；新二进制
+- `scripts/tests/test_np560_bit_sfr_addressing.py`：旧二进制实际错误进入 BAD0 分支；新二进制
   通过 Timer2 直接/位读写、SOCR/GPIO、R0 位别名及高软件位字分离检查。
 - 可选 `--original-prg` 从原 PRG 取出 `08:3930` 与 `08:47A4..483E` 的精确代码，
   只增加测试 caller。新 CPU 停在原厂 `08:47FA` 等待，`4BB8=3`，未进入 caller 的

@@ -6,5 +6,4 @@ np560-web-qemu.log
 /NP560+V3.80版系统升级程序/
 /tmp/
 
-# Maintained as its own Git repository.
-/qemu-dmcu/
+# qemu-dmcu is tracked as a Git submodule.

@@ -44,7 +44,7 @@
 
 ## 能区分修复前后的定向结果
 
-复用 `scripts/test_np560_code_coherence.py`：guest 自己通过 FP 在 `00:1202` 安装
+复用 `scripts/tests/test_np560_code_coherence.py`：guest 自己通过 FP 在 `00:1202` 安装
 `MOV R0,#1234; RETS`，调用后改立即数为 BEEF，再次调用。没有 NAND 或宿主 RAM 注入。
 
 - 修复前 `ecff5a4b…` 在第一次调用停于 `00:1202`，根本没有执行已写入的函数。

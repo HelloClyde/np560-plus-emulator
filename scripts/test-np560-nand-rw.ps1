@@ -26,7 +26,7 @@ try {
 
     $paths = @{}
     foreach ($item in @(
-        @{ Name = 'script'; Path = (Join-Path $PSScriptRoot 'test_np560_nand_rw.py') },
+        @{ Name = 'script'; Path = (Join-Path $PSScriptRoot 'tests/test_np560_nand_rw.py') },
         @{ Name = 'firmware'; Path = $firmware },
         @{ Name = 'persistWriter'; Path = $persistWriter },
         @{ Name = 'persistReader'; Path = $persistReader },

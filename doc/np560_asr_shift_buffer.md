@@ -22,7 +22,7 @@ PDF 第 57–58 页（说明书第 54–55 页）完整 ASR 定义：
 
 ## 修复前后的可区分结果
 
-[定向检查](../scripts/test_np560_asr_shift_buffer.py) 复用现有隔离 guest 运行器：
+[定向检查](../scripts/tests/test_np560_asr_shift_buffer.py) 复用现有隔离 guest 运行器：
 先执行正常 `SL R7,RB2`，将 `A55A` 移入 SB；再执行 `ASR R0,RB2`，其中
 R0=`1234`、计数=`FF`（-1），最后读取 SB 并让两个零值操作数分别执行
 `SLOSB #0` 和 `SROSB #0`。

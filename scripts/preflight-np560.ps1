@@ -45,12 +45,12 @@ try {
         Write-Host '[3/4] Running preprocessing, mapping, and monitor tests...'
         Invoke-PythonChecked `
             '-m' 'unittest' `
-            'scripts\test_np560_overlay_map.py' `
-            'scripts\test_preprocess_np560_ui.py' `
-            'scripts\test_audit_np560_overlay_mappings.py' `
-            'scripts\test_probe_np560_runtime.py' `
-            'scripts\test_watch_np560_code_sources.py' `
-            'scripts\test_analyze_np560_runtime_code_sources.py'
+            'scripts\tests\test_np560_overlay_map.py' `
+            'scripts\tests\test_preprocess_np560_ui.py' `
+            'scripts\tests\test_audit_np560_overlay_mappings.py' `
+            'scripts\tests\test_probe_np560_runtime.py' `
+            'scripts\tests\test_watch_np560_code_sources.py' `
+            'scripts\tests\test_analyze_np560_runtime_code_sources.py'
     }
 
     if ($RuntimeUrl) {

@@ -61,7 +61,7 @@ QEMU 的矩阵硬件模型不会自行挑选按键；`np560_key_matrix_input()` 
 - 长按/独立键：`scripts/monitor_np560_npe_input_semantics.py`
 - 组合键：`scripts/probe_np560_npe_input_combinations.py`
 - 持续游玩和退出：`scripts/monitor_np560_npe_play_session.py`
-- 单元测试：`scripts/test_probe_np560_npe_input_combinations.py`
+- 单元测试：`scripts/tests/test_probe_np560_npe_input_combinations.py`
 
 以上只证明所列场景的输入语义，不能宣布全部游戏模式、菜单、对话和战斗的输入都已完成。
 

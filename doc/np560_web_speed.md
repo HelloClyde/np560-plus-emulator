@@ -153,7 +153,7 @@ F4 返回菜单后 owner 及 session 均为 0、DAC 关闭、堆恢复 61358 byt
   29:CE22..CFFF 代码镜像。首轮误裁了矩阵候选/映射计数，自动导航超时；已把
   这两个公开 key-status 计数独立到必经路径，未改键盘语义或原厂事件。
   失败记录 `tmp/np560-deferred-player-20260916-v1`，修正后 v2 正常导航及退出。
-  `scripts/test_np560_minimal_key_counters.py` 验证同值重复写入在 full/minimal 都计数。
+  `scripts/tests/test_np560_minimal_key_counters.py` 验证同值重复写入在 full/minimal 都计数。
 - 指令额外时间先由 vCPU 私有累计，与原始 icount 一起在读时钟、预算边界及
   执行退出时发布，消除每条指令的全局时钟锁。每条指令/外存等待仍立即扣预算，
   时钟读取包含尚未发布的时间；暂停及重置之前仍走 QEMU 正常结算。
@@ -213,8 +213,8 @@ IGNDS、非对齐字访问、调试监视点和内存插件回调仍走原来的
 快速 RAM 读/写检查 QEMU 当前 TLB tag 的完整相等关系，不掩掉任何 slow flag；
 尤其写入碰到 TLB_NOTDIRTY 必须退回 QEMU 存储 helper，维护代码失效、脏页及迁移。
 没有独立保存主机 RAM 指针，也不对 MMIO 或 ROM 使用裸存储。
-跨银行非对齐访问新增 `scripts/test_np560_banked_tlb_boundary.py`，full/minimal
-均通过；`scripts/test_np560_unbanked_tlb.py` 现覆盖四种 clock/observer 组合。
+跨银行非对齐访问新增 `scripts/tests/test_np560_banked_tlb_boundary.py`，full/minimal
+均通过；`scripts/tests/test_np560_unbanked_tlb.py` 现覆盖四种 clock/observer 组合。
 八个代码一致性场景通过 `tmp/np560-faststore-code-20260916-v1`。
 
 SOCR 仅 IE 改变才更新 IRQ 资格，PSR 仅 CIRQ/CPRI 改变才重新仲裁；实际寄存器

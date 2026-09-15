@@ -19,7 +19,7 @@
 下一次采样请求到达时若上次尚未受理，就合并在同一个 RQ 位内。
 完整播放器稳定区间实际只有约 0.665–0.673 次传输/请求；指令时钟约为 1。
 
-新增 `scripts/test_np560_audio_clock_delivery.py` 由 guest 填入 1023 个正弦样本，
+新增 `scripts/tests/test_np560_audio_clock_delivery.py` 由 guest 填入 1023 个正弦样本，
 同一源接两路 DTU，关闭 CPU IE，启动原有 PLL/DAC，计数清零后由 guest 停止。
 无 NAND、ROM 服务、文件续读、宿主 RAM 注入或调试器，保存的是实际 DAC 环输出。
 
@@ -112,7 +112,7 @@ EN/IE、计数和完成服务仍由已有 CPU/DTU 仲裁；不直接搬整个缓
 
 ## 验证范围
 
-`scripts/test_np560_audio_requests.py` 使用原始 `24:97AC..9BE6` 字节，
+`scripts/tests/test_np560_audio_requests.py` 使用原始 `24:97AC..9BE6` 字节，
 逐项检查五种配置的双路搬运、关闭、普通执行和 icount=5，另检查 PLL 别名、
 字节通道和时钟启用/掉电/未支持模式、虚拟暂停、恢复与活动复位。
 这些是硬件通路检查，不是整首 MP3 播放验收。

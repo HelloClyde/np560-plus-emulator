@@ -67,7 +67,7 @@ ROM `np560-system-v380-vma03-resident-codec-holes-v1.bin`，NAND
 不插软件断点、不写 guest RAM、不操作用户端口。`watch` 报告值发生改变的写入，
 并不保证记录写回同值的事务，亦不覆盖所有可能的代码映射。
 
-`scripts/test_probe_np560_code_write.py` 的正对照在
+`scripts/tests/test_probe_np560_code_write.py` 的正对照在
 `tmp/np560-code-write-positive-v1/report.json` 通过：诊断 guest 的 `20:0008` MOV 确实被捕获，
 将 `22:1840` 写为 1234；宿主栈显示 CPU store 到 RAM 写入，读回字节为 34 12。
 这验证观察点能捕获目标，而不是因监控失效而得到“没有错误”。

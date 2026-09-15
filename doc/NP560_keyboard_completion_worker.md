@@ -263,7 +263,7 @@ Web 前端现在只允许 `matrixIndexes` 中已有原厂事件表证据的键�
   字段写为零；连接恢复而实体键仍按住时才重新发送当前完整矩阵快照。
 
 静态映射、控制器状态机和 Web 生命周期回归由
-`scripts/test_np560_web_frontend.py` 覆盖，当前为 `14/14` 通过。该结果证明的是前端
+`scripts/tests/test_np560_web_frontend.py` 覆盖，当前为 `14/14` 通过。该结果证明的是前端
 press/hold/release 合成及释放保护，不等价于游戏前台验收：尚未在真实 NPE 游戏中验证
 长按重复频率、所有组合语义、正常退出，也未完成 1,000 次输入压力测试。服务端断线
 释放是 opt-in lease，旧探针不带 `lease_id`，不会被 watchdog 改变既有按住时长；Web

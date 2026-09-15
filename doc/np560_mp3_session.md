@@ -59,7 +59,7 @@ BUSY 下的输出查询、处理、复位和释放均拒绝，不触碰其它调
 - 16 组件、35 片段共 84584 bytes，原检查范围内余 22132 bytes；已知原厂入口仍受保护，未知间接入口是否占用空洞仍未证明。
 - QEMU 沿用 `533dd1a47c08c2636e8921e046526ea31f0bf7a00f102a89705d1704f5d5d083`，本次未改 CPU、硬件映射、原 PRG、Web 或用户 NAND。
 
-`scripts/test_np560_mp3_session.py` 使用原厂 `25:77DA/31:5300` 申请并锁定
+`scripts/tests/test_np560_mp3_session.py` 使用原厂 `25:77DA/31:5300` 申请并锁定
 80-byte 控制对象，再由 session 自己管理内部 lease。输入是原文件的连续 bytes，
 由原始 `16:E844` 写环；不向核心逐帧提供 host header 或 bit context。
 每个成功 granule 的 PCM 从 output 返回的 **X0 原厂缓冲**采集，不从私有 PCM 偷读。
@@ -112,7 +112,7 @@ reset 清零、重新打开、控制对象尾部及 `1782/2984/2E02` 的区外�
 
 ```text
 python scripts/build_np560_mp3_resident.py --resident-rom tmp/np560-system-v380-vma03-resident-codec-holes-v1.bin --firmware "NP560+V3.80版系统升级程序/NP560.PRG" --output tmp/new-session-core
-python scripts/test_np560_mp3_session.py --qemu /path/to/qemu-system-dmcu --mp3 /path/to/input.mp3 --resident-bundle tmp/new-session-core --output tmp/new-session-test --limit 3 --player-neighbours
+python scripts/tests/test_np560_mp3_session.py --qemu /path/to/qemu-system-dmcu --mp3 /path/to/input.mp3 --resident-bundle tmp/new-session-core --output tmp/new-session-test --limit 3 --player-neighbours
 ```
 
 ## 原厂帧状态消费接口：2026-09-07 后续

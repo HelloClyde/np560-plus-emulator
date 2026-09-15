@@ -38,7 +38,7 @@ SFR 从 `F100` 开始。第 129 页图 4 的 DS/15-bit 地址拼接与原厂 701
 
 ## 原厂反例与修复结果
 
-`scripts/test_np560_audio_state_ram.py` 调用完整原字节 `08:3292`、`08:2F22`、
+`scripts/tests/test_np560_audio_state_ram.py` 调用完整原字节 `08:3292`、`08:2F22`、
 `24:9BD4` 和 `31:D9AA`；执行前逐字节验证实际 code bus 中的函数。
 外围是诊断 caller，四个回调/缓冲均传空、rate=0，明确只验证状态设置，不冒充解码和播放。
 Host 只控制开始/停止、物理输入和读结果，无 RAM 写入，无 NAND。

@@ -13,7 +13,7 @@
 见末节；添加后退出再打开播放器仍触发 4804，不能称重开和播放已完成。
 
 修改仅在 [Web 按键映射](../scripts/web/app.js) 和
-[前端回归](../scripts/test_np560_web_frontend.py)，没有修改 CPU、ROM、PRG、LCD 数据或
+[前端回归](../scripts/tests/test_np560_web_frontend.py)，没有修改 CPU、ROM、PRG、LCD 数据或
 原厂事件处理器。没有按应用切换映射，没有向 guest 队列直接写事件。
 
 ## 功能键依据
@@ -187,7 +187,7 @@ INVALID_CONTROL=none
 
 ### 原厂 MP3 输入函数实测
 
-复用 [X0 原厂函数验证器](../scripts/test_np560_x0_ring.py)，新增 `--mp3-only`，
+复用 [X0 原厂函数验证器](../scripts/tests/test_np560_x0_ring.py)，新增 `--mp3-only`，
 将完整原字节放在 VMA03 `16:E844`，由诊断 guest 自己设置参数、源数据及边界哨兵。
 它没有初始化或代替缺失解码器，没有 NAND，没有宿主运行中 RAM 写入。
 函数 SHA-256：`43d8da6ecfa3ac223a68f3e9321ff2c53046cc0e9a4e6631fa0d99a1b554ab7b`。

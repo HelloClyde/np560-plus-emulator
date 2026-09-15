@@ -81,7 +81,7 @@ QEMU 插件对这种非连续长指令的完整字节记录尚未核对；CPU �
   输入正负样本并比对输出。这里只证明既有样本处理仍工作，不是解码器或真实声音播放成功。
 
 这些检查的 QEMU 身份一致，各自保存通过结果和正常进程退出记录。
-检查脚本为 `scripts/test_np560_pc_wrap.py`，复用 `test_np560_mac.py` 的独立 guest 启停，
+检查脚本为 `scripts/tests/test_np560_pc_wrap.py`，复用 `test_np560_mac.py` 的独立 guest 启停，
 后者仅增加 VMA03 启动选择和可选反汇编断言，原有默认参数不变。
 
 ## 整机范围边界

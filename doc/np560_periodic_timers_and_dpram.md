@@ -71,7 +71,7 @@
 
 ### 原厂数据传输与架构检查
 
-- 新增 `scripts/test_np560_timers.py` 复用既有执行器；不是新增诊断平台。
+- 新增 `scripts/tests/test_np560_timers.py` 复用既有执行器；不是新增诊断平台。
 - T0/T1/T2：到期置 RQ，EN/CPU IE 关闭仍锁存；直接位指令停止；pause 冻结虚拟时间，
   resume 后继续。普通运行和 icount=5 都通过。
 - 原厂 `24:97AC..9BE6` 的相关完整函数：六种不同定时器配对均通过；T1/T2 另在

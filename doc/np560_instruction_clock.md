@@ -59,7 +59,7 @@ QEMU 单指令块入口先计一条指令、1 ns。DMCU 在指令执行前以进
 本轮 QEMU SHA256：`833f36ed9aa522e4013c3b34dffaf4a6e11e198727b4b6cf2ed675a97d945fd0`。
 所有下述实验均无宿主 guest-memory 写入，进程正常退出 0。
 
-`scripts/test_np560_instruction_clock.py`：
+`scripts/tests/test_np560_instruction_clock.py`：
 
 - 3113 条指令穿过非 PLL、32.768 kHz 别名、PLL 切换及锁定写入后，累计 19355779 ns，
   与独立有理数和定点计算相符；原始 icount 仍为 3113，不含虚构的等待指令。

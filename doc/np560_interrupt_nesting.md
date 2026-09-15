@@ -42,7 +42,7 @@
 
 ## 验证：执行变化，而非测试次数
 
-`scripts/test_np560_interrupt_nesting.py` 的 guest 自己安装向量、置软件请求，
+`scripts/tests/test_np560_interrupt_nesting.py` 的 guest 自己安装向量、置软件请求，
 或配置实际 Timer0 产生请求；宿主仅控制运行/暂停/复位并读取结果。
 没有宿主改 guest RAM，没有使用 NAND。结果在 `tmp/np560-nesting-v3/report.json`。
 

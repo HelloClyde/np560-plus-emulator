@@ -41,7 +41,7 @@ NSEG 的帧及 RETI 按文档条件省略 CS，同段测试通过；Romless 等�
 
 ## 验证与适用范围
 
-`scripts/test_np560_icr_vectors.py`：
+`scripts/tests/test_np560_icr_vectors.py`：
 
 - RAM 来源 0/3/15/16/31，覆盖图 13 两段步长及边界；ROM 向量选择。
 - 原厂 PSR 栈格式、四/六字节帧、返回 SP 和 CIRQ/CPRI 字段。

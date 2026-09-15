@@ -57,7 +57,7 @@ MOV R0, #BEEF
 
 ## 验证范围
 
-`scripts/test_np560_repeat_legality.py` 复用既有无 NAND CPU runner。
+`scripts/tests/test_np560_repeat_legality.py` 复用既有无 NAND CPU runner。
 23 个禁用目标类别及 2 个服务模式场景，分别以普通执行和 icount 检查；
 全部保留原寄存器/栈指针并停在目标，不调用软件 TRAP。
 这是按语义逐类检查，不是任意数量的压力测试。

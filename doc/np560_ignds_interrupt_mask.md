@@ -60,7 +60,7 @@ RETI 返回后，原本必须写内部 RAM 的 MOV 恢复了 DS 银行计算，�
 `809aa9c349b24caaba9d22d9b158e369d0096610ea936b78e180107fcaadf9cd`。
 前版保留为 `qemu-system-dmcu-pre-ignds-irq-20260905`，身份如上。
 
-`scripts/test_np560_ignds_irq.py` 使用独立诊断 guest，不使用 NAND，不从宿主写 guest RAM。
+`scripts/tests/test_np560_ignds_irq.py` 使用独立诊断 guest，不使用 NAND，不从宿主写 guest RAM。
 最终 `tmp/np560-ignds-irq-v2/report.json` 的 10 个场景通过：
 
 - 1–4 条保护，核对 ISR 进入 PC、内部写入、银行标记及返回 SP。

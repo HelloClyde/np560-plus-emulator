@@ -50,7 +50,7 @@ PLL 并入现有相邻 ADC MMIO 窗口，未增加逐 bank 小别名以规避物
 
 当前二进制上实际运行：
 
-- `scripts/test_np560_timer2.py`：PLL 视图一致；2 MHz / T2P=999 的周期配置实际置 RQ；
+- `scripts/tests/test_np560_timer2.py`：PLL 视图一致；2 MHz / T2P=999 的周期配置实际置 RQ；
   EN/IE 关闭不丢失请求；停止不再到期；QEMU pause 冻结虚拟时间，resume 后继续。
   普通执行和 icount=5 均通过。
 - 未修改的原厂 waiter/ISR：请求计数 3，经真实 Timer2 IRQ 归零；R4=600D、SP=4000，

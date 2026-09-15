@@ -99,7 +99,7 @@ ID `cddc15b6-750b-4b6a-ad36-041b6f99f70e`，来自先前通过原厂界面保存
 
 首次真实备份因 DrvFS 返回 EINVAL 而失败，目标不存在、暂存已清理；
 随后修正发布方式后才成功。不能把首次失败写成通过，也没有通过放宽“拒绝覆盖”来修复。
-`scripts/test_np560_device_backup.py` 的小型夹具分别在 Linux 临时盘和实际 E 盘运行，
+`scripts/tests/test_np560_device_backup.py` 的小型夹具分别在 Linux 临时盘和实际 E 盘运行，
 覆盖数据保真、进程锁、目标竞争、错误底图、损坏成员、路径越界和重复/符号链接成员。
 
 恢复副本的原厂启动/设置读回记录在 `tmp/np560-device-backup-native-20260906-v1/`。

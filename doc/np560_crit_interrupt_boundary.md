@@ -46,7 +46,7 @@ IGNDS 结束时原本就会因地址空间变化退出 TCG，本次不重复改�
 新核心为 `E:/qemu-dmcu-build/qemu-system-dmcu`，46,826,344 bytes，SHA-256：
 `40f88f23ecd1dd75fbb4335780bfc94d56b8ac1a84b23a1b269002825ed9f975`。
 
-[定向程序](../scripts/test_np560_crit_boundary.py) 复用现有 guest 执行器。
+[定向程序](../scripts/tests/test_np560_crit_boundary.py) 复用现有 guest 执行器。
 [同版结果](../tmp/np560-crit-boundary-20260906-v1/report.json) 验证了 1–4 条保护、
 32-bit 指令按一条计数、NSEG 栈、原本关闭的 IE、icount，以及 Timer0 实际产生请求。
 检查的不只是运行结束，还包括 ISR 的返回 PC、保护内外进度、请求应答和返回后的 SP。

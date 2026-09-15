@@ -53,7 +53,7 @@ CPU 与外部 LCD reset 引脚是否有板级联动仍没有证据，本实现�
 
 ## 已验证的实际行为
 
-脚本：[test_np560_software_reset.py](../scripts/test_np560_software_reset.py)。
+脚本：[test_np560_software_reset.py](../scripts/tests/test_np560_software_reset.py)。
 所有 RAM、寄存器、LCD 内容及可写代码准备由 guest 指令完成；宿主只读取结果、
 按住物理矩阵键 M61 退出观察循环，以及在软件复位通过后发一次 QMP 冷重启。
 不加载生产 NAND，不写运行中 guest RAM。

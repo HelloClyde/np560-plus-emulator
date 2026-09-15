@@ -64,7 +64,7 @@ DMCU code bus 只读转储实际载入代码并分析循环终止条件，不能
 
 ## 自动回归
 
-`scripts/test_build_np560_reconstructed_rom.py` 的
+`scripts/tests/test_build_np560_reconstructed_rom.py` 的
 `test_resident_record_range_worker_is_exact_and_bounded` 固定检查：
 
 - 入口与结尾原厂字；

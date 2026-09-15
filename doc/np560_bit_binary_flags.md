@@ -57,7 +57,7 @@ guest 自己准备 R0/R1 和 PSR，再将实际结果存入 RAM，宿主只读�
 `BCMP BIT[71].0, BIT[73].0`，随后 `51:7BD6` 根据 N 决定分支。这些是有效代码，
 不是仅凭全包内匹配两字节 opcode 得出的函数归属。
 
-本次重用已有隔离运行器，新增 `scripts/test_np560_bit_binary_flags.py`：
+本次重用已有隔离运行器，新增 `scripts/tests/test_np560_bit_binary_flags.py`：
 
 - 按原表的字面常量检查四种指令、全部双位输入；同时核对目标之外的位、来源字和其它 PSR 位不变。
 - 检查同一位同时作为源/目标、PSR 作为源及显式目标的既有次序。

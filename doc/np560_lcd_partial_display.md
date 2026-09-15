@@ -47,7 +47,7 @@
 `ae6eaa2258479e4199327f3862ffeee0f54968e243b604629e7520b205b2c3d1`。
 旧二进制保留为 `E:/qemu-dmcu-build/qemu-system-dmcu-pre-lcd-partial-20260906`。
 
-[guest 检查](../scripts/test_np560_lcd_partial.py) 通过实际指令写 LCD/读 LCD，再将结果存入 RAM，
+[guest 检查](../scripts/tests/test_np560_lcd_partial.py) 通过实际指令写 LCD/读 LCD，再将结果存入 RAM，
 宿主仅读取结果。没有 NAND、HLE、运行中 RAM 注入或前端补画。
 
 [完整记录](../tmp/np560-lcd-partial-20260906-v1/report.json) 已验证：

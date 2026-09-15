@@ -23,7 +23,7 @@
 
 旧 QEMU `d26b7ce7f17c8345a2a2604a1c18c7c960549640ae0ebebb8458f8ea5e577372`
 只有零散已知 ROM 数据岛，通用低端 resident 内容只映射在 code bus。
-`scripts/test_np560_resident_data.py` 在同一段 ROM 中放普通立即数返回代码和
+`scripts/tests/test_np560_resident_data.py` 在同一段 ROM 中放普通立即数返回代码和
 常量，guest 自己读写，不注入运行中内存。旧核心实际表现为：
 
 - 调用 `01:0800` 中的 `MOV R0,#1234; RETS` 得到 `1234`。

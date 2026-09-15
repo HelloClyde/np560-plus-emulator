@@ -559,10 +559,10 @@ item 已 materialize、SelectHero event-state 回调正常返回”的边界；�
 静态解码和断言由以下脚本维护：
 
 - `scripts/analyse_np560_operation_catalog.py`
-- `scripts/test_analyse_np560_operation_catalog.py`
-- `scripts/test_build_np560_reconstructed_rom.py`
-- `scripts/test_np560_overlay_map.py`
-- `scripts/test_np560_runtime_overlays.py`
+- `scripts/tests/test_analyse_np560_operation_catalog.py`
+- `scripts/tests/test_build_np560_reconstructed_rom.py`
+- `scripts/tests/test_np560_overlay_map.py`
+- `scripts/tests/test_np560_runtime_overlays.py`
 - `scripts/probe_np560_matrix_route.py`
 - `scripts/capture_np560_native_buffers.py`
 - `doc/NP560-source-498744_report.md`

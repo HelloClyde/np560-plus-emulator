@@ -26,7 +26,7 @@ try {
 
     $paths = @{}
     foreach ($item in @(
-        @{ Name = 'script'; Path = (Join-Path $PSScriptRoot 'test_np560_nand.py') },
+        @{ Name = 'script'; Path = (Join-Path $PSScriptRoot 'tests/test_np560_nand.py') },
         @{ Name = 'firmware'; Path = $firmware },
         @{ Name = 'rom'; Path = $rom },
         @{ Name = 'burner'; Path = (Join-Path $workDirectory 'BURN_NAND_FLASH_CODE.bin') },

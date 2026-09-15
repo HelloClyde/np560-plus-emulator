@@ -45,7 +45,7 @@ XC/YC、其余 modifier 映射、可变步长与位反转仍未实现，不能�
 SHA-256：`920620dd6bdc7f42269f259e78c1851961ed4ac5a2e986997f0a9fec2d7dac16`。
 旧核心另存 `E:/qemu-dmcu-build/qemu-system-dmcu-pre-agu-writeback-20260906`，哈希与上述原核心一致。
 
-新增 [定向用例](../scripts/test_np560_agu_writeback.py) 复用既有 guest 指令运行器，
+新增 [定向用例](../scripts/tests/test_np560_agu_writeback.py) 复用既有 guest 指令运行器，
 在普通和 icount=5 下检查下列情况，并检查 modifier 更新及 SP 保持：
 
 | 指令情形 | 应使用的本条配置与结果 |

@@ -221,7 +221,7 @@ QEMU 诊断中新增了有界的 `CLOCK_RASTER_PIPELINE` 行，最多保留 8 �
 - `qemu-dmcu/target/dmcu/cpu.h`：64 槽有界快照状态。
 - `qemu-dmcu/target/dmcu/helper.c`：四个精确 PC 边界的只读取样。
 - `qemu-dmcu/hw/dmcu/np560.c`：只读诊断文本输出。
-- `scripts/test_np560_resource_pair_release_observer.py`：双 caller、释放边界、参数、无 guest
+- `scripts/tests/test_np560_resource_pair_release_observer.py`：双 caller、释放边界、参数、无 guest
   写 API、输出字段和容量的源码契约测试。
 
 验证：

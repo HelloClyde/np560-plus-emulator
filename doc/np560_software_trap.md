@@ -49,7 +49,7 @@ NSEG=1 保持当前 CS；不更改 NSEG。不能称该歧义已由真机测量�
 
 ## 定向验证及实际固件
 
-`scripts/test_np560_software_trap.py` 使用明确诊断 guest，无 NAND；所有寄存器和 RAM 写入
+`scripts/tests/test_np560_software_trap.py` 使用明确诊断 guest，无 NAND；所有寄存器和 RAM 写入
 来自 guest 指令，宿主只读取及控制运行/暂停/复位。最终同版记录是
 `tmp/np560-software-trap-v5/report.json`，14 个定向场景全部通过：
 

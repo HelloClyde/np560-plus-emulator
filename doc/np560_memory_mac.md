@@ -114,7 +114,7 @@ AR=`12`、XM0 变为 `1`、本条 X0 后增量为旧模式生成的 `F12A`。
 
 ## 验证与中间夹具错误
 
-[内存 MAC 脚本](../scripts/test_np560_memory_mac.py) 复用现有运行器。
+[内存 MAC 脚本](../scripts/tests/test_np560_memory_mac.py) 复用现有运行器。
 112-byte 原函数完整复制到隔离 ROM 的链接地址，caller 以同段 near-call trampoline
 适配 near RET；没有改函数内容或生产 ROM。描述符、64 项数据及系数由 guest 指令准备，
 宿主只读观察结果；无 NAND、HLE 或运行时 guest RAM 写入。

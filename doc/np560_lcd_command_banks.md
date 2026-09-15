@@ -48,7 +48,7 @@ ANASET/EEPROM 这里只接收正确数量参数，模拟电路、EEPROM 操作�
 `d26b7ce7f17c8345a2a2604a1c18c7c960549640ae0ebebb8458f8ea5e577372`。
 旧核心保存在 E 盘同目录 `qemu-system-dmcu-pre-banks-20260907`。
 
-`scripts/test_np560_lcd_command_banks.py` 复用现有 guest-MMIO 运行器：
+`scripts/tests/test_np560_lcd_command_banks.py` 复用现有 guest-MMIO 运行器：
 
 - 跨区写显存、显示控制、窗口/扫描、部分显示隔离；
 - 双表 16 项、未使用高位屏蔽、同码不同区、重编程与额外数据；

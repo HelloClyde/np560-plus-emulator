@@ -17,7 +17,7 @@ try {
 
     $paths = @{}
     foreach ($item in @(
-        @{ Name = 'script'; Path = (Join-Path $PSScriptRoot 'test_np560_des.py') },
+        @{ Name = 'script'; Path = (Join-Path $PSScriptRoot 'tests/test_np560_des.py') },
         @{ Name = 'soc_rom'; Path = $socRom }
     )) {
         $windows = (Resolve-Path -LiteralPath $item.Path).Path -replace '\\', '/'

@@ -20,7 +20,7 @@ DTU 计数器或 PCM，也没有扩大 HLE 到其它应用地址。
 
 ## 可复现的计数证据
 
-脚本：`scripts/test_np560_icount_accounting.py`。所有初始化及循环均由 fixture 中的
+脚本：`scripts/tests/test_np560_icount_accounting.py`。所有初始化及循环均由 fixture 中的
 guest 指令执行，不用 NAND、不注入 RAM、不启用硬件中断。通过已有 QMP
 `query-replay` 读取原始 icount；没有启用录制/回放。终点是页末的 C701，明确检查
 唯一一次故障以及 R6/R7，随后暂停再读；表中计数**包含这一次终止指令尝试**，

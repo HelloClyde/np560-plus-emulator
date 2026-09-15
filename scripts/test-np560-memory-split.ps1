@@ -3,7 +3,7 @@ param()
 
 $ErrorActionPreference = 'Stop'
 $script = (Resolve-Path -LiteralPath (
-    Join-Path $PSScriptRoot 'test_np560_memory_split.py'
+    Join-Path $PSScriptRoot 'tests/test_np560_memory_split.py'
 )).Path -replace '\\', '/'
 $wslScript = (& wsl.exe -d Ubuntu2 -- wslpath -a -- $script).Trim()
 if ($LASTEXITCODE -ne 0 -or -not $wslScript) {

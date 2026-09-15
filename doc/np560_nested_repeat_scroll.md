@@ -48,7 +48,7 @@
 
 ## 修复前后执行证据
 
-复用现有无 NAND CPU runner，新增 `scripts/test_np560_nested_repeat.py`。
+复用现有无 NAND CPU runner，新增 `scripts/tests/test_np560_nested_repeat.py`。
 所有寄存器、RAM、向量与测试缓冲由诊断 guest 指令设置，宿主只读取结果。
 
 | 场景 | 旧核心 | 修复后 |

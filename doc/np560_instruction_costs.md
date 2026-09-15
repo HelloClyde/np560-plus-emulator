@@ -70,7 +70,7 @@ CPU 操作数等待；执行分派前后设置访问计时边界。
 
 构建 SHA256：`245165619eb3241c4f1eba99419baebee57619157efc64823f9fb03dbea9e144`。
 
-`scripts/test_np560_instruction_costs.py` 的完整 8 项：
+`scripts/tests/test_np560_instruction_costs.py` 的完整 8 项：
 `tmp/np560-instruction-costs-20260908-v2/report.json`，全部通过、退出 0、无 NAND。
 v1 保留首次 7 项记录，v2 增加真实计时器对外存等待的检查，不覆盖旧证据。
 

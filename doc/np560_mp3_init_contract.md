@@ -34,7 +34,7 @@ free-bitrate 和 Layer I 的原厂拒绝分支。拒绝返回 `FFFC`，不等于
 头部接受不证明完整帧、CRC 校验、Layer II 解码或整个文件播放可用。
 
 证据：`tmp/np560-mp3-header-20260907-v2/report.json`，32 个 QEMU 均正常退出 0。
-工具：`scripts/test_np560_mp3_header.py`，诊断输入、读回和边界哨兵都由 guest 指令设置。
+工具：`scripts/tests/test_np560_mp3_header.py`，诊断输入、读回和边界哨兵都由 guest 指令设置。
 `00:3340/3346` 哨兵不变，证明此函数没有代替缺失的解码器初始化。
 
 ### 保留失败并排除错误命名

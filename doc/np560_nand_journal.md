@@ -147,7 +147,7 @@ reader 自然启动和应用操作继续产生擦写，结束前序号已到 33,
 
 ### 已验证与尚未证明的保证
 
-`scripts/test_np560_nand_compaction.py` 的微型非空底图检查包含：
+`scripts/tests/test_np560_nand_compaction.py` 的微型非空底图检查包含：
 
 - 原始页保留、最终擦空、跨 data/OOB、跨块 OOB、copy-back、同进程替换后继续追加和新进程冷读回。
 - 用独立重放器比较新旧日志涉及的**完整块 data/OOB**；合并不改变 guest NAND 命令计数。
@@ -197,7 +197,7 @@ rename 前/后中止的 PID 80954 / 80965 均退出 -9，两个 reader 均退出
 
 ## 原有持久化检查与未完成范围
 
-`scripts/test_np560_nand_journal.py` 用 guest 控制器命令检查 AND 编程、数据/OOB 边界、跨页 OOB、
+`scripts/tests/test_np560_nand_journal.py` 用 guest 控制器命令检查 AND 编程、数据/OOB 边界、跨页 OOB、
 copy-back、擦除、SIGKILL 后重放、文件争用、错误底图、损坏记录与不完整尾部。不开辟大型 NAND 文件。
 旧无日志核心丢失已写数据的反例在 `tmp/np560-nand-journal-before-20260906-v1/report.json`；
 首版日志机制证据在 `tmp/np560-nand-journal-20260906-v1/report.json`。

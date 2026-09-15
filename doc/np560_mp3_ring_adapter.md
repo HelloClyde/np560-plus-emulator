@@ -47,7 +47,7 @@
 15 个组件、34 个片段共 81620 bytes，已保护范围内余 25096 bytes；原厂已知入口
 仍保留，不在这里安装空壳 `4804/49F8`。沿用 QEMU `533dd1a4...`，本阶段未改 CPU。
 
-真实连续输入检查使用 `scripts/test_np560_mp3_ring.py`。每个 QEMU 只运行一个
+真实连续输入检查使用 `scripts/tests/test_np560_mp3_ring.py`。每个 QEMU 只运行一个
 诊断 caller：通过原厂堆申请/锁定工作区，按不同长度 word 块调用原始 writer，
 每次检查 free、读写游标、消费位置与实际 PCM，最后释放真实句柄、检查邻接对象
 及原厂空闲链。测试程序不提供每帧 header 几何或 bit context，不向运行中 RAM 写入。
@@ -137,6 +137,6 @@ SP 恢复；guest 解出的 CRC 合法零频谱帧 PCM 为零。它是控制用�
 
 ```text
 python scripts/build_np560_mp3_resident.py --resident-rom tmp/np560-system-v380-vma03-resident-codec-holes-v1.bin --firmware "NP560+V3.80版系统升级程序/NP560.PRG" --output tmp/new-ring-core
-python scripts/test_np560_mp3_ring.py --qemu /path/to/qemu-system-dmcu --mp3 /path/to/input.mp3 --resident-bundle tmp/new-ring-core --output tmp/new-ring-test --limit 6
-python scripts/test_np560_mp3_ring_control.py --qemu /path/to/qemu-system-dmcu --resident-bundle tmp/new-ring-core --output tmp/new-ring-control
+python scripts/tests/test_np560_mp3_ring.py --qemu /path/to/qemu-system-dmcu --mp3 /path/to/input.mp3 --resident-bundle tmp/new-ring-core --output tmp/new-ring-test --limit 6
+python scripts/tests/test_np560_mp3_ring_control.py --qemu /path/to/qemu-system-dmcu --resident-bundle tmp/new-ring-core --output tmp/new-ring-control
 ```

@@ -40,7 +40,7 @@
 及通知定时设备之前拒绝写入。直接字/字节、BIT、POP、banked/IGNDS 内存映射共用该路径。
 解锁操作不自动清 UP，重新锁定由 guest 原厂代码负责。
 
-`scripts/test_np560_clock_protection.py` 复用现有 QEMU 启动和读状态接口：
+`scripts/tests/test_np560_clock_protection.py` 复用现有 QEMU 启动和读状态接口：
 
 - 锁定后的字、字节、位、POP 和两种总线映射均保持原值；同时核对三路实际 Timer 频率。
 - 解锁可切换至 32.768 kHz 或 3.072 MHz，重新锁定后不能改动。

@@ -34,7 +34,7 @@ signed(x) × signed(y)   = 上式           - (y < 0 ? U(x) << 32 : 0)
 
 ## 验证与实测
 
-新测试 `scripts/test_np560_mp3_multiply.py` 直接执行两个原生入口，
+新测试 `scripts/tests/test_np560_mp3_multiply.py` 直接执行两个原生入口，
 以独立 Python 大整数乘积检查完整四个输出 word，包含边界、随机、FR 开启、
 系数保持、调用栈和保留寄存器；宿主仅准备诊断输入和读回结果，不参与运行中的解码。
 

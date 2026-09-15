@@ -78,7 +78,7 @@ UNSUPPORTED=none
 显式 skeleton 模式继续报告更具体的 `ROM_MISSING`。这不是实现了真实 TRAP 异常机制，
 而是消除了把未知语义当作 NOP 的错误；真实 TRAP 的向量与异常约定仍待恢复。
 
-当时的 `scripts/test_np560_trap_strict.py` 检查 PRG 的 `0F00/0F37`、普通 resident 的 `0F00`，
+当时的 `scripts/tests/test_np560_trap_strict.py` 检查 PRG 的 `0F00/0F37`、普通 resident 的 `0F00`，
 以及显式 skeleton 缺口。陷阱后的指令会把 R0 从 `1234` 改为 `BEEF`：
 
 - 旧二进制实际执行到 `20:000A`，R0=`BEEF`，验证失败。

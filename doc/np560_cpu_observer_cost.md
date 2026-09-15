@@ -71,7 +71,7 @@ d150–d158 描述 EN/RQ/ED、计数非零时交 DTU、归零转 CPU 最高优�
   registry-builder 整块仅在 SCALL/RETS 时进入，其所有原有事件本来都要求这两种操作。
   没有取消有效日志、总线读取、故障检查或原厂指令。
 
-`scripts/test_np560_observer_sites.py` 编译生产 lookup C 代码，对全部 16777216 个
+`scripts/tests/test_np560_observer_sites.py` 编译生产 lookup C 代码，对全部 16777216 个
 24 位地址及越界键核对旧表的 first-match 结果，退出 0。参考表保存在
 `scripts/fixtures/np560_application_observer_sites.json`。
 这只证明地址索引等价，不等于所有观察器或整机验收。

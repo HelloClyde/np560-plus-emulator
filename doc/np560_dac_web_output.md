@@ -76,7 +76,7 @@ timer reset 也从旧 PLL/CLKCON 推导频率。CPU 最后清零并不会再次�
 
 ### 当前构建
 
-- `scripts/test_np560_audio.py` 普通及 icount=5 执行通过：未修改原厂 `08:33FA` 渐变，
+- `scripts/tests/test_np560_audio.py` 普通及 icount=5 执行通过：未修改原厂 `08:33FA` 渐变，
   有符号左右声道、banked/unbanked/直接寄存器、使能/掉电静音、暂停只读和活动中复位。
   原厂函数逐字节取自原 PRG；外围是明确的诊断 guest，不是完整原厂游戏。
   报告及采样 WAV 位于 `tmp/np560-audio-output-v2/`。

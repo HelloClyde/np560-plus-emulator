@@ -56,7 +56,7 @@ X0 的 `FFFF` 模式或初始地址位于循环长度之外时，在操作数读
 
 ## 未改写的原厂函数验证
 
-[验证脚本](../scripts/test_np560_x0_ring.py) 复用现有隔离 guest 运行器。
+[验证脚本](../scripts/tests/test_np560_x0_ring.py) 复用现有隔离 guest 运行器。
 原函数完整字节放在其 VMA03 程序地址；caller 由 guest 自己准备数据、寄存器、参数和栈。
 宿主不写运行中的 guest RAM，无 NAND、HLE、原厂解码替代或生产 ROM 修改。
 

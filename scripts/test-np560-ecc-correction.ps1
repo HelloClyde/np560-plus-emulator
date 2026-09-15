@@ -5,7 +5,7 @@ $ErrorActionPreference = 'Stop'
 $project = Split-Path $PSScriptRoot -Parent
 $burnCode = Join-Path $project `
     'NP560+V3.80版系统升级程序\BURN_NAND_FLASH_CODE.bin'
-$script = Join-Path $PSScriptRoot 'test_np560_ecc_correction.py'
+$script = Join-Path $PSScriptRoot 'tests/test_np560_ecc_correction.py'
 
 foreach ($path in @($burnCode, $script)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {

@@ -60,7 +60,7 @@ CPU 的 IE/CPRI/CIRQ 和 ISR 屏蔽限制 CPU 进入服务，不阻挡已致能�
 
 ## 验证结果与边界
 
-`scripts/test_np560_dtu.py` 在下面同一二进制上检查：
+`scripts/tests/test_np560_dtu.py` 在下面同一二进制上检查：
 
 - 四个通道 × 保持/递增源/递增目标 × word/byte；SDS/DDS 各组合、非零 DS 下的
   unbanked 指针表、逐请求计数以及 EN 屏蔽后再致能。每一步读取实际 guest 寄存器和数据。

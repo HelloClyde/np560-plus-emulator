@@ -48,7 +48,7 @@ DMCU 的 QEMU 翻译页为 2 KiB，指令首字在前一页末尾，立即数字
 新 `E:/qemu-dmcu-build/qemu-system-dmcu`：46,599,840 bytes，SHA-256
 `31dc2d9c0cbb946809cb1aecb7155264de2b3302008d2e03b5e63164239647c6`。
 
-`scripts/test_np560_code_coherence.py` 是一项短时定向检查，复用已有 Emulator，
+`scripts/tests/test_np560_code_coherence.py` 是一项短时定向检查，复用已有 Emulator，
 不是新增自动导航或压力测试平台。
 
 - `tmp/np560-code-coherence-20260906-v1/report.json`：同页、整个指令位于新页的对照、

@@ -56,7 +56,7 @@ SHA-256：`8565fc8d1f917f89667d1ac3439699888f669ec0ac774438d852848371d02031`。
 
 ## 验证与原厂画面
 
-[格式检查](../scripts/test_np560_lcd_formats.py) 复用既有 guest 运行器，
+[格式检查](../scripts/tests/test_np560_lcd_formats.py) 复用既有 guest 运行器，
 由 guest 指令写入 LCD、读取 LCD，再将结果存入 RAM；宿主仅读结果。
 没有 NAND、HLE、运行中 RAM 注入或前端补画。
 

@@ -74,7 +74,7 @@ v3 在实际 PCM 和回调完成后以 `BSET BIT83.15` 发布这一位，初始�
 
 ## 已运行的验证
 
-`scripts/test_np560_mp3_factory.py` 使用实际原厂堆和五个已测播放器大小的邻居，
+`scripts/tests/test_np560_mp3_factory.py` 使用实际原厂堆和五个已测播放器大小的邻居，
 直接调用这七个入口及原始 `16:E89C`、`2F:A6BA`、`16:EDB2`。输入由原厂
 `16:E844` 从原 MP3 连续字节写入；PCM 从原厂 4954 返回的实际 X0 缓冲采集。
 **没有诊断对象定位跳板**，也没有用返回值桩替代回调。
@@ -123,11 +123,11 @@ CPU-only 寄存器保持原路径，板级设备入口新增持锁断言。**未
 移除原断言，未跳过计数器更新，未更改 guest 代码以绕过设备故障。**
 
 修复后 `tmp/np560-sfr-device-lock-after-20260907-v1/report.json` 通过，直接和 MMIO
-读写均持锁，包含 T2 counter 和 DAC。`scripts/test_np560_timers.py` 也退出 0：三个
+读写均持锁，包含 T2 counter 和 DAC。`scripts/tests/test_np560_timers.py` 也退出 0：三个
 定时器正常/`icount=5`/暂停恢复及原厂全部六种双定时器路由通过；两个 DTU 声道均实际
 传输 32 个样本并完成一次，T1/T2 的 icount 运行也通过。它们不代替完整应用播放验证。
 
-`scripts/test_np560_dtu.py` 完整退出 0，包括四通道/字节与 word/增址/别名/边界及
+`scripts/tests/test_np560_dtu.py` 完整退出 0，包括四通道/字节与 word/增址/别名/边界及
 原厂 24:98FC 正常与 icount 的实际 1024 次传输、两次完成。声音回归
 `tmp/np560-audio-lockfix-20260907-v1/` 的普通、icount、活动复位也通过：真实 DAC
 PCM 正负样本、静音、原厂 08:33FA 渐变、暂停不推进音频、复位清除状态仍正确。

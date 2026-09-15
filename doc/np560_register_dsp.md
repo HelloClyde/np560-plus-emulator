@@ -86,7 +86,7 @@ Y-RAM、位反转、内存 MAC 和 EXR 仍缺；本篇下面的完整 DSP 验证
 
 ## 原厂字节验证与中间失败
 
-`scripts/test_np560_mac.py` 使用原 PRG 整段函数和原表。隔离 caller 由 guest
+`scripts/tests/test_np560_mac.py` 使用原 PRG 整段函数和原表。隔离 caller 由 guest
 自己设置样本、参数及栈；宿主仅读结果，不写运行中 guest RAM，没有 NAND 或 codec 替代。
 夹具将原表放入相应物理数据映射，不能算生产 ROM 数据映射修复。
 

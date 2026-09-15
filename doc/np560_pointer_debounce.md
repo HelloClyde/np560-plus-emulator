@@ -64,7 +64,7 @@
 
 ## 验证与版本边界
 
-`scripts/test_np560_pointer_input.js` 使用实际 app 事件处理器，控制时间和传输确认，
+`scripts/tests/test_np560_pointer_input.js` 使用实际 app 事件处理器，控制时间和传输确认，
 检查延迟确认、长按释放、快速重按、失焦取消及请求失败；已接入现有 Web 前端单元测试。
 这是前端逻辑验证，不声称完成了真实浏览器到 QEMU 的整链点按检查。
 

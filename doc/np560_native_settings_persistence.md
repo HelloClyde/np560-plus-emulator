@@ -49,7 +49,7 @@
 - `qemu-dmcu/hw/dmcu/np560.c`：删除普通复位中的 `np560_load_nand_image(s)`。
   初次机器创建仍加载输入 NAND；复位只重置 NAND 控制器和诊断计数，保留 data/OOB。
   继续按 CPU → TB/TLB → 外设的既有顺序复位，未改变 RAM 和 action code/UI 快照恢复。
-- `scripts/test_np560_web_frontend.py`：纠正旧测试中“Reset 必须重载 checkpoint”的错误预期，
+- `scripts/tests/test_np560_web_frontend.py`：纠正旧测试中“Reset 必须重载 checkpoint”的错误预期，
   保留初始化加载和 CPU/外设顺序约束。22 项测试通过；首次沙箱运行中的三个 Node 路径访问
   EPERM 在允许读取工作区的环境复核后通过，没有为此修改前端功能。
 - `scripts/probe_np560_native_settings_reset.py`：复用已有矩阵、LCD 和内存只读接口，

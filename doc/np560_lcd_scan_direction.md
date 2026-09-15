@@ -32,7 +32,7 @@
 
 ## 修改前反例
 
-[隔离 guest](../scripts/test_np560_lcd_scan.py) 通过实际 LCD MMIO 写入几个已知像素组，
+[隔离 guest](../scripts/tests/test_np560_lcd_scan.py) 通过实际 LCD MMIO 写入几个已知像素组，
 再设置 LI=1，不重写像素，最后读取原逻辑 RAM 地址。
 预期画面由手册方向和既有 COMSCN=1 接线计算为固定坐标，不从当前 QEMU 输出生成。
 

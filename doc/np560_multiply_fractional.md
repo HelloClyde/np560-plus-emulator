@@ -43,7 +43,7 @@ MUL 小数溢出时的 N 沿用写入后 32-bit 符号位；极端复合标志�
 - 两个源操作数先取完再写 R6/R7，继续支持源与结果寄存器重叠。
 - 没有启用饱和、写入 ARX、改变 C 或 DSP 的 MV/MS/MX 等其它位。
 
-没有新建监控框架；扩展已有 `scripts/test_np560_multiply_registers.py`，
+没有新建监控框架；扩展已有 `scripts/tests/test_np560_multiply_registers.py`，
 复用现有隔离运行器，保留 `--qemu` 调用方式，增加可选结果目录和单例选择。
 
 ## 当前验证

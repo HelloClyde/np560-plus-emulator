@@ -53,7 +53,7 @@ guest 安装的可执行向量。三个计数器恢复为普通共享 RAM，仅�
 
 ## 行为差异与验证边界
 
-`scripts/test_np560_timebase.py` 的外围是明确诊断 guest，原厂初始化/ISR 片段保持原字节。
+`scripts/tests/test_np560_timebase.py` 的外围是明确诊断 guest，原厂初始化/ISR 片段保持原字节。
 宿主只读取结果和控制运行/暂停/复位，无 guest RAM 写入、无 NAND。
 
 | 场景 | 结果 |

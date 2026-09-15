@@ -43,7 +43,7 @@ MP3 标准算法与原厂 ROM 私有接口是两类问题。缺少原厂函数�
 
 ## 3. 位读取/Huffman 验证及失败记录
 
-`scripts/test_np560_mp3_huffman.py` 先独立展开 libmad 的多位查表，与 FFmpeg 长度/符号
+`scripts/tests/test_np560_mp3_huffman.py` 先独立展开 libmad 的多位查表，与 FFmpeg 长度/符号
 表示逐项比较：32 张有效表、4995 个含共享码表重复项的码字全部一致，linbits 也一致。
 这比用同一树生成器同时充当唯一 oracle 更独立，但仍不是整帧 PCM 对照。
 
@@ -276,7 +276,7 @@ intensity_enabled/payload_bytes。`reset` 保留这五项并清空余下状态�
 有效段数置 0，主数据 context 作废，**整帧输出必须拒绝**。没有用零频谱掩盖坏帧。
 调用者须检查返回状态，不能在预检失败后使用上一帧留存的有效段标记。
 
-`scripts/test_np560_mp3_frame.py` 的 NOR 夹具只向解码函数提供原始 sideinfo/payload
+`scripts/tests/test_np560_mp3_frame.py` 的 NOR 夹具只向解码函数提供原始 sideinfo/payload
 和头参数；参考结果位于另一区域，仅由 guest 检查函数读取比较。每个完整文件
 使用一个持续运行的自有 QEMU，不在帧间重启，不引导注入历史，不写入前 granule SF。
 与 4.4 同一个独立离线熵解码参考比较量化整数、SF/IS、flags、游标、历史及哨兵。
@@ -743,7 +743,7 @@ bank 0，`workspace_bank=None` 保留调用者 DS0。构建 PCM 驱动时拒绝�
    宿主代算或跳过失败 granule。全部 16 种 SCFSI 掩码、两种 compress 和原地复用的
    32 例定向回归通过（`np560-mp3-scfsi-regression-20260907-v1`）。
 
-`scripts/test_np560_mp3_decoder.py` 仅调用上述公开接口，逐 granule 检查实际 PCM、
+`scripts/tests/test_np560_mp3_decoder.py` 仅调用上述公开接口，逐 granule 检查实际 PCM、
 全部滤波历史、消费位置、pending/错误状态与边界哨兵，并验证 busy/empty 调用不变。
 bank-0 RAM 在测试前由 guest 毒化，结束时逐 word 检查；仅排除真实栈区及八字节
 诊断区，原厂的 `1000/1784/333E` 等地址都在检查范围内。没有 NAND 或运行中宿主内存注入。
@@ -1008,55 +1008,55 @@ guest 原始 WAV 不裁剪。这里只验证各三帧前缀，不借用旧布局
 
 ```text
 python scripts/build_np560_mp3_huffman.py --output tmp/new-mp3-core
-python scripts/test_np560_mp3_huffman.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-core-test
-python scripts/test_np560_mp3_huffman.py --qemu /path/to/qemu-system-dmcu --resident-rom /path/to/current-resident-rom.bin --output tmp/new-mp3-resident-entropy
+python scripts/tests/test_np560_mp3_huffman.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-core-test
+python scripts/tests/test_np560_mp3_huffman.py --qemu /path/to/qemu-system-dmcu --resident-rom /path/to/current-resident-rom.bin --output tmp/new-mp3-resident-entropy
 python scripts/build_np560_mp3_sideinfo.py --output tmp/new-mp3-sideinfo
 python scripts/build_np560_mp3_reservoir.py --output tmp/new-mp3-reservoir
-python scripts/test_np560_mp3_sideinfo.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-sideinfo-test --mp3 /path/to/existing.mp3
-python scripts/test_np560_mp3_reservoir.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-reservoir-test --mp3 /path/to/existing.mp3
+python scripts/tests/test_np560_mp3_sideinfo.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-sideinfo-test --mp3 /path/to/existing.mp3
+python scripts/tests/test_np560_mp3_reservoir.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-reservoir-test --mp3 /path/to/existing.mp3
 python scripts/build_np560_mp3_spectrum.py --output tmp/new-mp3-front-end
-python scripts/test_np560_mp3_scalefactors.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-sf-test
-python scripts/test_np560_mp3_spectrum.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-spectrum-test --mp3 /path/to/existing.mp3
-python scripts/test_np560_mp3_spectrum.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-spectrum-errors --errors-only
+python scripts/tests/test_np560_mp3_scalefactors.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-sf-test
+python scripts/tests/test_np560_mp3_spectrum.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-spectrum-test --mp3 /path/to/existing.mp3
+python scripts/tests/test_np560_mp3_spectrum.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-spectrum-errors --errors-only
 python scripts/build_np560_mp3_frame.py --output tmp/new-mp3-frame-core
-python scripts/test_np560_mp3_frame.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-frames --mp3 /path/to/existing.mp3
-python scripts/test_np560_mp3_frame.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-recovery --mp3 /path/to/existing.mp3 --recovery
-python scripts/test_np560_mp3_frame.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-modes --modes
+python scripts/tests/test_np560_mp3_frame.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-frames --mp3 /path/to/existing.mp3
+python scripts/tests/test_np560_mp3_frame.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-recovery --mp3 /path/to/existing.mp3 --recovery
+python scripts/tests/test_np560_mp3_frame.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-modes --modes
 python scripts/build_np560_mp3_requantize.py --output tmp/new-mp3-requant
-python scripts/test_np560_mp3_requantize.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-requant-test
-python scripts/test_np560_mp3_frame.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-requant-chain --mp3 /path/to/existing.mp3 --requant
+python scripts/tests/test_np560_mp3_requantize.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-requant-test
+python scripts/tests/test_np560_mp3_frame.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-requant-chain --mp3 /path/to/existing.mp3 --requant
 python scripts/build_np560_mp3_stereo.py --output tmp/new-mp3-stereo
-python scripts/test_np560_mp3_stereo.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-stereo-test
-python scripts/test_np560_mp3_frame.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-post-chain --mp3 /path/to/existing.mp3 --postprocess
+python scripts/tests/test_np560_mp3_stereo.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-stereo-test
+python scripts/tests/test_np560_mp3_frame.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-post-chain --mp3 /path/to/existing.mp3 --postprocess
 python scripts/build_np560_mp3_intensity.py --output tmp/new-mp3-intensity
-python scripts/test_np560_mp3_intensity.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-intensity-test
-python scripts/test_np560_mp3_frame.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-is-chain --mp3 doc/sources/minimp3-vectors-20260907/l3-he_mode.bit --postprocess --post-start 50 --limit 70
+python scripts/tests/test_np560_mp3_intensity.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-intensity-test
+python scripts/tests/test_np560_mp3_frame.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-is-chain --mp3 doc/sources/minimp3-vectors-20260907/l3-he_mode.bit --postprocess --post-start 50 --limit 70
 
 python scripts/build_np560_mp3_antialias.py --output tmp/new-mp3-antialias
-python scripts/test_np560_mp3_antialias.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-antialias-test
-python scripts/test_np560_mp3_frame.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-antialias-chain --mp3 /path/to/existing.mp3 --antialias
+python scripts/tests/test_np560_mp3_antialias.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-antialias-test
+python scripts/tests/test_np560_mp3_frame.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-antialias-chain --mp3 /path/to/existing.mp3 --antialias
 
 python scripts/build_np560_mp3_hybrid.py --output tmp/new-mp3-hybrid
-python scripts/test_np560_mp3_hybrid.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-hybrid-test
-python scripts/test_np560_mp3_hybrid.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-hybrid-reference --reference-only
-python scripts/test_np560_mp3_frame.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-hybrid-chain --mp3 /path/to/existing.mp3 --hybrid
+python scripts/tests/test_np560_mp3_hybrid.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-hybrid-test
+python scripts/tests/test_np560_mp3_hybrid.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-hybrid-reference --reference-only
+python scripts/tests/test_np560_mp3_frame.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-hybrid-chain --mp3 /path/to/existing.mp3 --hybrid
 
 python scripts/build_np560_mp3_synthesis.py --output tmp/new-mp3-synthesis
-python scripts/test_np560_mp3_synthesis.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-synthesis-test
-python scripts/test_np560_mp3_frame.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-pcm --mp3 /path/to/existing.mp3 --pcm
-python scripts/test_np560_mp3_frame.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-pcm-offline-recheck --mp3 /path/to/existing.mp3 --pcm --recheck-pcm-from tmp/previous-mp3-pcm
+python scripts/tests/test_np560_mp3_synthesis.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-synthesis-test
+python scripts/tests/test_np560_mp3_frame.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-pcm --mp3 /path/to/existing.mp3 --pcm
+python scripts/tests/test_np560_mp3_frame.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-pcm-offline-recheck --mp3 /path/to/existing.mp3 --pcm --recheck-pcm-from tmp/previous-mp3-pcm
 
 python scripts/build_np560_mp3_decoder.py --output tmp/new-mp3-banked-decoder
-python scripts/test_np560_mp3_decoder.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-banked-pcm --mp3 /path/to/existing.mp3 --limit 8 --workspace-bank 0x30
+python scripts/tests/test_np560_mp3_decoder.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-banked-pcm --mp3 /path/to/existing.mp3 --limit 8 --workspace-bank 0x30
 python scripts/build_np560_mp3_allocation.py --output tmp/new-mp3-allocation
-python scripts/test_np560_mp3_allocation.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-allocation-test
-python scripts/test_np560_mp3_decoder.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-heap-pcm --mp3 /path/to/existing.mp3 --limit 2 --factory-heap --heap-prefix-bytes 0x2000
-python scripts/test_np560_mp3_decoder.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-offset-heap-pcm --mp3 /path/to/existing.mp3 --limit 2 --factory-heap --heap-prefix-bytes 0x5000
-python scripts/test_np560_mp3_decoder.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-offset-edge-pcm --mp3 /path/to/existing.mp3 --limit 2 --workspace-bank 0x34 --workspace-offset 0x1cfe --icount 5
+python scripts/tests/test_np560_mp3_allocation.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-allocation-test
+python scripts/tests/test_np560_mp3_decoder.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-heap-pcm --mp3 /path/to/existing.mp3 --limit 2 --factory-heap --heap-prefix-bytes 0x2000
+python scripts/tests/test_np560_mp3_decoder.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-offset-heap-pcm --mp3 /path/to/existing.mp3 --limit 2 --factory-heap --heap-prefix-bytes 0x5000
+python scripts/tests/test_np560_mp3_decoder.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-offset-edge-pcm --mp3 /path/to/existing.mp3 --limit 2 --workspace-bank 0x34 --workspace-offset 0x1cfe --icount 5
 
 python scripts/build_np560_mp3_resident.py --resident-rom tmp/np560-system-v380-vma03-resident-codec-holes-v1.bin --firmware "NP560+V3.80版系统升级程序/NP560.PRG" --output tmp/new-mp3-resident
-python scripts/test_np560_mp3_requantize.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-resident-rq --resident-bundle tmp/new-mp3-resident --scalars-only
-python scripts/test_np560_mp3_decoder.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-resident-pcm --mp3 /path/to/existing.mp3 --limit 3 --factory-heap --heap-prefix-bytes 0x4000 --resident-bundle tmp/new-mp3-resident
+python scripts/tests/test_np560_mp3_requantize.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-resident-rq --resident-bundle tmp/new-mp3-resident --scalars-only
+python scripts/tests/test_np560_mp3_decoder.py --qemu /path/to/qemu-system-dmcu --output tmp/new-mp3-resident-pcm --mp3 /path/to/existing.mp3 --limit 3 --factory-heap --heap-prefix-bytes 0x4000 --resident-bundle tmp/new-mp3-resident
 ```
 
 以上命令拒绝复用输出目录。测试使用现有 QEMU 运行环境；熵核心测试的 `--bits-only`

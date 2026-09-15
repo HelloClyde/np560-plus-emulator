@@ -66,7 +66,7 @@ try {
 
     $paths = @{}
     foreach ($item in @(
-        @{ Name = 'script'; Path = (Join-Path $PSScriptRoot 'test_np560_system_boot.py') },
+        @{ Name = 'script'; Path = (Join-Path $PSScriptRoot 'tests/test_np560_system_boot.py') },
         @{ Name = 'firmware'; Path = $firmware },
         @{ Name = 'rom'; Path = $rom },
         @{ Name = 'nand'; Path = $nand }

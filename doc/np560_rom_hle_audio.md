@@ -29,7 +29,7 @@ DTU/DAC → Web PCM。后端不能访问文件、NAND、Web 或设备时钟，�
 - 当前支持边界不是完整 MP3 标准符合性证明：自由格式明确未支持，所有畸形码流的检测、
   完整变格式/seek/错误恢复与性能仍须在服务接入后核验。
 
-验证脚本：`scripts/test_np560_mp3_hle_codec.py`。仅编译并调用上述同一后端，不运行 QEMU，
+验证脚本：`scripts/tests/test_np560_mp3_hle_codec.py`。仅编译并调用上述同一后端，不运行 QEMU，
 不向用户设备写内存。证据：`tmp/np560-mp3-hle-codec-20260907-v1/report.json`。
 
 | 实际输入 | 帧数 | 采样率/声道 | 与独立 FFmpeg 最大 PCM16 差异 |

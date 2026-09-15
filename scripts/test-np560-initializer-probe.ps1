@@ -17,7 +17,7 @@ try {
 
     $paths = @{}
     foreach ($item in @(
-        @{ Name = 'script'; Path = (Join-Path $PSScriptRoot 'test_np560_initializer_probe.py') },
+        @{ Name = 'script'; Path = (Join-Path $PSScriptRoot 'tests/test_np560_initializer_probe.py') },
         @{ Name = 'firmware'; Path = (Join-Path $project 'NP560+V3.80版系统升级程序\NP560.PRG') },
         @{ Name = 'rom'; Path = $rom }
     )) {
