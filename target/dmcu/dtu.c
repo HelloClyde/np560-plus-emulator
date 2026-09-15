@@ -30,7 +30,7 @@ void dmcu_dtu_trace_irq(DMCUCPU *cpu, unsigned source)
 
 void dmcu_dtu_trace_reload(CPUDMCUState *env, unsigned channel, unsigned count)
 {
-    DMCUCPU *cpu = DMCU_CPU(env_cpu(env));
+    DMCUCPU *cpu = env_archcpu(env);
     DMCUDTURefillEvent *e = &env->dtu_refill_pending[channel];
 
     if (!cpu->dtu_refill_trace_enabled || !count || !e->pending) {
@@ -118,7 +118,7 @@ static hwaddr dmcu_dtu_address(CPUDMCUState *env, uint16_t pointer,
 bool dmcu_dtu_run(DMCUCPU *cpu)
 {
     CPUDMCUState *env = &cpu->env;
-    AddressSpace *as = cpu_get_address_space(CPU(cpu), DMCU_AS_DATA);
+    AddressSpace *as = cpu_get_address_space(&cpu->parent_obj, DMCU_AS_DATA);
     unsigned source;
     bool handled = false;
 

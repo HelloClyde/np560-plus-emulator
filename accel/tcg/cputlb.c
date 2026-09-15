@@ -346,7 +346,20 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
 
     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
 
+#ifdef TARGET_DMCU
+    /* DMCU instruction fetch uses a separate, identity-mapped code MMU
+     * index. DS0/DS1 and IGNDS change only the data index. Flushing that
+     * index must not discard the PC->TB cache on every banked access.
+     * A requested code/full flush still clears the cache, even when the
+     * code TLB is already clean. RAM code writes continue to invalidate
+     * their TBs through the ordinary physical-memory invalidation path.
+     */
+    if (asked & (1u << MMU_CODE_IDX)) {
+        tcg_flush_jmp_cache(cpu);
+    }
+#else
     tcg_flush_jmp_cache(cpu);
+#endif
 
     if (to_clean == ALL_MMUIDX_BITS) {
         qatomic_set(&cpu->neg.tlb.c.full_flush_count,

@@ -68,8 +68,12 @@ static int64_t icount_get_limit(void)
 
 static void icount_notify_aio_contexts(void)
 {
-    /* Wake up other AioContexts.  */
-    qemu_clock_notify(QEMU_CLOCK_VIRTUAL);
+    /* Run the main list below, without redundantly kicking this very vCPU.
+     * Only due other AioContexts need waking. Future timers still bound the
+     * next icount budget through qemu_clock_deadline_ns_all(). Audio-rate
+     * main-list deadlines must not cause an eventfd write / wakeup in every
+     * unrelated I/O context for each sample. */
+    qemu_clock_notify_due_other(QEMU_CLOCK_VIRTUAL);
     qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL);
 }
 
@@ -113,6 +117,7 @@ void icount_prepare_for_run(CPUState *cpu, int64_t cpu_budget)
      */
     g_assert(cpu->neg.icount_decr.u16.low == 0);
     g_assert(cpu->icount_extra == 0);
+    g_assert(cpu->icount_pending_extra_ns == 0);
 
     replay_mutex_lock();
 

@@ -11,13 +11,12 @@
 
 static void dmcu_cpu_set_pc(CPUState *cs, vaddr value)
 {
-    DMCUCPU *cpu = DMCU_CPU(cs);
-    cpu->env.pc = value & 0x00ffffffu;
+    cpu_env(cs)->pc = value & 0x00ffffffu;
 }
 
 static vaddr dmcu_cpu_get_pc(CPUState *cs)
 {
-    return DMCU_CPU(cs)->env.pc & 0x00ffffffu;
+    return cpu_env(cs)->pc & 0x00ffffffu;
 }
 
 static bool dmcu_cpu_has_work(CPUState *cs)
@@ -69,6 +68,41 @@ static int dmcu_irq_select(CPUDMCUState *env)
     return selected;
 }
 
+/* Boolean work check does not need to select the highest-priority vector.
+ * Inspect each latched source once, rather than scanning the whole ICR bank
+ * again for DTU work after a negative CPU-only selection. Actual CPU entry
+ * continues to use dmcu_irq_select, including its original tie order. */
+static bool dmcu_irq_or_dtu_pending(CPUDMCUState *env)
+{
+    unsigned psr = dmcu_sfr_read_word(env, DMCU_SFR_PSW);
+    unsigned threshold = (psr & DMCU_PSR_CPRI) >> 12;
+    bool enabled = env->sfr[DMCU_SFR_SOCR] & DMCU_SOCR_IE;
+
+    for (unsigned source = 0; source < DMCU_ICR_COUNT; source++) {
+        unsigned icr = env->sfr[DMCU_ICR_FIRST + source];
+        unsigned priority;
+
+        if ((icr & (DMCU_ICR_EN | DMCU_ICR_RQ)) !=
+                (DMCU_ICR_EN | DMCU_ICR_RQ)) {
+            continue;
+        }
+        if ((icr & DMCU_ICR_ED) &&
+            (env->sfr[DMCU_DTUC_FIRST + ((icr & DMCU_ICR_PRI) >> 4)] &
+             DMCU_DTUC_COUNT)) {
+            if (!(env->dtu_fault_sources & (1u << source))) {
+                return true;
+            }
+            continue;
+        }
+        priority = dmcu_irq_priority(icr);
+        if (enabled && priority >= threshold &&
+            !((psr & DMCU_PSR_CIRQ) && priority == threshold)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* CPU-internal software requests are synchronous register state changes,
  * not asynchronous I/O. The instruction helper exits its TB afterwards so
  * arbitration observes the completed PC (also under -icount). External
@@ -78,8 +112,7 @@ void dmcu_irq_update(CPUDMCUState *env)
     CPUState *cs = env_cpu(env);
 
     env->irq_state_changed = true;
-    if (dmcu_irq_select(env) >= 0 ||
-        dmcu_dtu_has_work(env)) {
+    if (dmcu_irq_or_dtu_pending(env)) {
         cs->interrupt_request |= CPU_INTERRUPT_HARD;
     } else {
         cpu_reset_interrupt(cs, CPU_INTERRUPT_HARD);
@@ -98,15 +131,15 @@ void dmcu_irq_raise(DMCUCPU *cpu, unsigned source)
      * software-written RQ retains its completed-instruction boundary. This
      * models autonomous DMA, not bus-cycle stealing or a guest ISR call. */
     dmcu_dtu_run(cpu);
-    if (dmcu_irq_select(&cpu->env) >= 0 || dmcu_dtu_has_work(&cpu->env)) {
-        cpu_interrupt(CPU(cpu), CPU_INTERRUPT_HARD);
+    if (dmcu_irq_or_dtu_pending(&cpu->env)) {
+        cpu_interrupt(&cpu->parent_obj, CPU_INTERRUPT_HARD);
     }
 }
 
 void dmcu_internal_memory_write(DMCUCPU *cpu, uint32_t addr,
                                 uint32_t value, int bits)
 {
-    AddressSpace *as = cpu_get_address_space(CPU(cpu), DMCU_AS_INTERNAL);
+    AddressSpace *as = cpu_get_address_space(&cpu->parent_obj, DMCU_AS_INTERNAL);
     uint32_t logical = addr & 0xffff;
 
     /* This address space is rooted at the raw SRAM backing, not the board
@@ -182,7 +215,7 @@ static void dmcu_interrupt_suspend(DMCUCPU *cpu)
 
 void dmcu_interrupt_complete(CPUDMCUState *env)
 {
-    DMCUCPU *cpu = DMCU_CPU(env_cpu(env));
+    DMCUCPU *cpu = env_archcpu(env);
     GArray *parents = cpu->interrupt_contexts;
 
     if (parents->len) {
@@ -354,7 +387,7 @@ static void dmcu_interrupt_enter(DMCUCPU *cpu, uint32_t return_pc,
 
 void dmcu_software_trap(CPUDMCUState *env, uint32_t return_pc, unsigned trap)
 {
-    DMCUCPU *cpu = DMCU_CPU(env_cpu(env));
+    DMCUCPU *cpu = env_archcpu(env);
     unsigned segment = env->sfr[DMCU_SFR_SOCR] & DMCU_SOCR_NSEG ?
                        dmcu_code_segment(return_pc) : 1;
 
@@ -370,7 +403,7 @@ void dmcu_software_trap(CPUDMCUState *env, uint32_t return_pc, unsigned trap)
 
 static bool dmcu_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
 {
-    DMCUCPU *cpu = DMCU_CPU(cs);
+    DMCUCPU *cpu = env_archcpu(cpu_env(cs));
     CPUDMCUState *env = &cpu->env;
     bool transferred = false;
     uint16_t old_sp, old_fp, socr;
@@ -423,14 +456,14 @@ static void dmcu_cpu_synchronize_from_tb(CPUState *cs,
                                          const TranslationBlock *tb)
 {
     tcg_debug_assert(!(cs->tcg_cflags & CF_PCREL));
-    DMCU_CPU(cs)->env.pc = tb->pc & 0x00ffffffu;
+    cpu_env(cs)->pc = tb->pc & 0x00ffffffu;
 }
 
 static void dmcu_restore_state_to_opc(CPUState *cs,
                                       const TranslationBlock *tb,
                                       const uint64_t *data)
 {
-    DMCU_CPU(cs)->env.pc = data[0] & 0x00ffffffu;
+    cpu_env(cs)->pc = data[0] & 0x00ffffffu;
 }
 
 static void dmcu_cpu_reset_hold(Object *obj)
@@ -545,6 +578,9 @@ void dmcu_cpu_list(void)
 
 static int dmcu_asidx_from_attrs(CPUState *cs, MemTxAttrs attrs)
 {
+    if (attrs.space == DMCU_AS_INTERNAL) {
+        return DMCU_AS_INTERNAL;
+    }
     return attrs.secure ? DMCU_AS_CODE : DMCU_AS_DATA;
 }
 

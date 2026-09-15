@@ -13,6 +13,9 @@
 
 #define MMU_CODE_IDX 0
 #define MMU_DATA_IDX 1
+#define MMU_UNBANKED_IDX 2
+#define MMU_INTERNAL_IDX 3
+#define MMU_PHYSICAL_DATA_IDX 4
 
 #define DMCU_AS_DATA 0
 #define DMCU_AS_CODE 1
@@ -4624,6 +4627,8 @@ typedef struct CPUArchState {
     bool control_observers_minimal; /* opt-in; strict faults/key ACK retained */
     bool instruction_clock_enabled;
     uint32_t instruction_clock_hz;
+    uint32_t instruction_clock_cached_pll;
+    uint32_t instruction_clock_cached_clkcon;
     uint32_t instruction_clock_fraction;
     uint64_t instruction_clock_period_fp;
     uint64_t instruction_clock_count;
@@ -4755,7 +4760,8 @@ struct DMCUCPUClass {
 
 static inline int dmcu_cpu_mmu_index(CPUDMCUState *env, bool ifetch)
 {
-    return ifetch ? MMU_CODE_IDX : MMU_DATA_IDX;
+    return ifetch ? MMU_CODE_IDX :
+           (env->ignore_ds_count ? MMU_UNBANKED_IDX : MMU_DATA_IDX);
 }
 
 #define cpu_mmu_index dmcu_cpu_mmu_index

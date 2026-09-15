@@ -89,6 +89,15 @@ static void icount_update_locked(CPUState *cpu)
 
     qatomic_set_i64(&timers_state.qemu_icount,
                     timers_state.qemu_icount + executed);
+    if (cpu->icount_pending_extra_ns) {
+        assert(cpu->icount_pending_extra_ns <= INT64_MAX);
+        assert(timers_state.qemu_icount_bias <=
+               INT64_MAX - (int64_t)cpu->icount_pending_extra_ns);
+        qatomic_set_i64(&timers_state.qemu_icount_bias,
+                       timers_state.qemu_icount_bias +
+                       (int64_t)cpu->icount_pending_extra_ns);
+        cpu->icount_pending_extra_ns = 0;
+    }
 }
 
 /*
@@ -114,14 +123,24 @@ void icount_account_extra_ns(CPUState *cpu, uint64_t ns)
     assert(current_cpu == cpu && cpu->running && cpu->neg.can_do_io);
     assert(ns <= INT64_MAX);
 
-    seqlock_write_lock(&timers_state.vm_clock_seqlock,
-                       &timers_state.vm_clock_lock);
-    icount_update_locked(cpu);
-    assert(timers_state.qemu_icount_bias <= INT64_MAX - (int64_t)ns);
-    qatomic_set_i64(&timers_state.qemu_icount_bias,
-                    timers_state.qemu_icount_bias + (int64_t)ns);
-    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
-                         &timers_state.vm_clock_lock);
+    /* Like uncommitted raw instructions, extra elapsed time is vCPU-local
+     * until a clock read or execution boundary publishes both under the
+     * seqlock. Device reads in this vCPU use icount_get_raw_locked(), which
+     * calls icount_update_locked() before exposing the clock. The run-exit
+     * path also commits before resetting the budget / stopping the CPU.
+     * Do not take a global lock for each arithmetic instruction. */
+    assert(cpu->icount_pending_extra_ns <= INT64_MAX - ns);
+    cpu->icount_pending_extra_ns += ns;
+
+    /* Usually the current 16-bit slice alone covers this instruction.
+     * Do not redistribute the entire extra budget on every charge. Keep
+     * exactly the same budget-minus-remaining raw instruction count, and
+     * preserve the asynchronous high half as on the slow path. */
+    if (ns < cpu->neg.icount_decr.u16.low) {
+        cpu->neg.icount_decr.u16.low -= ns;
+        cpu->icount_budget -= ns;
+        return;
+    }
 
     /* One budget unit is one ns, but is NOT another executed instruction.
      * Reduce the budget and its remaining counters together. Charging just

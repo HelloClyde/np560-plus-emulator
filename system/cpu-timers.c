@@ -245,6 +245,15 @@ void qemu_timer_notify_cb(void *opaque, QEMUClockType type)
     }
 
     if (qemu_in_vcpu_thread()) {
+        /* The counted rr loop runs virtual timer callbacks BETWEEN CPU
+         * runs, with the previous budget already committed and cleared.
+         * Rearming a periodic timer there must not kick this same idle
+         * executor: it will compute the new deadline before its next run.
+         * A rearm inside guest execution (MMIO/SFR) still kicks immediately,
+         * as do notifications from other threads below. */
+        if (!current_cpu->running && current_cpu->icount_budget == 0) {
+            return;
+        }
         /*
          * A CPU is currently running; kick it back out to the
          * tcg_cpu_exec() loop so it will recalculate its

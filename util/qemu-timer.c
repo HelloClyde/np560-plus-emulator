@@ -147,6 +147,19 @@ void qemu_clock_notify(QEMUClockType type)
     }
 }
 
+void qemu_clock_notify_due_other(QEMUClockType type)
+{
+    QEMUTimerList *timer_list;
+    QEMUClock *clock = qemu_clock_ptr(type);
+
+    QLIST_FOREACH(timer_list, &clock->timerlists, list) {
+        if (timer_list != main_loop_tlg.tl[type] &&
+            timerlist_deadline_ns(timer_list) == 0) {
+            timerlist_notify(timer_list);
+        }
+    }
+}
+
 /* Disabling the clock will wait for related timerlists to stop
  * executing qemu_run_timers.  Thus, this functions should not
  * be used from the callback of a timer that is based on @clock.

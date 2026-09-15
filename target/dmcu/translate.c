@@ -12,6 +12,7 @@
 
 #include "qemu/osdep.h"
 #include "cpu.h"
+#include "decode.h"
 #include "tcg/tcg.h"
 #include "tcg/tcg-op.h"
 #include "exec/exec-all.h"
@@ -240,7 +241,11 @@ static void dmcu_tr_translate_insn(DisasContextBase *db, CPUState *cs)
     }
     ctx->last_insn_wraps = wrapped_extension;
 
-    tcg_gen_movi_i32(cpu_pc, ctx->pc);
+    /* The C executor commits env->pc on every completed instruction.
+     * NEXT is returned only for the verified sequential successor, and
+     * linked LOOKUP edges compare the committed PC with their destination.
+     * Entry/exception restore also installs PC. Do not rewrite the same
+     * value in generated code before each helper (including counted TBs). */
     if (wrapped_extension) {
         extension = tcg_temp_new_i32();
         gen_helper_fetch_extension(extension, tcg_env,
@@ -249,11 +254,39 @@ static void dmcu_tr_translate_insn(DisasContextBase *db, CPUState *cs)
         extension = tcg_constant_i32(word1);
     }
     gen_helper_exec(exec_result, tcg_env, tcg_constant_i32(word0),
-                    extension);
+                    extension,
+                    tcg_constant_i32(dmcu_exec_metadata(word0, ctx->pc)));
     tcg_gen_brcondi_i32(TCG_COND_EQ, exec_result, DMCU_EXEC_NEXT, sequential);
     tcg_gen_brcondi_i32(TCG_COND_EQ, exec_result, DMCU_EXEC_LOOKUP, lookup);
     tcg_gen_exit_tb(NULL, 0);
     gen_set_label(lookup);
+    /* A single-instruction counted TB has a spare link slot. Most loop
+     * back-edges are statically known (or repeat this very instruction),
+     * so avoid re-hashing the destination on every iteration. Still check
+     * the architecturally committed PC: an outer REPB can override a branch
+     * destination, and all other dynamic edges retain the ordinary lookup.
+     * Arbitration exits above never reach this path. Linked destinations
+     * retain QEMU's icount/exit checks and executable-page invalidation. */
+    if ((tb_cflags(db->tb) & CF_USE_ICOUNT) && !wrapped_extension) {
+        uint8_t op = word0 >> 8;
+        uint8_t arg = word0;
+        uint32_t target = ctx->pc;
+        TCGLabel *dynamic = gen_new_label();
+
+        if ((op == 0xac || op == 0xbc) && arg < 16) {
+            target = dmcu_code_address(dmcu_code_segment(ctx->pc), word1);
+        } else if (op == 0xad || op == 0xbd) {
+            target = dmcu_code_address(arg, word1);
+        } else if (op >= 0xd0 && op <= 0xde) {
+            target = dmcu_code_advance(ctx->pc, size + (int8_t)arg * 2);
+        }
+        if (translator_use_goto_tb(db, target)) {
+            tcg_gen_brcondi_i32(TCG_COND_NE, cpu_pc, target, dynamic);
+            tcg_gen_goto_tb(1);
+            tcg_gen_exit_tb(db->tb, 1);
+            gen_set_label(dynamic);
+        }
+    }
     tcg_gen_lookup_and_goto_ptr();
     gen_set_label(sequential);
     /* This is the linear TB byte extent, not the architectural PC. The

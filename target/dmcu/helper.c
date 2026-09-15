@@ -5,6 +5,7 @@
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
 #include "cpu.h"
+#include "decode.h"
 #include "observer-sites.h"
 #include "exec/exec-all.h"
 #include "exec/tb-flush.h"
@@ -1619,7 +1620,7 @@ static inline uint32_t sfr_read(CPUDMCUState *env, unsigned reg, int bits)
     }
     value = env->sfr[reg];
     if (dmcu_sfr_has_timing(reg)) {
-        DMCUCPU *cpu = DMCU_CPU(env_cpu(env));
+        DMCUCPU *cpu = env_archcpu(env);
         QEMU_IOTHREAD_LOCK_GUARD();
 
         value = env->sfr[reg];
@@ -1672,13 +1673,17 @@ static void sfr_write_internal(CPUDMCUState *env, unsigned reg,
         uint32_t written = bits == 8 ?
                            (env->sfr[reg] & 0xff00) | (value & 0xff) :
                            value & MASK16;
+        bool irq_changed = (env->sfr[reg] ^ written) &
+                           (DMCU_PSR_CIRQ | DMCU_PSR_CPRI);
 
         env->sfr[reg] = written;
         env->psw = (written & 0x1 ? DMCU_PSW_Z : 0) |
                    (written & 0x2 ? DMCU_PSW_V : 0) |
                    (written & 0x4 ? DMCU_PSW_C : 0) |
                    (written & 0x8 ? DMCU_PSW_N : 0);
-        dmcu_irq_update(env);
+        if (irq_changed) {
+            dmcu_irq_update(env);
+        }
         return;
     }
     old_value = sfr_read(env, reg, 16);
@@ -1700,7 +1705,7 @@ static void sfr_write_internal(CPUDMCUState *env, unsigned reg,
         ((old_value | env->sfr[reg]) & DMCU_ICR_ED) &&
         ((old_value ^ env->sfr[reg]) &
          (DMCU_ICR_EN | DMCU_ICR_ED | DMCU_ICR_PRI))) {
-        DMCUCPU *cpu = DMCU_CPU(env_cpu(env));
+        DMCUCPU *cpu = env_archcpu(env);
         DMCUDTUConfigEvent *event = &env->dtu_config_trace[
             env->dtu_config_count++ % DMCU_DTU_CONFIG_TRACE_SLOTS];
         unsigned i;
@@ -1723,7 +1728,12 @@ static void sfr_write_internal(CPUDMCUState *env, unsigned reg,
             event->dtu[i] = env->sfr[DMCU_DTUC_FIRST + i];
         }
     }
-    if (reg == DMCU_SFR_SOCR ||
+    /* Only IE changes CPU eligibility. UP/FR/wait-state writes still
+     * commit normally, but do not require another IRQ/DTU scan and host
+     * scheduling exit. Keep ICR writes (including identical retries) and
+     * DTUC writes on the unconditional arbitration path. */
+    if ((reg == DMCU_SFR_SOCR &&
+         ((old_value ^ env->sfr[reg]) & DMCU_SOCR_IE)) ||
         (reg >= DMCU_ICR_FIRST && reg < DMCU_ICR_FIRST + DMCU_ICR_COUNT)) {
         if (reg != DMCU_SFR_SOCR) {
             env->dtu_fault_sources &= ~(1u << (reg - DMCU_ICR_FIRST));
@@ -1731,7 +1741,7 @@ static void sfr_write_internal(CPUDMCUState *env, unsigned reg,
         dmcu_irq_update(env);
     }
     if (dmcu_sfr_has_timing(reg)) {
-        DMCUCPU *cpu = DMCU_CPU(env_cpu(env));
+        DMCUCPU *cpu = env_archcpu(env);
 
         if (cpu->sfr_device_write) {
             cpu->sfr_device_write(cpu->sfr_device_opaque, reg,
@@ -2291,8 +2301,50 @@ static inline void trace_npe_game_data_write_end(CPUDMCUState *env, int slot,
         width_mask(bits);
 }
 
-static inline uint32_t translated_data_read(CPUDMCUState *env, uint32_t addr,
-                                            int bits)
+static inline bool dmcu_cached_ram_store(CPUDMCUState *env, uint32_t address,
+                                         uint32_t value, int bits, int mmu)
+{
+    CPUState *cpu = env_cpu(env);
+    CPUTLBEntry *entry;
+    void *host;
+
+    if (!env->control_observers_minimal || (bits == 16 && (address & 1)) ||
+        !QTAILQ_EMPTY(&cpu->watchpoints) || cpu_plugin_mem_cbs_enabled(cpu)) {
+        return false;
+    }
+    entry = tlb_entry(cpu, mmu, address);
+    /* This is QEMU's generated-store fast-path contract, not a private
+     * RAM pointer cache. In particular TLB_NOTDIRTY must NOT be masked:
+     * clean/migration-protected/executable pages go through the ordinary
+     * store helper for dirty tracking and code invalidation. MMIO, ROM,
+     * watchpoints, byte swapping and all other slow flags also reject. */
+    if (tlb_addr_write(entry) != (address & TARGET_PAGE_MASK)) {
+        return false;
+    }
+    host = (void *)(uintptr_t)(address + entry->addend);
+    if (bits == 8) {
+        stb_p(host, value);
+    } else {
+        stw_le_p(host, value);
+    }
+    return true;
+}
+
+static bool dmcu_unbanked_dpram(CPUDMCUState *env, uint32_t backing, int bits)
+{
+    /* Fig.2 DPRAM and the board's unbanked alias share internal_data.
+     * F100 starts peripheral registers in that same 2-KiB dispatch page.
+     * Select the raw SRAM port ONLY for a wholly contained RAM operand;
+     * never cache the mixed page as RAM or bypass logical watchpoints. */
+    return env->control_observers_minimal && env->ignore_ds_count &&
+        (backing & ~0xffu) == 0xf000u &&
+        (bits == 8 || !(backing & 1)) &&
+        QTAILQ_EMPTY(&env_cpu(env)->watchpoints) &&
+        !cpu_plugin_mem_cbs_enabled(env_cpu(env));
+}
+
+static inline QEMU_ALWAYS_INLINE uint32_t translated_data_read_impl(
+    CPUDMCUState *env, uint32_t addr, int bits, bool minimal)
 {
     uint32_t backing_addr = data_backing_address(env, addr, bits);
     uint32_t value;
@@ -2313,8 +2365,46 @@ static inline uint32_t translated_data_read(CPUDMCUState *env, uint32_t addr,
     if (unlikely(env->instruction_clock_enabled)) {
         dmcu_instruction_clock_data(env, npe_actual_physical);
     }
-    value = bits == 8 ? cpu_ldub_data(env, backing_addr)
-                     : cpu_lduw_data(env, backing_addr);
+    /* Resolve the bank before entering the soft MMU. This cache is keyed
+     * by the actual data-bus address and survives DS changes. Unaligned
+     * words retain logical translation: their second byte can cross into
+     * a different DS half. IGNDS retains its distinct low/SFR aliases. */
+    if (minimal && dmcu_unbanked_dpram(env, backing_addr, bits)) {
+        value = bits == 8 ? cpu_ldub_mmuidx_ra(env, backing_addr,
+                                               MMU_INTERNAL_IDX, 0) :
+            cpu_lduw_le_mmuidx_ra(env, backing_addr, MMU_INTERNAL_IDX, 0);
+    } else if (minimal && !env->ignore_ds_count &&
+        (bits == 8 || !(backing_addr & 1)) &&
+        QTAILQ_EMPTY(&env_cpu(env)->watchpoints) &&
+        !cpu_plugin_mem_cbs_enabled(env_cpu(env))) {
+        CPUState *cpu = env_cpu(env);
+        CPUTLBEntry *entry = tlb_entry(cpu, MMU_PHYSICAL_DATA_IDX,
+                                      npe_actual_physical);
+        /* The same tag contract as generated soft-MMU loads: exact page
+         * match with NO slow flags. MMIO, invalid/subpage/byte-swapped
+         * mappings, watchpoints and plugin callbacks all use the ordinary
+         * helper below. This branch is only aligned RAM reads, not stores;
+         * it neither fills nor maintains a private host-pointer cache. */
+        if (tlb_read_idx(entry, MMU_DATA_LOAD) ==
+                (npe_actual_physical & TARGET_PAGE_MASK) &&
+            !cpu_plugin_mem_cbs_enabled(cpu)) {
+            const void *host = (void *)(uintptr_t)(npe_actual_physical +
+                                                   entry->addend);
+            value = bits == 8 ? ldub_p(host) : lduw_le_p(host);
+        } else {
+            value = bits == 8 ? cpu_ldub_mmuidx_ra(env, npe_actual_physical,
+                                            MMU_PHYSICAL_DATA_IDX, 0) :
+                cpu_lduw_le_mmuidx_ra(env, npe_actual_physical,
+                                     MMU_PHYSICAL_DATA_IDX, 0);
+        }
+    } else {
+        value = bits == 8 ? cpu_ldub_data(env, backing_addr)
+                         : cpu_lduw_data(env, backing_addr);
+    }
+
+    if (minimal) {
+        return value;
+    }
 
     trace_npe_literal_data_access(env, addr, npe_actual_physical, value, bits,
                                   false);
@@ -2739,6 +2829,20 @@ static inline uint32_t translated_data_read(CPUDMCUState *env, uint32_t addr,
     }
     trace_outer_context_data(env, addr, value, bits, false);
     return value;
+}
+
+static __attribute__((noinline)) uint32_t translated_data_read_full(
+    CPUDMCUState *env, uint32_t addr, int bits)
+{
+    return translated_data_read_impl(env, addr, bits, false);
+}
+
+static inline uint32_t translated_data_read(CPUDMCUState *env, uint32_t addr,
+                                            int bits)
+{
+    return env->control_observers_minimal ?
+        translated_data_read_impl(env, addr, bits, true) :
+        translated_data_read_full(env, addr, bits);
 }
 
 enum {
@@ -3248,8 +3352,8 @@ static inline bool dmcu_np560_sfr_range_is_modelled(uint32_t start,
     return false;
 }
 
-static inline void translated_data_write(CPUDMCUState *env, uint32_t addr,
-                                          uint32_t value, int bits)
+static inline QEMU_ALWAYS_INLINE void translated_data_write_impl(
+    CPUDMCUState *env, uint32_t addr, uint32_t value, int bits, bool minimal)
 {
     uint32_t physical = data_physical_address(env, addr);
     uint32_t backing_addr = data_backing_address(env, addr, bits);
@@ -3257,12 +3361,12 @@ static inline void translated_data_write(CPUDMCUState *env, uint32_t addr,
         data_actual_physical_address(env, addr, bits);
     uint32_t instruction_pc = env->current_instruction_pc & MASK24;
     bool transition_gate_write =
-        actual_physical < 0x50b87cu &&
+        !minimal && actual_physical < 0x50b87cu &&
         actual_physical + bits / 8u > 0x50b87au;
     uint16_t transition_gate_old = transition_gate_write ?
         address_space_lduw_le(&address_space_memory, 0x50b87au,
                               MEMTXATTRS_UNSPECIFIED, NULL) : 0u;
-    int npe_game_data_write_slot;
+    int npe_game_data_write_slot = -1;
     static unsigned framebuffer_writes;
     static unsigned storage_root_writes;
     static unsigned storage_callback_writes;
@@ -3289,6 +3393,27 @@ static inline void translated_data_write(CPUDMCUState *env, uint32_t addr,
 
     if (unlikely(env->instruction_clock_enabled)) {
         dmcu_instruction_clock_data(env, actual_physical);
+    }
+
+    /* Physical input ACKs are part of the public read-only key status,
+     * not optional history. Count repeated values as distinct writes. */
+    if (actual_physical == 0x5128d8u && bits == 16) {
+        env->matrix_candidate_writes++;
+        env->matrix_candidate_pc = env->pc & MASK24;
+        env->matrix_candidate_last = value & MASK16;
+    }
+    if ((env->pc & MASK24) == 0x28f6deu &&
+        actual_physical == 0x5128dau && bits == 16) {
+        env->matrix_event_maps++;
+        env->matrix_event_map_pc = env->pc & MASK24;
+        env->matrix_event_last = value & MASK16;
+    }
+
+    /* The optional provenance below must not add debug bus reads to normal
+     * execution. Retain IRQ corruption checks, the real store and the
+     * executable overlay mirror, irrespective of observer configuration. */
+    if (minimal) {
+        goto required_translated_irq_observers;
     }
 
     /* IGNDS exposes the SoC's unbanked F000..FFFF register window.  Keep a
@@ -4603,6 +4728,7 @@ static inline void translated_data_write(CPUDMCUState *env, uint32_t addr,
         }
     }
 
+required_translated_irq_observers:
     if (env->in_interrupt && env->interrupt_frame_watch_active &&
         actual_physical <
             (env->interrupt_frame_base & MASK16) + env->interrupt_frame_size &&
@@ -4661,6 +4787,10 @@ static inline void translated_data_write(CPUDMCUState *env, uint32_t addr,
         trace_resource_range_write(env, addr, actual_physical, old_value,
                                    value, bits,
                                    RESOURCE_RANGE_BUS_TRANSLATED);
+    }
+
+    if (minimal) {
+        goto perform_translated_store;
     }
 
     if (((actual_physical >= 0x336bb2u &&
@@ -5344,20 +5474,6 @@ static inline void translated_data_write(CPUDMCUState *env, uint32_t addr,
             address_space_lduw_le(&address_space_memory, actual_physical,
                                   MEMTXATTRS_UNSPECIFIED, NULL);
 
-        /* Count every guest write, including a repeated value.  A toggled
-         * status key deliberately writes the same 0x8C candidate on its next
-         * press, so a value-change-only counter would miss the second edge. */
-        if (actual_physical == 0x5128d8u && bits == 16) {
-            env->matrix_candidate_writes++;
-            env->matrix_candidate_pc = env->pc & MASK24;
-            env->matrix_candidate_last = value & MASK16;
-        }
-        if ((env->pc & MASK24) == 0x28f6deu &&
-            actual_physical == 0x5128dau && bits == 16) {
-            env->matrix_event_maps++;
-            env->matrix_event_map_pc = env->pc & MASK24;
-            env->matrix_event_last = value & MASK16;
-        }
         if ((old_value & width_mask(bits)) !=
             (value & width_mask(bits))) {
             /* 28:F4A4 stores the table-mapped firmware event in A2:28D8
@@ -5910,7 +6026,32 @@ static inline void translated_data_write(CPUDMCUState *env, uint32_t addr,
                       env->sfr[DMCU_SFR_DS0] & 0x1ff,
                       env->sfr[DMCU_SFR_DS1] & 0x1ff);
     }
-    if (bits == 8) {
+perform_translated_store:
+    if (minimal && dmcu_unbanked_dpram(env, backing_addr, bits)) {
+        if (!dmcu_cached_ram_store(env, backing_addr, value, bits,
+                                   MMU_INTERNAL_IDX)) {
+            if (bits == 8) {
+                cpu_stb_mmuidx_ra(env, backing_addr, value, MMU_INTERNAL_IDX, 0);
+            } else {
+                cpu_stw_le_mmuidx_ra(env, backing_addr, value,
+                                    MMU_INTERNAL_IDX, 0);
+            }
+        }
+    } else if (minimal && !env->ignore_ds_count &&
+        (bits == 8 || !(backing_addr & 1)) &&
+        QTAILQ_EMPTY(&env_cpu(env)->watchpoints) &&
+        !cpu_plugin_mem_cbs_enabled(env_cpu(env))) {
+        if (dmcu_cached_ram_store(env, actual_physical, value, bits,
+                                  MMU_PHYSICAL_DATA_IDX)) {
+            /* The normal store was completed by QEMU's valid RAM tag. */
+        } else if (bits == 8) {
+            cpu_stb_mmuidx_ra(env, actual_physical, value,
+                             MMU_PHYSICAL_DATA_IDX, 0);
+        } else {
+            cpu_stw_le_mmuidx_ra(env, actual_physical, value,
+                                MMU_PHYSICAL_DATA_IDX, 0);
+        }
+    } else if (bits == 8) {
         cpu_stb_data(env, backing_addr, value);
     } else {
         cpu_stw_data(env, backing_addr, value);
@@ -5953,9 +6094,33 @@ static inline void translated_data_write(CPUDMCUState *env, uint32_t addr,
                                  MEMTXATTRS_UNSPECIFIED, NULL);
         }
     }
-    trace_npe_game_data_write_end(env, npe_game_data_write_slot,
-                                  actual_physical, bits);
-    trace_outer_context_data(env, addr, value, bits, true);
+    if (!minimal) {
+        trace_npe_game_data_write_end(env, npe_game_data_write_slot,
+                                      actual_physical, bits);
+        trace_outer_context_data(env, addr, value, bits, true);
+    }
+}
+
+static __attribute__((noinline)) void translated_data_write_full(
+    CPUDMCUState *env, uint32_t addr, uint32_t value, int bits)
+{
+    translated_data_write_impl(env, addr, value, bits, false);
+}
+
+static __attribute__((noinline)) void translated_data_write_minimal(
+    CPUDMCUState *env, uint32_t addr, uint32_t value, int bits)
+{
+    translated_data_write_impl(env, addr, value, bits, true);
+}
+
+static inline void translated_data_write(CPUDMCUState *env, uint32_t addr,
+                                          uint32_t value, int bits)
+{
+    if (env->control_observers_minimal) {
+        translated_data_write_minimal(env, addr, value, bits);
+    } else {
+        translated_data_write_full(env, addr, value, bits);
+    }
 }
 
 static inline uint32_t data_read(CPUDMCUState *env, uint32_t addr, int bits)
@@ -5992,7 +6157,7 @@ static inline void data_write(CPUDMCUState *env, uint32_t addr,
 
 static inline uint32_t internal_data_read(uint32_t addr, int bits)
 {
-    DMCUCPU *cpu = DMCU_CPU(current_cpu);
+    DMCUCPU *cpu = env_archcpu(cpu_env(current_cpu));
     uint32_t logical = addr & MASK16;
     uint32_t backing = bits == 8 ? logical ^ 1u : logical;
     uint8_t *physical = cpu->internal_data + backing;
@@ -6092,12 +6257,16 @@ static inline void internal_data_write(uint32_t addr, uint32_t value,
     static bool menu_layout_watch_active;
     static unsigned menu_layout_internal_writes;
     static unsigned framebuffer_pointer_internal_writes;
-    DMCUCPU *cpu = DMCU_CPU(current_cpu);
+    DMCUCPU *cpu = env_archcpu(cpu_env(current_cpu));
     CPUDMCUState *env = &cpu->env;
     uint32_t logical = addr & MASK16;
     uint32_t backing = bits == 8 ? logical ^ 1u : logical;
     uint8_t *physical = cpu->internal_data + backing;
     uint32_t width = bits / 8;
+
+    if (env->control_observers_minimal) {
+        goto required_internal_irq_observers;
+    }
 
     trace_clock_format_output_write(
         env, logical,
@@ -6249,6 +6418,7 @@ static inline void internal_data_write(uint32_t addr, uint32_t value,
         framebuffer_pointer_internal_writes++;
     }
 
+required_internal_irq_observers:
     if (env->in_interrupt && env->interrupt_frame_watch_active &&
         backing < (env->interrupt_frame_base & MASK16) +
                   env->interrupt_frame_size &&
@@ -6285,6 +6455,10 @@ static inline void internal_data_write(uint32_t addr, uint32_t value,
         trace_resource_range_write(
             env, logical, backing, ldub_p(physical), value, bits,
             RESOURCE_RANGE_BUS_INTERNAL);
+    }
+
+    if (env->control_observers_minimal) {
+        goto perform_internal_store;
     }
 
     /* The generic-menu renderer reaches 30:09C8 with a malformed rectangle.
@@ -6348,7 +6522,22 @@ static inline void internal_data_write(uint32_t addr, uint32_t value,
         env->event_frame_write_fp = env->gpr[DMCU_FP] & MASK16;
     }
 
-    dmcu_internal_memory_write(cpu, logical, value, bits);
+perform_internal_store:
+    /* Cache the raw SRAM address space separately from banked data / IGNDS.
+     * These are ordinary soft-MMU RAM stores, including dirty tracking and
+     * executable-alias invalidation, NOT naked pointer writes. All internal
+     * stores end their translated block, so no following instruction in an
+     * invalidated TB executes. A zero host RA keeps the same non-restarting
+     * store semantics as the former AddressSpace path. IRQ entry outside a
+     * translated block continues to use dmcu_internal_memory_write(). */
+    if (dmcu_cached_ram_store(env, bits == 8 ? logical ^ 1u : logical,
+                              value, bits, MMU_INTERNAL_IDX)) {
+        /* Same dirty/SMC safeguards as the banked fast path above. */
+    } else if (bits == 8) {
+        cpu_stb_mmuidx_ra(env, logical ^ 1u, value, MMU_INTERNAL_IDX, 0);
+    } else {
+        cpu_stw_le_mmuidx_ra(env, logical, value, MMU_INTERNAL_IDX, 0);
+    }
 }
 
 static inline bool is_stack_pointer(unsigned reg)
@@ -6440,12 +6629,9 @@ static inline bool is_y_pointer(unsigned reg)
     return reg >= 12 && reg <= 14;
 }
 
-static bool instruction_y_addresses_valid(CPUDMCUState *env, uint8_t op,
-                                          uint8_t arg, uint16_t ext)
+static uint32_t instruction_y_pointer_mask(uint8_t op, uint8_t arg,
+                                           uint32_t pointers)
 {
-    uint32_t pointers = instruction_agu_pointer_mask(op, arg);
-    unsigned bytes;
-
     /* Fig. 9 includes predecrement and displacement forms in the Y-only
      * address space even though they bypass circular/bit-reversal AGU. */
     switch (op) {
@@ -6456,7 +6642,17 @@ static bool instruction_y_addresses_valid(CPUDMCUState *env, uint8_t op,
         pointers |= 1u << (arg & 15);
         break;
     }
-    if (!(pointers & 0x7000u)) {
+    return pointers & 0x7000u;
+}
+
+static bool instruction_y_addresses_valid(CPUDMCUState *env, uint8_t op,
+                                          uint8_t arg, uint16_t ext,
+                                          uint32_t pointers)
+{
+    unsigned bytes;
+
+    pointers = instruction_y_pointer_mask(op, arg, pointers);
+    if (!pointers) {
         return true;
     }
     if ((op >> 4 == 2 || op >> 4 == 3) && (op & 15) <= 7) {
@@ -6777,6 +6973,40 @@ static bool forbidden_rep_target(uint16_t word)
            (op == 0x3f && arg <= 3) || op == 0x2e || word == 0x2f00;
 }
 
+uint32_t dmcu_exec_metadata(uint16_t word, uint32_t pc)
+{
+    uint32_t metadata = instruction_agu_pointer_mask(word >> 8, word) |
+           (dmcu_insn_size(word) << DMCU_META_SIZE_SHIFT) |
+           (is_repeat_instruction(word) ? DMCU_META_REPEAT : 0) |
+           (forbidden_rep_target(word) ? DMCU_META_FORBIDDEN_REP : 0) |
+           (dmcu_decode_cycles(word, pc) << DMCU_META_CYCLES_SHIFT);
+
+    if (instruction_y_pointer_mask(word >> 8, word, metadata & MASK16)) {
+        metadata |= DMCU_META_Y_ACCESS;
+    }
+
+    /* These are the complete PC sets of audio_file_observe, VMA03
+     * progress and physical matrix pipeline observers below. Preserve
+     * every event, but do not re-test these sparse sets per instruction. */
+    switch (pc) {
+    case 0x321614: case 0x32169a: case 0x17e9c0: case 0x17eece:
+    case 0x32c194: case 0x29247c: case 0x29248e: case 0x20f9a2:
+    case 0x20f9c2: case 0x16eb0a: case 0x16ec34:
+    case 0x0c0000: case 0x31ce52: case 0x322fb2:
+    case 0x30638e: case 0x30638c:
+    case 0x27e5ac: case 0x27e5b0: case 0x27e5e8: case 0x32241a:
+    case 0x3338f8: case 0x28f4a4: case 0x324c34: case 0x29bddc:
+    case 0x03411c: case 0x1a7b00:
+        metadata |= DMCU_META_SPARSE_PRELUDE;
+        break;
+    default:
+        if (pc >= 0x30639e && pc <= 0x306440) {
+            metadata |= DMCU_META_SPARSE_PRELUDE;
+        }
+    }
+    return metadata;
+}
+
 static bool exec_alu(CPUDMCUState *env, uint8_t op, uint8_t arg,
                      uint16_t ext)
 {
@@ -7043,6 +7273,51 @@ static bool exec_shift(CPUDMCUState *env, uint8_t op, uint8_t arg)
     }
     steps = count;
     incoming_shift_buffer = env->shift_buffer & MASK16;
+    /* Compute the same 16-bit shift stream in constant time. Keep ASL's
+     * saturation loop below; logical shifts, ASR and rotates need no
+     * per-bit host loop, including signed-byte counts of magnitude 128. */
+    if (kind == SH_SL || kind == SH_SLOSB) {
+        uint64_t shifted = (uint64_t)value << MIN(steps, 32u);
+
+        carry = (shifted >> 16) & 1u;
+        overflow = (shifted >> 16) != 0;
+        if (kind == SH_SL) {
+            outgoing_shift_buffer = (shifted >> 16) & MASK16;
+        }
+        value = shifted & MASK16;
+        steps = 0;
+    } else if (kind == SH_SR || kind == SH_SROSB || kind == SH_ASR) {
+        uint32_t original = value;
+        uint64_t shifted = ((uint64_t)value << 16) >> MIN(steps, 32u);
+
+        carry = (shifted >> 15) & 1u;
+        overflow = steps > 16 ? original != 0 :
+                   steps > 1 && (original & ((1u << (steps - 1)) - 1u));
+        if (kind == SH_ASR) {
+            int32_t signed_value = sext16(original);
+
+            value = (signed_value >> MIN(steps, 16u)) & MASK16;
+            outgoing_shift_buffer = steps <= 16 ? shifted & MASK16 :
+                (signed_value >> MIN(steps - 16, 16u)) & MASK16;
+            if (steps > 16) {
+                carry = original >> 15;
+            }
+        } else {
+            value = shifted >> 16;
+            if (kind == SH_SR) {
+                outgoing_shift_buffer = shifted & MASK16;
+            }
+        }
+        steps = 0;
+    } else if (kind == SH_ROL || kind == SH_ROR) {
+        if (steps) {
+            value = kind == SH_ROL ?
+                ((value << steps) | (value >> (16 - steps))) & MASK16 :
+                ((value >> steps) | (value << (16 - steps))) & MASK16;
+            carry = kind == SH_ROL ? value & 1u : value >> 15;
+        }
+        steps = 0;
+    }
     while (steps--) {
         uint32_t out;
 
@@ -18007,8 +18282,9 @@ static bool np560_overlay_service(CPUDMCUState *env, uint32_t target)
     }
 }
 
-static bool exec_control(CPUDMCUState *env, uint8_t op, uint8_t arg,
-                         uint16_t ext, uint32_t start, uint32_t next)
+static inline QEMU_ALWAYS_INLINE bool exec_control_impl(
+    CPUDMCUState *env, uint8_t op, uint8_t arg, uint16_t ext,
+    uint32_t start, uint32_t next, bool minimal)
 {
     uint32_t target;
     if ((op == 0xac || op == 0xbc) && (arg >> 4) == 0) {
@@ -18033,7 +18309,7 @@ static bool exec_control(CPUDMCUState *env, uint8_t op, uint8_t arg,
         target = dmcu_code_address(arg, ext);
         if (op == 0xbd) {
             bool target_is_vma03_program =
-                DMCU_CPU(env_cpu(env))->reset_pc == 0x00030000u &&
+                env_archcpu(env)->reset_pc == 0x00030000u &&
                 target >= 0x00030000u &&
                 target < 0x00030000u + DMCU_PROGRAM_SIZE;
             bool execute_resident_rom =
@@ -18043,6 +18319,10 @@ static bool exec_control(CPUDMCUState *env, uint8_t op, uint8_t arg,
             bool execute_auxiliary =
                 target >= env->auxiliary_code_base &&
                 target < env->auxiliary_code_limit;
+
+            if (minimal) {
+                goto required_far_call_services;
+            }
 
             if (execute_resident_rom &&
                 (target == dmcu_code_address(0x02, 0xbbf6) ||
@@ -18902,6 +19182,7 @@ static bool exec_control(CPUDMCUState *env, uint8_t op, uint8_t arg,
                 }
             }
 
+required_far_call_services:
             if (env->rom_hle_enabled &&
                 np560_overlay_service(env, target)) {
                 return true;
@@ -19035,6 +19316,10 @@ static bool exec_control(CPUDMCUState *env, uint8_t op, uint8_t arg,
             env->pc = near_return_pop(env);
         } else if (arg == 0x20) {
             uint32_t return_sp = env->gpr[DMCU_SP] & MASK16;
+
+            if (minimal) {
+                goto perform_far_return;
+            }
 
             if (start == dmcu_code_address(0x14, 0x65e8) &&
                 hardware_init_return_watch_active) {
@@ -19212,6 +19497,7 @@ static bool exec_control(CPUDMCUState *env, uint8_t op, uint8_t arg,
                     internal_data_read((return_sp + 8u) & MASK16, 16),
                     internal_data_read((return_sp + 10u) & MASK16, 16));
             }
+perform_far_return:
             env->pc = far_return_pop(env);
             if (start == dmcu_code_address(0x29, 0x4094)) {
                 qemu_log_mask(
@@ -19563,6 +19849,20 @@ static bool exec_control(CPUDMCUState *env, uint8_t op, uint8_t arg,
     return false;
 }
 
+static __attribute__((noinline)) bool exec_control_minimal(
+    CPUDMCUState *env, uint8_t op, uint8_t arg, uint16_t ext,
+    uint32_t start, uint32_t next)
+{
+    return exec_control_impl(env, op, arg, ext, start, next, true);
+}
+
+static __attribute__((noinline)) bool exec_control(
+    CPUDMCUState *env, uint8_t op, uint8_t arg, uint16_t ext,
+    uint32_t start, uint32_t next)
+{
+    return exec_control_impl(env, op, arg, ext, start, next, false);
+}
+
 static bool exec_compare_update(CPUDMCUState *env, uint8_t op,
                                 uint8_t arg, uint16_t ext)
 {
@@ -19824,6 +20124,57 @@ uint32_t HELPER(fetch_extension)(CPUDMCUState *env, uint32_t start)
  * perturbing the audio clock heavily while the playlist save ran. This
  * bounded observer never changes guest state and does not sample each FAT
  * lookup or each audio IRQ. Locals are FP-64 .. FP-2, raw internal words. */
+/* Same handlers and validation, selected once instead of probing every
+ * unrelated instruction family. The full observer executor retains the
+ * old chain as a differential reference. */
+static bool exec_decoded(CPUDMCUState *env, uint8_t op, uint8_t arg,
+                         uint16_t ext, uint32_t start, uint32_t next)
+{
+    if (op < 0xc0 && (op & 15) <= 7) {
+        return exec_alu(env, op, arg, ext);
+    }
+    if (op >= 0xe0) {
+        return exec_bit(env, op, arg, ext);
+    }
+    if (op >= 0xd0 && op <= 0xde) {
+        return exec_control_minimal(env, op, arg, ext, start, next);
+    }
+    switch (op) {
+    case 0x08: case 0x09: case 0x0a: case 0x0b:
+    case 0x18: case 0x19: case 0x1a: case 0x1b:
+    case 0x28: case 0x29: case 0x2a: case 0x2b:
+    case 0x38: case 0x39: case 0x3a: case 0x3b:
+    case 0x48: case 0x49: case 0x58: case 0x59: case 0x5a: case 0x5b:
+    case 0x68: case 0x69: case 0x6a: case 0x6b: case 0x78: case 0x79:
+    case 0x88: case 0x89: case 0x8a: case 0x8b:
+    case 0x98: case 0x99: case 0xa8: case 0xa9: case 0xb8: case 0xb9:
+        return exec_move(env, op, arg, ext);
+    case 0x0c: case 0x0d: case 0x1c: case 0x1d:
+    case 0x2c: case 0x2d: case 0x3c: case 0x3d:
+    case 0x4a: case 0x4b: case 0x4c: case 0x4d: case 0x5c: case 0x5d:
+    case 0xc8: case 0xc9: case 0xca: case 0xcb:
+        return exec_shift(env, op, arg);
+    case 0x6c: case 0x6d: case 0x7c: case 0x7d: case 0x8c: case 0x8d:
+        return exec_bit(env, op, arg, ext);
+    case 0x9a: case 0x9b: case 0x9c: case 0x9d:
+    case 0xac: case 0xad: case 0xbc: case 0xbd:
+    case 0xc6: case 0xcc: case 0xcd: case 0xce:
+        return exec_control_minimal(env, op, arg, ext, start, next);
+    case 0x4e: case 0x4f: case 0x5e: case 0x5f:
+    case 0x6e: case 0x6f: case 0x7e: case 0x7f:
+    case 0x8e: case 0x8f: case 0x9e: case 0x9f:
+        return exec_compare_update(env, op, arg, ext);
+    case 0xbe:
+        return exec_mac(env, op, arg, ext);
+    case 0xc2: case 0xc3: case 0xc4: case 0xc5:
+        return exec_divide(env, op, arg);
+    case 0x1e:
+        return exec_exponent(env, op, arg);
+    default:
+        return false;
+    }
+}
+
 static void audio_file_observe(CPUDMCUState *env, uint32_t pc)
 {
     DMCUAudioFileEvent *e;
@@ -19954,7 +20305,9 @@ static unsigned np560_sound_trace_kind(uint32_t pc)
     }
 }
 
-uint32_t HELPER(exec)(CPUDMCUState *env, uint32_t word0, uint32_t word1)
+static inline QEMU_ALWAYS_INLINE uint32_t dmcu_exec_impl(
+    CPUDMCUState *env, uint32_t word0, uint32_t word1, uint32_t metadata,
+    bool minimal)
 {
     static unsigned resident_allocator_trace_steps;
     static unsigned result_heap_failure_logs;
@@ -19980,7 +20333,10 @@ uint32_t HELPER(exec)(CPUDMCUState *env, uint32_t word0, uint32_t word1)
     uint8_t arg = word0;
     uint16_t ext = word1;
     uint32_t start = env->pc & MASK24;
-    uint32_t next = dmcu_code_advance(start, dmcu_insn_size(word0));
+    uint32_t next = dmcu_code_advance(start, minimal ?
+        ((metadata >> DMCU_META_SIZE_SHIFT) & 7) : dmcu_insn_size(word0));
+    uint32_t agu_pointers = minimal ? metadata & MASK16 :
+        instruction_agu_pointer_mask(op, arg);
     uint32_t value, left, right;
     uint32_t old_sp = env->gpr[DMCU_SP] & MASK16;
     uint32_t old_fp = env->gpr[DMCU_FP] & MASK16;
@@ -19990,7 +20346,7 @@ uint32_t HELPER(exec)(CPUDMCUState *env, uint32_t word0, uint32_t word1)
     bool was_critical = env->critical_count != 0;
     bool address_space_changed;
     bool execute_vma03_program =
-        DMCU_CPU(env_cpu(env))->reset_pc == 0x00030000u &&
+        env_archcpu(env)->reset_pc == 0x00030000u &&
         start >= 0x00030000u &&
         start < 0x00030000u + DMCU_PROGRAM_SIZE;
     bool execute_resident_rom =
@@ -20005,13 +20361,21 @@ uint32_t HELPER(exec)(CPUDMCUState *env, uint32_t word0, uint32_t word1)
     env->irq_state_changed = false;
 
     if (unlikely(env->instruction_clock_enabled)) {
-        dmcu_instruction_clock_step(env, word0);
+        if (minimal) {
+            dmcu_instruction_clock_step_decoded(env, word0,
+                (metadata >> DMCU_META_CYCLES_SHIFT) & 7);
+        } else {
+            dmcu_instruction_clock_step(env, word0);
+        }
     }
 
     /* Data helpers run after env->pc has advanced to the fall-through PC.
      * Keep the actual instruction start separately so watchpoints can report
      * both the writer and its next PC without a two-byte ambiguity. */
     env->current_instruction_pc = start;
+    if (minimal && !(metadata & DMCU_META_SPARSE_PRELUDE)) {
+        goto minimal_prelude_done;
+    }
     audio_file_observe(env, start);
 
     if (start == dmcu_code_address(0x0c, 0x0000)) {
@@ -20118,6 +20482,15 @@ uint32_t HELPER(exec)(CPUDMCUState *env, uint32_t word0, uint32_t word1)
             env->matrix_completion_trace_stack[slot][index] =
                 internal_data_read((old_sp + index * 2u) & MASK16, 16);
         }
+    }
+
+minimal_prelude_done:
+    /* Minimal mode keeps the physical-key observations above, the bounded
+     * execution history and modal ACK below. The historical instruction
+     * observers (including whole-frame statistics) do not execute guest
+     * operations and need not run for every instruction in normal use. */
+    if (minimal) {
+        goto required_execution_history;
     }
 
     /* Retain decisive instruction checkpoints for the state-0x55 descriptor
@@ -21078,6 +21451,7 @@ uint32_t HELPER(exec)(CPUDMCUState *env, uint32_t word0, uint32_t word1)
         resource_geometry_trace_steps++;
     }
 
+required_execution_history:
     /* Once the foreground task has stopped on an unsupported word, periodic
      * timer IRQs can still wake the CPU and overwrite the circular trace with
      * interrupt prologue/epilogue traffic.  Keep the first-failure window
@@ -21087,6 +21461,10 @@ uint32_t HELPER(exec)(CPUDMCUState *env, uint32_t word0, uint32_t word1)
         env->exec_trace_pc[trace_slot] = start & MASK24;
         env->exec_trace_word[trace_slot] = word0 & MASK16;
         env->exec_trace_count++;
+    }
+
+    if (minimal) {
+        goto required_modal_ack;
     }
 
     /* Flat 25:B000..B5D5 is resource/payload data, while the complete linked
@@ -21494,6 +21872,7 @@ uint32_t HELPER(exec)(CPUDMCUState *env, uint32_t word0, uint32_t word1)
                                       MEMTXATTRS_UNSPECIFIED, NULL);
         }
     }
+required_modal_ack:
     /* Exact source 3B:F734 is relocated to 1E:F734 for the state-50/modal
      * input worker.  At 1E:F8E4 its mapped event has already been copied to
      * frame local FP-0x0A and is about to enter the original dispatch tree.
@@ -21542,6 +21921,9 @@ uint32_t HELPER(exec)(CPUDMCUState *env, uint32_t word0, uint32_t word1)
             env->npe_modal_control_trace_decoder_caller = 0;
             env->npe_modal_control_trace_decoder_result = 0;
         }
+    }
+    if (minimal) {
+        goto execute_architecture;
     }
     if (env->npe_game_action_trace_armed &&
         !env->npe_game_linked_loader_valid && !env->in_interrupt &&
@@ -22317,11 +22699,12 @@ uint32_t HELPER(exec)(CPUDMCUState *env, uint32_t word0, uint32_t word1)
         }
     }
 
+execute_architecture:
     /* A registered HLE gate is a deliberate marker in a reconstructed
      * 01/02 ROM hole. Its following RETS remains an ordinary CPU return.
      * Every other hole still takes the strict missing-ROM path below. */
     if (skeleton_hole && start >= 0x10000 && start < 0x30000) {
-        DMCUCPU *cpu = DMCU_CPU(env_cpu(env));
+        DMCUCPU *cpu = env_archcpu(env);
         if (cpu->rom_service &&
             cpu->rom_service(cpu->rom_service_opaque, env, start)) {
             env->pc = next;
@@ -22388,26 +22771,28 @@ uint32_t HELPER(exec)(CPUDMCUState *env, uint32_t word0, uint32_t word1)
      * Explicit ROM-hole handling above keeps its more specific diagnosis.
      */
     if (env->single_repeat_count && start == env->single_repeat_pc &&
-        forbidden_rep_target(word0)) {
+        (minimal ? metadata & DMCU_META_FORBIDDEN_REP :
+                   forbidden_rep_target(word0))) {
         env->unsupported_repeat_reason = 1;
         unsupported(env, start, word0);
     }
-    if (is_repeat_instruction(word0) &&
+    if ((minimal ? metadata & DMCU_META_REPEAT : is_repeat_instruction(word0)) &&
         (dmcu_sfr_read_word(env, DMCU_SFR_PSW) & DMCU_PSR_CIRQ)) {
         env->unsupported_repeat_reason = 2;
         unsupported(env, start, word0);
     }
-    if (np560_native_tick(env, start)) {
+    if (start == 0x030032u && np560_native_tick(env, start)) {
         return DMCU_EXEC_EXIT;
     }
     env->pc = next;
 
-    if (!instruction_y_addresses_valid(env, op, arg, ext)) {
+    if ((!minimal || (metadata & DMCU_META_Y_ACCESS)) &&
+        !instruction_y_addresses_valid(env, op, arg, ext, agu_pointers)) {
         unsupported(env, start, word0);
     }
 
     {
-        uint32_t pointers = instruction_agu_pointer_mask(op, arg);
+        uint32_t pointers = agu_pointers;
         static const unsigned known_agu[] = { 8, 10, 14 };
 
         for (unsigned i = 0; i < ARRAY_SIZE(known_agu); i++) {
@@ -22421,7 +22806,8 @@ uint32_t HELPER(exec)(CPUDMCUState *env, uint32_t word0, uint32_t word1)
     }
 
     env->instruction_clock_data_active = env->instruction_clock_enabled;
-    if (exec_alu(env, op, arg, ext) ||
+    if (minimal ? exec_decoded(env, op, arg, ext, start, next) :
+       (exec_alu(env, op, arg, ext) ||
         exec_move(env, op, arg, ext) ||
         exec_shift(env, op, arg) ||
         exec_bit(env, op, arg, ext) ||
@@ -22429,7 +22815,7 @@ uint32_t HELPER(exec)(CPUDMCUState *env, uint32_t word0, uint32_t word1)
         exec_compare_update(env, op, arg, ext) ||
         exec_mac(env, op, arg, ext) ||
         exec_divide(env, op, arg) ||
-        exec_exponent(env, op, arg)) {
+        exec_exponent(env, op, arg))) {
         goto complete;
     }
 
@@ -22538,7 +22924,8 @@ uint32_t HELPER(exec)(CPUDMCUState *env, uint32_t word0, uint32_t word1)
     }
     if (op == 0x3f && arg >= 0x10 && arg <= 0x13) {
         env->ignore_ds_count = (arg & 3) + 1;
-        tlb_flush_by_mmuidx(env_cpu(env), 1u << MMU_DATA_IDX);
+        /* The fixed unbanked view has its own TLB index. Neither entering
+         * nor leaving IGNDS changes either view's address translation. */
         goto complete;
     }
     if (op == 0xbf && arg == 0) {
@@ -22569,6 +22956,9 @@ uint32_t HELPER(exec)(CPUDMCUState *env, uint32_t word0, uint32_t word1)
 
 complete:
     env->instruction_clock_data_active = false;
+    if (minimal) {
+        goto required_completed_instruction;
+    }
     if (start_event_state_import_active &&
         dmcu_code_segment(start) == 0x1f &&
         (start == dmcu_code_address(0x1f, 0xf488) ||
@@ -23459,6 +23849,7 @@ complete:
         env->start_callback_running = false;
     }
 
+required_completed_instruction:
     /* Keep the last architecturally completed instruction separate from the
      * circular execution trace.  This is especially useful at IRQ entry:
      * env->pc must name either this instruction's result or a later complete
@@ -23467,6 +23858,9 @@ complete:
     env->completed_instruction_next_pc = env->pc & MASK24;
     env->completed_instruction_word = word0 & MASK16;
     env->completed_instruction_ext = ext & MASK16;
+    if (minimal) {
+        goto required_stack_checks;
+    }
     if (start == dmcu_code_address(0x1d, 0xf30a)) {
         /* F30A is the second half of the exact object-pointer save. */
         env->root_object_slot_watch_active = true;
@@ -23604,6 +23998,7 @@ complete:
             env->gpr[DMCU_FP] & MASK16;
         env->application_file_attach_frame_watch_active = false;
     }
+required_stack_checks:
     if (env->direct_menu_stack_watch_active &&
         !env->direct_menu_stack_escape_valid) {
         uint16_t new_sp = env->gpr[DMCU_SP] & MASK16;
@@ -23620,7 +24015,7 @@ complete:
         }
         if (escape_kind) {
             dmcu_record_direct_menu_stack_escape(
-                DMCU_CPU(env_cpu(env)), escape_kind, start, env->pc,
+                env_archcpu(env), escape_kind, start, env->pc,
                 word0, ext, old_sp, old_fp);
         }
     }
@@ -23710,9 +24105,7 @@ complete:
                       env->gpr[DMCU_SP] & MASK16, word0 & MASK16);
     }
     if (was_ignoring_ds && env->ignore_ds_count) {
-        if (!--env->ignore_ds_count) {
-            tlb_flush_by_mmuidx(env_cpu(env), 1u << MMU_DATA_IDX);
-        }
+        --env->ignore_ds_count;
     }
     if (was_critical && env->critical_count) {
         env->critical_count--;
@@ -23720,7 +24113,7 @@ complete:
     /* A single translated block may contain several helper calls.  Do not
      * let an instruction following a DS0/DS1 or IGNDS transition reuse the
      * TLB mapping under which the block began.  The individual SFR/IGNDS
-     * operations already flush the TLB; returning false here also makes the
+     * operations flush or select their own TLB; returning false here makes the
      * architectural transition an exact TB boundary. */
     address_space_changed =
         old_ds0 != (env->sfr[DMCU_SFR_DS0] & 0x1ff) ||
@@ -23745,21 +24138,60 @@ complete:
             }
         }
     }
-    trace_control_transfer(env, start, next, word0, ext, old_sp, old_fp);
+    if (!minimal) {
+        trace_control_transfer(env, start, next, word0, ext, old_sp, old_fp);
+    } else if (op == 0xbd || op == 0xad || op == 0xbc || op == 0xcc ||
+               op == 0xcd || op == 0xce || op == 0xc6) {
+        trace_control_minimal(env, start, next, word0, ext, old_sp, old_fp);
+    }
     /* CRIT masks only its following instruction window (CN1916884A p113).
      * An already-pending IRQ must be reconsidered at the first unprotected
      * boundary, not after the remaining register-only instructions in this
      * TB. IGNDS expiration already exits through address_space_changed.
      * This does not set SOCR.IE or acknowledge a pending request. */
-    if (address_space_changed || (was_critical && !env->critical_count) ||
+    if ((was_ignoring_ds && !env->ignore_ds_count) ||
+        (was_critical && !env->critical_count) ||
         env->irq_state_changed) {
         return DMCU_EXEC_EXIT;
+    }
+    /* DS writes have already flushed the data TLB; entering IGNDS selects
+     * its separate unbanked index. They must end this TB, but need no host
+     * CPU scheduling round trip. Unlike expiry, neither transition unmasks
+     * an IRQ. Keep the dynamic successor's ordinary icount/exit checks.
+     * Never continue the uncounted multi-instruction TB across a mapping
+     * change, even if the resulting PC is the sequential successor. */
+    if (address_space_changed) {
+        return DMCU_EXEC_LOOKUP;
     }
     /* Ordinary branches/calls/returns and repeat back-edges need a new TB,
      * but no extra host scheduling pass. The successor's standard TCG
      * prologue still checks asynchronous exit requests and icount. IRQ
      * register changes and protected-window expiry took the EXIT above. */
     return env->pc == next ? DMCU_EXEC_NEXT : DMCU_EXEC_LOOKUP;
+}
+
+/* Constant specialization keeps optional history's large stack frame and
+ * register spills out of the normal executor, without maintaining two CPU
+ * implementations. Both variants share the exact instruction semantics. */
+static __attribute__((noinline)) uint32_t dmcu_exec_minimal(CPUDMCUState *env,
+                                  uint32_t word0, uint32_t word1,
+                                  uint32_t metadata)
+{
+    return dmcu_exec_impl(env, word0, word1, metadata, true);
+}
+
+static __attribute__((noinline)) uint32_t dmcu_exec_full(CPUDMCUState *env,
+                               uint32_t word0, uint32_t word1)
+{
+    return dmcu_exec_impl(env, word0, word1, 0, false);
+}
+
+uint32_t HELPER(exec)(CPUDMCUState *env, uint32_t word0, uint32_t word1,
+                      uint32_t metadata)
+{
+    return env->control_observers_minimal ?
+        dmcu_exec_minimal(env, word0, word1, metadata) :
+        dmcu_exec_full(env, word0, word1);
 }
 
 hwaddr dmcu_cpu_get_phys_page_debug(CPUState *cs, vaddr addr)
@@ -23780,12 +24212,24 @@ bool dmcu_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
         ppage = vpage & MASK24;
         prot = PAGE_READ | PAGE_EXEC;
         attrs.secure = 1;
+    } else if (mmu_idx == MMU_PHYSICAL_DATA_IDX) {
+        /* Fully resolved banked data address; ordinary board RAM/MMIO and
+         * code-alias invalidation, without a DS-dependent cached mapping. */
+        ppage = vpage;
+        prot = PAGE_READ | PAGE_WRITE;
+    } else if (mmu_idx == MMU_INTERNAL_IDX) {
+        /* DMCU's X/Y stack port bypasses the board bus, including MMIO at
+         * the same numeric address. Keep the backing RAM and all executable
+         * aliases shared; only the translation cache / address space differ. */
+        ppage = vpage;
+        prot = PAGE_READ | PAGE_WRITE;
+        attrs.space = DMCU_AS_INTERNAL;
     } else {
-        CPUDMCUState *env = &DMCU_CPU(cs)->env;
+        CPUDMCUState *env = cpu_env(cs);
         uint32_t logical = vpage & 0xffff;
         uint32_t segment;
 
-        if (env->ignore_ds_count) {
+        if (mmu_idx == MMU_UNBANKED_IDX) {
             /* IGNDS exposes the unbanked internal/SFR view.  Give the two
              * pages containing modeled devices private physical aliases so
              * ordinary banked RAM at 00:0000 and 00:F000 remains distinct. */

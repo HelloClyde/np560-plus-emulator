@@ -8,6 +8,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "cpu.h"
+#include "decode.h"
 #include "exec/exec-all.h"
 #include "sysemu/cpu-timers.h"
 
@@ -153,10 +154,33 @@ void dmcu_instruction_clock_data(CPUDMCUState *env, uint32_t physical)
     }
 }
 
+unsigned dmcu_decode_cycles(uint16_t word, uint32_t pc)
+{
+    return pc >= 0x010000u ?
+        dmcu_documented_cycles(word, pc >= 0x210000u) : 0;
+}
+
 void dmcu_instruction_clock_step(CPUDMCUState *env, uint16_t word)
 {
-    uint32_t hz = dmcu_system_clock_hz(env);
-    unsigned cycles;
+    dmcu_instruction_clock_step_decoded(env, word,
+                                       dmcu_decode_cycles(word, env->pc));
+}
+
+void dmcu_instruction_clock_step_decoded(CPUDMCUState *env, uint16_t word,
+                                         unsigned cycles)
+{
+    uint32_t hz = env->instruction_clock_hz;
+
+    /* PLL/CLKCON usually remain unchanged across millions of instructions.
+     * Cache their derived frequency, not elapsed time. Compare the actual
+     * registers so all write paths (including reset/restore) are covered.
+     * The first instruction and every configuration change recompute it. */
+    if (!hz || env->instruction_clock_cached_pll != env->sfr[DMCU_SFR_PLL] ||
+        env->instruction_clock_cached_clkcon != env->sfr[DMCU_SFR_CLKCON]) {
+        hz = dmcu_system_clock_hz(env);
+        env->instruction_clock_cached_pll = env->sfr[DMCU_SFR_PLL];
+        env->instruction_clock_cached_clkcon = env->sfr[DMCU_SFR_CLKCON];
+    }
 
     env->instruction_clock_data_active = false;
 
@@ -188,8 +212,6 @@ void dmcu_instruction_clock_step(CPUDMCUState *env, uint16_t word)
     /* Fig.2: 01:0000..20:FFFF is internal ROM/Flash. SRAM execution is
      * supported by the emulator, but not assigned the ROM's A timing.
      */
-    cycles = env->pc >= 0x010000u ?
-             dmcu_documented_cycles(word, env->pc >= 0x210000u) : 0;
     if (!cycles) {
         env->instruction_clock_unknown++;
         env->instruction_clock_last_unknown = word;

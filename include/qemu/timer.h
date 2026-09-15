@@ -209,6 +209,9 @@ QEMUTimerList *qemu_clock_get_main_loop_timerlist(QEMUClockType type);
  */
 void qemu_clock_notify(QEMUClockType type);
 
+/* icount vCPU runs the main timer list itself; wake only due other lists. */
+void qemu_clock_notify_due_other(QEMUClockType type);
+
 /**
  * qemu_clock_enable:
  * @type: the clock type

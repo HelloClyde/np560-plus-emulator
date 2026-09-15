@@ -89,12 +89,17 @@ static void np560_audio_request_config(NP560AudioState *s)
 
 static void np560_audio_sync(NP560AudioState *s)
 {
+    /* The request callback rendered both channels before either latch.
+     * Avoid even a redundant virtual-clock read for its two DAC writes. */
+    if (s->request_in_progress) {
+        return;
+    }
     int64_t elapsed = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->epoch_ns;
     uint64_t target, first, frame;
     uint16_t a = np560_audio_enabled(s) ? s->sample[0] : 0;
     uint16_t b = np560_audio_enabled(s) ? s->sample[1] : 0;
 
-    if (s->request_in_progress || elapsed <= 0) {
+    if (elapsed <= 0) {
         return;
     }
     target = muldiv64(elapsed, NP560_AUDIO_RATE, NANOSECONDS_PER_SECOND);

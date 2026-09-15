@@ -489,6 +489,8 @@ struct CPUState {
     int singlestep_enabled;
     int64_t icount_budget;
     int64_t icount_extra;
+    /* vCPU-owned elapsed-time adjustment, published with executed icount. */
+    uint64_t icount_pending_extra_ns;
     uint64_t random_seed;
     sigjmp_buf jmp_env;
 
