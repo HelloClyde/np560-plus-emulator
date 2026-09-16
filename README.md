@@ -18,22 +18,21 @@
 
 ## 获取源码
 
-主仓库和 QEMU 子模块均为私有仓库，需要有两个仓库的访问权限。
+全部项目源码统一在一个私有仓库中，QEMU 核心是普通目录，无需初始化子模块。
 
 ```bash
-git clone https://github.com/HelloClyde/np560.git
-cd np560
-git submodule update --init qemu-dmcu
+git clone https://github.com/HelloClyde/np560-qemu.git
+cd np560-qemu
 ```
 
-只初始化项目所需的 QEMU 子模块即可；不必递归下载 QEMU 自带的全部其它平台固件仓库。
-主仓库固定 QEMU 的具体提交，不会自动跟随其分支变化。
+合并保留了工具仓库和 QEMU 上游/定制提交的历史。NP560 不使用的上游可选平台
+固件子模块未纳入当前工作树，其原始引用仍可在历史提交中找到。
 
 ## 目录
 
 | 路径 | 内容 |
 | --- | --- |
-| `qemu-dmcu/` | QEMU CPU/硬件核心，Git submodule |
+| `qemu-dmcu/` | QEMU CPU/硬件核心，直接纳入本仓库 |
 | `scripts/web/` | Python Web 桥接及浏览器前端 |
 | `scripts/` | 构建、启动、导入和验证工具 |
 | `scripts/tests/` | Python/JS 自动测试；硬件测试需要额外输入 |
@@ -82,7 +81,7 @@ node scripts/tests/test_np560_pointer_input.js
 
 ## 提交与恢复
 
-修改核心时先在 `qemu-dmcu/` 中提交并推送到其私有远程，再在主仓库提交更新后的
-子模块指针。不要只提交主仓库而遗漏核心提交。详见 [仓库恢复说明](doc/github_restore.md)。
+核心、Web、工具及文档现在使用同一个 Git 仓库，统一提交、统一推送到 `origin/master`。
+无需更新子模块指针，也无需同步历史补丁。详见 [仓库恢复说明](doc/github_restore.md)。
 
 QEMU 及第三方组件保留各自的许可证和来源说明，参见 `qemu-dmcu/COPYING` 等文件。

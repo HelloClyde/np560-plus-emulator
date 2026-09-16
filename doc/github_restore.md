@@ -1,43 +1,32 @@
-# GitHub 私有备份与恢复
+# 单仓库恢复与维护
 
-远程：`https://github.com/HelloClyde/np560`（私有）。
-主仓库包含工具、Web 前端、逆向文档和 QEMU 子模块指针；不包含运行用固件、
-NAND、游戏及 tmp 日志。文档资料目录中的既有研究附件仍随 Git 历史保存。
-
-## QEMU 核心
-
-`qemu-dmcu/` 作为正式 submodule，远程为私有仓库
-`https://github.com/HelloClyde/np560-qemu.git`。主仓库固定其提交。
-本地官方远程保留为 `upstream`，私有远程使用 `origin`。
-
-正常恢复：
+统一远程：`https://github.com/HelloClyde/np560-qemu`（私有），默认分支 `master`。
+QEMU 核心、Web 前端、脚本和文档均在同一仓库，`qemu-dmcu/` 不再是 submodule。
 
 ```bash
-git clone https://github.com/HelloClyde/np560.git
-cd np560
-git submodule update --init qemu-dmcu
+git clone https://github.com/HelloClyde/np560-qemu.git
+cd np560-qemu
 ```
 
-下面是引入 submodule 前的历史补丁恢复方式，不要在已初始化子模块上重复应用：
+之后在项目内统一 commit、push 即可。无需 `git submodule update`，也无需套用
+`scripts/qemu-patches/`；这些补丁仅保留为早期版本的历史备份。
 
-`scripts/qemu-patches/` 按顺序保存截至 `0fa30bd31b032cbd07d8a85719734c1bd4c57cc2`
-的全部三个定制提交（含二进制补丁）。基线为 QEMU 8.2.10：
-`f671ce11d2a15a58ab752d7cf0b2890c9022c7ba`。
+运行固件、resident ROM 构建产物、NAND、游戏与 tmp 日志仍需自行保管，不随 Git 上传。
+文档研究附件维持原来的 Git 跟踪范围。
 
-在新环境先克隆主仓库，然后在根目录运行：
+## 合并历史与回退资料
 
-```bash
-git clone --depth 1 --branch v8.2.10 https://gitlab.com/qemu-project/qemu.git qemu-dmcu
-git -C qemu-dmcu rev-parse HEAD
-# 上一步必须等于上述基线；不相等时先停止，不要套用到其它版本。
-git -C qemu-dmcu switch -c np560
-git -C qemu-dmcu am ../scripts/qemu-patches/*.patch
-```
+- 合并前项目提交：`5ed4dd0`。
+- 合并前 QEMU 提交：`0fa30bd31b032cbd07d8a85719734c1bd4c57cc2`。
+- 通过双父合并保留两个仓库历史，QEMU 源码位于 `qemu-dmcu/` 前缀目录。
+- 原核心分支 `codex/dmcu` 保留；旧 `HelloClyde/np560` 仓库未删除或改写。
+- 本机旧项目远程保留为 `legacy-project`，统一仓库使用 `origin`。
+- 本机原嵌套 `.git` 元数据移到主仓库 `.git/np560-core-before-monorepo`，未删除；
+  这是本地恢复资料，不随 push 上传。日常操作不应使用该备份替代主仓库。
 
-补丁恢复已用独立 Git index 验证：从指定基线依次应用后的完整 tree 与当前
-QEMU HEAD tree 完全一致。恢复后的 commit ID 可能因提交者时间不同而变化。
-补丁目录保留为这三个历史提交的备用快照，不再作为后续源码同步机制。
-后续先推送核心仓库，再提交并推送主仓库的子模块指针。
+QEMU 原上游的 15 个未初始化可选子模块（其它平台 ROM 和 libvirt-ci）不属于 NP560
+实现，本次从工作树的 gitlink 中排除，原始 `.gitmodules` 与固定提交可在 QEMU
+父历史中查询。未删除任何已初始化的第三方源码；NP560 CPU/硬件源码、许可证及
+Web/脚本功能没有因合仓改写。
 
-运行仍需自行提供原厂固件和 NAND；构建与启动入口分别为
-`scripts/build-np560.ps1`、`scripts/run-np560-web.ps1`。
+若以后需要构建其它 QEMU 平台，请按上游历史单独取得相应依赖；当前仓库面向 NP560。

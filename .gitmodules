@@ -1,3 +1,0 @@
-[submodule "qemu-dmcu"]
-	path = qemu-dmcu
-	url = https://github.com/HelloClyde/np560-qemu.git

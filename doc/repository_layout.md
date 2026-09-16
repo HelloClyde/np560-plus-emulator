@@ -1,5 +1,8 @@
 # 仓库结构整理记录（2026-09-16）
 
+后续决策：已改为 `HelloClyde/np560-qemu` 单仓库，QEMU 直接纳入目录。
+下面的 submodule 方案仅为合并前历史记录，当前恢复方式见 [github_restore.md](github_restore.md)。
+
 - 主仓库添加根 README；QEMU 改为正式 `qemu-dmcu` submodule，固定
   `0fa30bd31b032cbd07d8a85719734c1bd4c57cc2`。
 - 核心私有远程：`HelloClyde/np560-qemu`，保留完整上游与定制提交历史，

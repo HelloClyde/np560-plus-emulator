@@ -1,0 +1,4 @@
+config NP560
+    bool
+    select DMCU
+    select PTIMER
