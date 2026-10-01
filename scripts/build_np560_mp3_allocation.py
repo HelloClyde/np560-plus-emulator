@@ -40,7 +40,7 @@ ALLOC, LOCK, FREE, UNLOCK = 0x2577DA, 0x315300, 0x303A56, 0x308B26
 HANDLE, ALLOCATED, SEGMENT, OFFSET, WORK_BANK, SYN_BANK, LEFT, RIGHT, WORK_OFFSET = range(0,18,2)
 
 
-def build(address=ADDRESS):
+def build(address=ADDRESS, *, reserve_synthesis=True):
     a=_DMCUAssembler(address)
     def imm(r,v): a.emit(0x68F0|r,v&65535)
     def mov(d,s): a.emit(0x0800|d<<4|s)
@@ -64,7 +64,7 @@ def build(address=ADDRESS):
         mov(0,14);a.emit(0x74F0,1);a.ajmp("invalid",2)
     a.label("acquire");enter()
     get(0,HANDLE);cmpi(0,0);a.ajmp("busy",2)
-    imm(4,WORK_STORAGE+SYN_STORAGE);imm(3,3)
+    imm(4,WORK_STORAGE+(SYN_STORAGE if reserve_synthesis else 0));imm(3,3)
     a.label("allocate")
     cmpi(3,0);a.ajmp("unstable",1)
     a.emit(0x5231)
@@ -77,6 +77,16 @@ def build(address=ADDRESS):
     mov(8,6);a.emit(0x4C81);mov(0,7);a.emit(0x4D0F,0x1080)
     mov(2,7);a.emit(0x74F2,0x7fff)
     imm(9,0x8000);a.emit(0x1292)
+    if not reserve_synthesis:
+        # HLE-only: host codec owns synthesis history. Keep the complete near
+        # workspace and guard, including actual compressed/PCM buffers.
+        # If it crosses a bank, own the prefix as well via the real allocator.
+        imm(12,WORK_STORAGE)
+        cmpi(2,0x8000-WORK_STORAGE);a.ajmp("compact_ready",0xC)
+        a.emit(0x5081);imm(2,0);a.emit(0x10C9)
+        a.label("compact_ready")
+        # Explicit absent pointers, never a borrowed or invented RAM region.
+        imm(9,0);imm(10,0);imm(11,0);a.ajmp("layout_ready")
     # If the near workspace already fits at the returned pointer, do not
     # discard that space to align to the next bank. R2 is its base offset.
     cmpi(2,0x8000-WORK_STORAGE);a.ajmp("workspace_here",0xC)

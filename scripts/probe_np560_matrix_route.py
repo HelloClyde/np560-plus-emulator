@@ -73,7 +73,7 @@ def parse_step(value: str) -> RouteStep:
     except ValueError as error:
         raise argparse.ArgumentTypeError(
             "step must be LABEL:INDEX:EVENT[:map|candidate], for example "
-            "right:20:0x85 or status:26:0x8c:candidate"
+            "right:29:0x81 or status:26:0x8c:candidate"
         ) from error
     if not label:
         raise argparse.ArgumentTypeError("step label must not be empty")
@@ -230,6 +230,9 @@ def key_counter_timeline_point(
             0,
             int(status["matrix_reads"]) - int(before.get("matrix_reads", 0)),
         )
+    if "virtual_time_ns" in status and "virtual_time_ns" in before:
+        point["virtual_time_ns"] = int(status["virtual_time_ns"])
+        point["virtual_elapsed_ns"] = int(status["virtual_time_ns"]) - int(before["virtual_time_ns"])
     return point
 
 
@@ -302,12 +305,14 @@ class WebBridge:
 
     def set_matrix(self, index: int | None) -> None:
         low, high = (0, 0) if index is None else matrix_masks(index)
-        self.post_json("/api/key", {
+        result = self.post_json("/api/key", {
             "state": 0,
             "code": 0,
             "matrix_low": low,
             "matrix_high": high,
         })
+        if result.get("applied") is False or result.get("ok") is False:
+            raise RuntimeError("Web bridge rejected physical matrix input")
 
     def pulse_matrix(self, index: int) -> None:
         if not 0 <= index < 64:
@@ -557,6 +562,14 @@ def wait_for_delivery_and_matrix_rearm(
     )
 
 
+class KeyObservationTimeout(TimeoutError):
+    """Failed observation with bounded input evidence, not an inferred cause."""
+
+    def __init__(self, message: str, evidence: dict[str, Any]):
+        super().__init__(message)
+        self.input_evidence = evidence
+
+
 def replay_step(
     web: WebBridge,
     step: RouteStep,
@@ -571,10 +584,14 @@ def replay_step(
     use_bounded_status: bool = True,
     single_scan_pulse: bool = False,
     pulse_duration: float = 0.0,
+    observe_contact_bounds: bool = False,
     hold_duration: float = 0.0,
     on_observed: Callable[[], None] | None = None,
     on_timeout: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
+    if observe_contact_bounds and (pulse_duration <= 0 or single_scan_pulse):
+        raise ValueError('contact bounds require a fixed physical pulse')
+    contact_bounds = None
     frame_before = (
         web.get_json("/api/frame") if frame_stable_samples else None
     )
@@ -614,10 +631,15 @@ def replay_step(
     before_modal_acknowledgements = int(before.get(
         "modal_acknowledgements", 0,
     ))
+    contact_request_started = time.monotonic()
+    contact_request_interval = None
+    candidate_observation = None
     if single_scan_pulse:
         web.pulse_matrix(step.matrix_index)
     else:
         web.set_matrix(step.matrix_index)
+    contact_started = time.monotonic()
+    contact_upper_bound = None
     observed: dict[str, Any] | None = None
     held_status: dict[str, Any] = before
     hold_elapsed = 0.0
@@ -626,11 +648,31 @@ def replay_step(
     hold_started: float | None = None
     released = single_scan_pulse
     deadline = time.monotonic() + press_timeout
+    status = before
     try:
         if pulse_duration:
-            time.sleep(pulse_duration)
+            if observe_contact_bounds:
+                # These reads bracket, not timestamp, the actual level changes.
+                # Keep the requested deadline anchored at the make ACK.
+                made = web.get_json('/api/key-status')
+                time.sleep(max(0, pulse_duration - (time.monotonic() - contact_started)))
+                releasing = web.get_json('/api/key-status')
+            else:
+                time.sleep(pulse_duration)
             web.set_matrix(None)
+            contact_upper_bound = time.monotonic() - contact_started
+            contact_request_interval = time.monotonic() - contact_request_started
             released = True
+            if observe_contact_bounds:
+                released_status = web.get_json('/api/key-status')
+                contact_bounds = dict(before_make=before, after_make=made,
+                    before_release=releasing, after_release=released_status,
+                    scope='sampled guest-time bounds; extra reads perturb contact timing')
+                times = [s.get('virtual_time_ns') for s in
+                         (before, made, releasing, released_status)]
+                if all(type(t) is int for t in times) and times == sorted(times):
+                    contact_bounds['guest_contact_lower_ns'] = times[2] - times[1]
+                    contact_bounds['guest_contact_upper_ns'] = times[3] - times[0]
         while time.monotonic() < deadline:
             status = web.get_json("/api/key-status")
             raise_if_key_status_faulted(web, status)
@@ -686,10 +728,24 @@ def replay_step(
         if observed is None:
             if on_timeout is not None:
                 on_timeout()
-            raise TimeoutError(
+            raise KeyObservationTimeout(
                 f"matrix {step.matrix_index} did not reach {step.observation} "
-                f"observation for event 0x{step.expected_event:04X}"
+                f"observation for event 0x{step.expected_event:04X}",
+                {
+                    "matrix_index": step.matrix_index,
+                    "expected_event": step.expected_event,
+                    "pulse_duration_seconds": pulse_duration,
+                    "contact_after_make_ack_upper_bound_seconds": contact_upper_bound,
+                    "before": before,
+                    "contact_bounds": contact_bounds,
+                    "last_observation": status,
+                    "released_before_timeout": released,
+                    "scope": "host timing and sampled counters; not guest contact duration or root cause",
+                },
             )
+        candidate_observation = key_counter_timeline_point(
+            before, status, time.monotonic() - contact_request_started,
+        )
         if on_observed is not None:
             on_observed()
         hold_started = time.monotonic()
@@ -735,6 +791,7 @@ def replay_step(
     finally:
         if not released:
             web.set_matrix(None)
+            contact_request_interval = time.monotonic() - contact_request_started
     reads_after, delivered = wait_for_delivery_and_matrix_rearm(
         web,
         reads_before=reads_before,
@@ -819,10 +876,16 @@ def replay_step(
             "single-scan-pulse" if single_scan_pulse else "held-level"
         ),
         "hold_duration_requested_seconds": hold_duration,
+        # This includes host request/ack latency, not exact guest contact
+        # duration. hold_elapsed below is only the extra post-candidate hold.
+        "host_contact_request_interval_seconds": contact_request_interval,
+        "candidate_observation": candidate_observation,
+        "matrix_make_requests": 1,
         "hold_duration_observed_seconds": round(hold_elapsed, 6),
         "hold_status_samples": hold_samples,
         "hold_timeline": hold_timeline,
         "pulse_duration_seconds": pulse_duration,
+        "contact_bounds": contact_bounds,
         "candidate_writes_after_settle": candidates_after_settle,
         "maps_after_settle": maps_after_settle,
         "acknowledgements_after_settle": acknowledgements_after_settle,
@@ -845,8 +908,8 @@ def replay_step(
         "modal_acknowledgements_total": modal_acknowledgements_total,
         "logical_delivery_observed": logical_delivery_observed,
         "logical_guest_events_total": int(logical_delivery_observed),
-        # Backward-compatible raw boundary count.  New callers should use
-        # logical_guest_events_total when they mean physical user actions.
+        # logical_guest_events_total is a legacy boolean, NOT a cardinality
+        # of guest dispatches. Preserve raw counters when auditing repeats.
         "consumer_acknowledgements_total": (
             foreground_acknowledgements_total +
             modal_acknowledgements_total
@@ -923,6 +986,14 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--observe-contact-bounds", action="store_true",
+        help=(
+            "with --pulse-duration, sample guest virtual time around matrix "
+            "make/break; the extra QMP reads perturb timing, so report "
+            "bounds rather than an exact hold duration"
+        ),
+    )
+    parser.add_argument(
         "--hold-duration", type=float, default=0.0,
         help=(
             "seconds to keep each physical matrix position asserted after "
@@ -983,6 +1054,8 @@ def main() -> int:
             "--single-scan-pulse, --pulse-duration and --hold-duration "
             "are mutually exclusive"
         )
+    if args.observe_contact_bounds and args.pulse_duration <= 0:
+        parser.error("--observe-contact-bounds requires --pulse-duration")
     if args.capture_final_only and args.capture_frame_only:
         parser.error(
             "--capture-final-only and --capture-frame-only are mutually exclusive"
@@ -1035,6 +1108,7 @@ def main() -> int:
                 frame_stable_interval=args.frame_stable_interval,
                 single_scan_pulse=args.single_scan_pulse,
                 pulse_duration=args.pulse_duration,
+                observe_contact_bounds=args.observe_contact_bounds,
                 hold_duration=args.hold_duration,
                 on_observed=(
                     capture_held
@@ -1068,6 +1142,7 @@ def main() -> int:
                     "expected_event": step.expected_event,
                     "observation": step.observation,
                     "error": f"{type(error).__name__}: {error}",
+                    "input_evidence": getattr(error, "input_evidence", None),
                     "held_capture": held_prefix,
                     "capture": failure_prefix,
                 },

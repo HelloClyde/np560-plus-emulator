@@ -39,9 +39,10 @@ DIAG, RESULT, CAPTURE, STREAM = 0x800, 0x900, 0x4f0000, 0x380000
 
 def check(qemu,output,mp3,frames,bundle,icount,preconfigured_format=False,preconfigured_rate=None,
           preconfigured_selector=False,profile_pc=False,query_edges=False,eof_tail=False,
-          finite_word_tail=False,startup_prime_count=None):
+          finite_word_tail=False,startup_prime_count=None,close_after_pcm=False):
     cores,rom,manifest=load_bundle(bundle)
     assert manifest["experimental_factory_abi"]
+    channel_publication = "channel_published" in cores["factory"]["entries"]
     if finite_word_tail:
         assert eof_tail, "finite word tail requires the original EOF producer"
         assert manifest.get("rom_mp3_hle",{}).get("bounded_final_frame"), \
@@ -115,7 +116,11 @@ def check(qemu,output,mp3,frames,bundle,icount,preconfigured_format=False,precon
     for group in (0x88,0x89,0x8a,0x8c):
         for bit in range(16): a.emit(0xf000|bit<<8|group)
     for off in (0x4a52,0x4a54,0x4a56,0x4a58,0x4a5a,0x4a76,0x4a78): const(off,0)
+    if channel_publication:
+        a.emit(0xeb83)  # Stale state from a previous stereo owner.
     init("public init");zero_outputs("init clears outputs")
+    if channel_publication:
+        flag(0x83,11,0,"init invalidates stale channel state")
     flag(0x83,15,0,"initial priming gate clear")
     call(0x1485a);result(0,0,"public reset")
     output_pair(1,"initial output");call(0x149be);result(766,0,"initial free")
@@ -221,6 +226,8 @@ def check(qemu,output,mp3,frames,bundle,icount,preconfigured_format=False,precon
             value(0x3346,0,f"prime{index}.not a decoder failure")
             value(0x3352,0,f"prime{index}.input retained")
             flag(0x83,15,0,f"prime{index}.not ready yet")
+            if channel_publication:
+                flag(0x83,11,0,f"prime{index}.no channel publication without PCM")
             output_pair(1,f"prime{index}.initial output retained")
             for offset in (0x1784,0x1c04,0x2084,0x2504):
                 value(offset,0,f"prime{index}.unpublished PCM {offset:04x}")
@@ -239,6 +246,8 @@ def check(qemu,output,mp3,frames,bundle,icount,preconfigured_format=False,precon
             value(0x3352,consumed//2,f"granule{granules}.public consumed words")
             flag(0x8c,8,0,f"granule{granules}.not exhausted")
             flag(0x83,15,1,f"granule{granules}.real PCM priming gate")
+            if channel_publication:
+                flag(0x83,11,int(nch==2),f"granule{granules}.decoded channel state")
             if eof_tail:
                 flag(0x89,7,1,f"granule{granules}.producer EOF retained")
             if eof_tail and (granules+1<total_granules or held_final):
@@ -283,8 +292,23 @@ def check(qemu,output,mp3,frames,bundle,icount,preconfigured_format=False,precon
     if eof_tail:
         flag(0x89,11,1,"original exhaustion finishes finite tail")
     output_pair(phase,"trailing input keeps buffers")
+    if close_after_pcm:
+        # Exercise actual published PCM state, not an already-reset owner.
+        if channel_publication:
+            flag(0x83,11,int(nch==2),"exhausted input retains last channel state")
+        close("close after real PCM")
+        if channel_publication:
+            flag(0x83,11,0,"close clears published channel state")
+        flag(0x83,15,0,"close clears PCM readiness")
+        close("repeat close after real PCM")
+        init("reopen after real PCM close")
+        zero_outputs("reopen clears old PCM")
+        if channel_publication:
+            flag(0x83,11,0,"reopen does not inherit channel state")
     call(0x1485a);result(0,0,"public reset after PCM")
     flag(0x83,15,0,"reset invalidates priming gate")
+    if channel_publication:
+        flag(0x83,11,0,"reset invalidates channel state")
     output_pair(1,"reset output");zero_outputs("reset clears outputs")
     # Reinit an existing live object: old core AND old owner must be freed.
     init("reinitialize owned instance");close("close reinitialized instance")
@@ -313,6 +337,7 @@ def check(qemu,output,mp3,frames,bundle,icount,preconfigured_format=False,precon
         expected_code=code,capture_ranges=[("checks",RESULT,len(expected)*2),
             ("guest-pcm",CAPTURE,granules*nch*1152)],metadata={
                 "rom_sha256":manifest["rom_sha256"],"frames":len(frames),"granules":granules,
+                "close_after_pcm":close_after_pcm,
                 "diagnostic_owner_trampolines":False,"owner_allocated_by":"original ABI 01:4804 native implementation",
                 "original_callbacks":["2F:A6BA","16:EDB2"],
                 "preconfigured_format":preconfigured_format,
@@ -341,8 +366,10 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     for flag in ("qemu","mp3","resident-bundle","output"): p.add_argument("--"+flag,type=Path,required=True)
     p.add_argument("--limit",type=int,
-                   help="prefix frames; default 3, or 2 with --query-edges/--eof-tail (3 with --finite-word-tail)")
+                   help="prefix frames; default 2 for priming/close checks, otherwise 3 or 2 for query/EOF checks")
     p.add_argument("--icount",type=int)
+    p.add_argument("--close-after-pcm",action="store_true",
+                   help="close a decoded owner before reset; check clearing and reopening")
     p.add_argument("--startup-prime-count",type=int,choices=(1,2,3),
                    help="verify configured v6 priming before normal refill")
     p.add_argument("--preconfigured-format",action="store_true",
@@ -363,7 +390,7 @@ def main():
     if args.startup_prime_count is not None and not (args.preconfigured_format and args.preconfigured_selector):
         p.error("--startup-prime-count requires --preconfigured-format --preconfigured-selector")
     if args.limit is None:
-        args.limit=2 if args.startup_prime_count is not None else 3 if args.finite_word_tail else 2 if args.query_edges or args.eof_tail else 3
+        args.limit=2 if args.close_after_pcm or args.startup_prime_count is not None else 3 if args.finite_word_tail else 2 if args.query_edges or args.eof_tail else 3
     if args.finite_word_tail and not args.eof_tail:
         p.error("--finite-word-tail requires --eof-tail")
     if args.eof_tail and args.query_edges:
@@ -389,7 +416,8 @@ def main():
                    preconfigured_format=args.preconfigured_format,preconfigured_rate=args.preconfigured_rate,
                    preconfigured_selector=args.preconfigured_selector,profile_pc=args.profile_pc,
                    query_edges=args.query_edges,eof_tail=args.eof_tail,
-                   finite_word_tail=args.finite_word_tail,startup_prime_count=args.startup_prime_count)
+                   finite_word_tail=args.finite_word_tail,startup_prime_count=args.startup_prime_count,
+                   close_after_pcm=args.close_after_pcm)
         report["cases"].append(case)
         hle=bool(manifest.get("rom_mp3_hle"))
         if hle:

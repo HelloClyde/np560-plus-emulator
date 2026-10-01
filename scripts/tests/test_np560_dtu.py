@@ -17,6 +17,7 @@ _test_sys.path.insert(0, str(_TestPath(__file__).resolve().parent))
 
 
 import argparse
+import base64
 import json
 import re
 import struct
@@ -47,6 +48,8 @@ def read_sfr(words: list[int], sfr: int, register: int) -> None:
 def execute(qemu: Path, name: str, words: list[int], expected: dict[int, int], *,
             extra: tuple[int, bytes] | None = None, isr: list[int] | None = None,
             icount: int | None = None,
+            verify_extra_code: bool = False,
+            extra_regions: tuple[tuple[int, bytes], ...] = (),
             transfers: tuple[int, int] | None = None,
             refill_trace_output: Path | None = None) -> dict[str, str]:
     final_pc = f"PC=20:{len(words) * 2:04x}"
@@ -56,8 +59,8 @@ def execute(qemu: Path, name: str, words: list[int], expected: dict[int, int], *
         assert len(image) <= 0x200
         image.extend(bytes(0x200 + len(isr) * 2 - len(image)))
         image[0x200:] = struct.pack(f"<{len(isr)}H", *isr)
-    if extra is not None:
-        address, data = extra
+    code_regions = sorted(((extra,) if extra is not None else ()) + extra_regions)
+    for address, data in code_regions:
         offset = address - 0x200000
         assert offset >= len(image)
         image.extend(bytes(offset + len(data) - len(image)))
@@ -73,6 +76,13 @@ def execute(qemu: Path, name: str, words: list[int], expected: dict[int, int], *
                             soc_rom_skeleton=True, icount_shift=icount,
                             start_paused=True)
         try:
+            if verify_extra_code:
+                assert code_regions
+                for address, expected_code in code_regions:
+                    actual_code = base64.b64decode(emulator.snapshot('code', address, len(expected_code))['frame'])
+                    assert actual_code == expected_code, (
+                        f'fixture differs on instruction bus before execution at {address:06x}',
+                        actual_code[:16].hex(), expected_code[:16].hex())
             if refill_trace_output is not None:
                 emulator.qmp.execute("qom-set", {
                     "path":"/machine", "property":"dtu-refill-trace", "value":True})

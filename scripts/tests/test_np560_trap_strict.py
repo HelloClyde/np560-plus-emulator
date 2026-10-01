@@ -24,7 +24,7 @@ from pathlib import Path
 from web.np560_web import Emulator
 
 
-def check(qemu: Path) -> None:
+def check(qemu: Path, minimal: bool = False) -> None:
     with tempfile.TemporaryDirectory(prefix="np560-trap-strict-") as directory:
         root = Path(directory)
         firmware = root / "trap.prg"
@@ -35,8 +35,11 @@ def check(qemu: Path) -> None:
         words = [0xBD01, 0x0000, 0xD0FF]
         firmware.write_bytes(struct.pack(f"<{len(words)}H", *words))
         emulator = Emulator(qemu=qemu, firmware=firmware, soc_rom=rom,
-                            soc_rom_skeleton=True)
+                            soc_rom_skeleton=True, start_paused=True)
         try:
+            emulator.qmp.execute('qom-set', {'path': '/machine',
+                'property': 'control-observers-minimal', 'value': minimal})
+            emulator.qmp.execute('cont')
             address = "01:0004"
             expected = f"ROM_MISSING={address}"
             state = ""
@@ -55,16 +58,18 @@ def check(qemu: Path) -> None:
             assert "INVALID_CONTROL=none" in state, state[:1500]
             assert "UNSUPPORTED=none" in state, state[:1500]
             assert "IRQ_NESTING=DEPTH:0 MAX:0 ICR:0 TRAPS:0" in state, state[:1500]
-            print(f"{address} explicit ROM hole: stopped before TRAP; R0 preserved")
+            print(f"{address} explicit ROM hole: stopped before TRAP; R0 preserved; minimal={minimal}")
         finally:
             emulator.close()
+        assert emulator.process.returncode == 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--qemu", type=Path, required=True)
     args = parser.parse_args()
-    check(args.qemu)
+    for minimal in (False, True):
+        check(args.qemu, minimal)
     return 0
 
 

@@ -612,6 +612,10 @@ def pcm_artifact(path, output, frames, case, *, hle=False):
         "guest_samples": len(interleaved), "compared_guest_samples": len(compared), "reference_samples": len(ref), "channels": nch, "hz": hz,
         "samples_per_channel": len(interleaved)//nch, "duration_seconds": len(interleaved)/nch/hz,
         "peak_sample": max(map(abs, interleaved), default=0), "nonzero_samples": sum(v!=0 for v in interleaved),
+        # Two encoded channels alone cannot detect duplicated/swapped lanes
+        # when the source is dual mono. Report the actual captured distinction.
+        "stereo_unequal_frames": (sum(a != b for a, b in zip(interleaved[::2], interleaved[1::2]))
+                                  if nch == 2 else None),
         "max_absolute_difference": peak_error, "rms_difference": (sum(e*e for e in errors)/len(errors))**.5 if errors else None,
         "equal_length": len(compared)==len(ref), "delay_adjustment_samples": 0, "gain_adjustment": False,
         "demuxer_omitted_zero_metadata_frames": omitted, "excluded_zero_metadata_samples_per_channel": skipped_samples//nch,

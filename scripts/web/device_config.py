@@ -10,11 +10,23 @@ import re
 import subprocess
 import uuid
 
+try:
+    from .rom_bundle import NPE_ENTRY_OFFSETS
+except ImportError:  # Direct scripts/web execution.
+    from rom_bundle import NPE_ENTRY_OFFSETS
 
-SCHEMA = "np560-device-v1"
+
+SCHEMA = "np560-device-v3"
+PREVIOUS_SCHEMA = "np560-device-v2"
+LEGACY_SCHEMA = "np560-device-v1"
 INPUTS = ("firmware", "soc_rom", "nand_checkpoint")
-SETTINGS = ("boot_mode", "soc_rom_skeleton", "adc_level", "external_power",
+LEGACY_SETTINGS = ("boot_mode", "soc_rom_skeleton", "adc_level", "external_power",
             "icount_shift")
+V2_RUNTIME_DEFAULTS = {"rom_mp3_hle_base": 0, "rom_mp3_arena_image": 0,
+                       "instruction_clock": False, "realtime": False}
+RUNTIME_DEFAULTS = {**V2_RUNTIME_DEFAULTS, "rom_npe_codec_owned": False}
+V2_SETTINGS = LEGACY_SETTINGS + tuple(V2_RUNTIME_DEFAULTS)
+SETTINGS = LEGACY_SETTINGS + tuple(RUNTIME_DEFAULTS)
 # An explicit device binds these options. QEMU upgrades and Web transport/log
 # options are still selectable without silently changing the virtual device.
 BOUND_FLAGS = {
@@ -25,6 +37,9 @@ BOUND_FLAGS = {
     "--external-power", "--icount-shift", "--debug-program-load",
     "--initial-key-matrix-low", "--initial-key-matrix-high",
 }
+RUNTIME_FLAGS = {"--rom-mp3-hle-base", "--rom-mp3-arena-image", "--instruction-clock",
+                 "--realtime", "--rom-npe-codec-owned", "--rom-npe-codec-dll",
+                 "--rom-npe-codec-socket", "--rom-npe-codec-pythonpath"}
 
 
 def file_identity(path: Path) -> dict:
@@ -72,9 +87,18 @@ def protect_inputs(config: Path, journal: Path, inputs: list[Path]) -> None:
                 raise ValueError(f"Device journal/lock must not overwrite input: {protected}")
 
 
-def validate_settings(settings: dict) -> None:
-    if not isinstance(settings, dict) or set(settings) != set(SETTINGS):
-        raise ValueError("Device settings fields do not match schema v1")
+def require_npe_gates(path: Path) -> None:
+    image = path.read_bytes()
+    for entry in NPE_ENTRY_OFFSETS:
+        if image[entry:entry + 4] != b"\x00\x0f\x20\xc6":
+            raise ValueError(f"NPE-owned device ROM lacks reviewed gate {entry:06x}")
+
+
+def validate_settings(settings: dict, *, legacy: bool = False,
+                      previous: bool = False) -> None:
+    expected = LEGACY_SETTINGS if legacy else V2_SETTINGS if previous else SETTINGS
+    if not isinstance(settings, dict) or set(settings) != set(expected):
+        raise ValueError("Device settings fields do not match schema")
     if settings["boot_mode"] not in ("firmware", "firmware-vma03"):
         raise ValueError("Devices require normal firmware boot, not a diagnostic loader")
     if type(settings["soc_rom_skeleton"]) is not bool:
@@ -85,6 +109,26 @@ def validate_settings(settings: dict) -> None:
     shift = settings["icount_shift"]
     if shift is not None and (type(shift) is not int or shift not in range(21)):
         raise ValueError("Invalid device setting: icount_shift")
+    if legacy:
+        return
+    for key in ("rom_mp3_hle_base", "rom_mp3_arena_image"):
+        value = settings[key]
+        if type(value) is not int or not 0 <= value <= 0xFFFFFE or value & 1:
+            raise ValueError(f"Invalid aligned 24-bit device setting: {key}")
+    if settings["rom_mp3_arena_image"] and not settings["rom_mp3_hle_base"]:
+        raise ValueError("MP3 arena image requires an HLE base")
+    for key in ("instruction_clock", "realtime"):
+        if type(settings[key]) is not bool:
+            raise ValueError(f"Invalid boolean device setting: {key}")
+    if settings["instruction_clock"] and shift != 0:
+        raise ValueError("Device instruction_clock requires icount_shift 0")
+    if settings["realtime"] and (not settings["instruction_clock"] or shift != 0):
+        raise ValueError("Realtime device requires instruction_clock and icount_shift 0")
+    if not previous:
+        if type(settings["rom_npe_codec_owned"]) is not bool:
+            raise ValueError("rom_npe_codec_owned must be boolean")
+        if settings["rom_npe_codec_owned"] and not settings["soc_rom_skeleton"]:
+            raise ValueError("NPE codec requires a strict SoC ROM skeleton")
 
 
 def create_device(path: Path, args) -> dict:
@@ -103,6 +147,8 @@ def create_device(path: Path, args) -> dict:
     validate_settings(settings)
     qemu = args.qemu.resolve()
     paths = {key: getattr(args, key).resolve() for key in INPUTS}
+    if settings["rom_npe_codec_owned"]:
+        require_npe_gates(paths["soc_rom"])
     journal = (args.nand_journal or path.with_suffix(".npj")).resolve()
     protect_inputs(path, journal, [qemu, *paths.values()])
     if journal.exists() or journal.is_symlink() or Path(str(journal) + ".lock").exists():
@@ -132,18 +178,23 @@ def create_device(path: Path, args) -> dict:
     return config
 
 
-def load_device(path: Path, args, *, qemu_override: bool = False) -> dict:
+def load_device(path: Path, args, *, qemu_override: bool = False,
+                runtime_overrides=frozenset()) -> dict:
     """Validate identities before the Web bridge can start a guest or writer."""
     path = path.resolve()
     config = json.loads(path.read_text(encoding="utf-8-sig"))
     keys = {"schema", "id", "name", "qemu", "inputs", "journal", "settings"}
-    if not isinstance(config, dict) or set(config) != keys or config["schema"] != SCHEMA:
+    if not isinstance(config, dict) or set(config) != keys or config["schema"] not in (SCHEMA, PREVIOUS_SCHEMA, LEGACY_SCHEMA):
         raise ValueError("Unsupported or incomplete NP560 device configuration")
     if not isinstance(config["id"], str) or str(uuid.UUID(config["id"])) != config["id"]:
         raise ValueError("Device id must be a canonical UUID")
     if not isinstance(config["name"], str) or not config["name"].strip():
         raise ValueError("Device name must be a nonempty string")
-    validate_settings(config["settings"])
+    validate_settings(config["settings"], legacy=config["schema"] == LEGACY_SCHEMA,
+                      previous=config["schema"] == PREVIOUS_SCHEMA)
+    if config["schema"] != LEGACY_SCHEMA and runtime_overrides:
+        raise ValueError("Device binds runtime settings; remove overrides: " +
+                         ", ".join(sorted(runtime_overrides)))
     if not isinstance(config["inputs"], dict) or set(config["inputs"]) != set(INPUTS):
         raise ValueError("Device requires firmware, SoC ROM and complete NAND checkpoint")
     paths = {}
@@ -159,6 +210,8 @@ def load_device(path: Path, args, *, qemu_override: bool = False) -> dict:
         if file_identity(candidate)["sha256"] != entry["sha256"]:
             raise ValueError(f"Device input hash mismatch: {key}: {candidate}")
         paths[key] = candidate
+    if config["settings"].get("rom_npe_codec_owned"):
+        require_npe_gates(paths["soc_rom"])
     qemu = args.qemu.resolve() if qemu_override else resolve_path(path.parent, config["qemu"])
     if not qemu.is_file():
         raise ValueError(f"Device QEMU not found: {qemu}")
@@ -167,7 +220,10 @@ def load_device(path: Path, args, *, qemu_override: bool = False) -> dict:
     if not journal.exists() and Path(str(journal) + ".lock").exists():
         raise ValueError("Device journal is missing but its lock sidecar remains; "
                          "restore the saved journal instead of resetting this device")
-    for key, value in {**paths, **config["settings"], "qemu": qemu,
+    # V1 never recorded these flags. Preserve its explicit legacy overrides;
+    # do not infer or rewrite missing addresses from firmware bytes.
+    runtime = {key: getattr(args, key, default) for key, default in RUNTIME_DEFAULTS.items()}
+    for key, value in {**paths, **runtime, **config["settings"], "qemu": qemu,
                        "nand_journal": journal}.items():
         setattr(args, key, value)
     return {"id": config["id"], "name": config["name"], "config": str(path),

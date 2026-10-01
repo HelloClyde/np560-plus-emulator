@@ -52,9 +52,13 @@ def firmware(core):
     return image,rom,expected+[(core["code_address"],core["code"])]
 
 
-def layout(prefix_bytes):
+def layout(prefix_bytes, reserve_synthesis=True):
     raw=HEAP_BEGIN+6+(prefix_bytes+6 if prefix_bytes else 0)
     work=raw if (raw&0x7fff)+lease.WORK_STORAGE<=0x8000 else (raw+0x7fff)&~0x7fff
+    if not reserve_synthesis:
+        size=work-raw+lease.WORK_STORAGE
+        if raw+size+6>HEAP_END: return [0]*9
+        return [2 if prefix_bytes else 1,size,raw>>16,raw&65535,work>>15,0,0,0,work&0x7fff]
     if work-raw>=lease.SYN_STORAGE:
         syn,left=raw>>15,0x8000|((raw&0x7fff)+2)
         end=work+lease.WORK_STORAGE
@@ -66,8 +70,8 @@ def layout(prefix_bytes):
     return [2 if prefix_bytes else 1,size,raw>>16,raw&65535,work>>15,syn,left,left+4102,work&0x7fff]
 
 
-def check(qemu,output,prefix_bytes=0,icount=None):
-    core=lease.build();image,rom,code=firmware(core)
+def check(qemu,output,prefix_bytes=0,icount=None, *, reserve_synthesis=True):
+    core=lease.build(reserve_synthesis=reserve_synthesis);image,rom,code=firmware(core)
     a=_DMCUAssembler(0x200000);expected=[];count=0
     def const(addr,value): a.emit(0x68F0,value,0xA8F0,addr)
     def factory(target,arg=None):
@@ -97,7 +101,7 @@ def check(qemu,output,prefix_bytes=0,icount=None):
         factory(lease.LOCK,1)
         # The pinned neighbour must survive allocator retries/compaction.
         a.emit(0x6810,0xa2);const(0x4a46,0xbeef)
-    descriptor=layout(prefix_bytes);success=bool(descriptor[0])
+    descriptor=layout(prefix_bytes,reserve_synthesis);success=bool(descriptor[0])
     invoke("acquire");record(descriptor[0],0 if success else 1,descriptor)
     if success:
         invoke("acquire");record(0,6,descriptor)
@@ -109,7 +113,7 @@ def check(qemu,output,prefix_bytes=0,icount=None):
     empty_heap()
     # A real second acquisition must reuse the handle and full allocation,
     # without reinitializing the heap or clearing its bitmap in the caller.
-    invoke("acquire");record(1,0,layout(0))
+    invoke("acquire");record(1,0,layout(0,reserve_synthesis))
     invoke("release");record(0,0,[0]*9)
     empty_heap()
     a.emit(0x6810,0);read_sfr(a.words,0x10,10);read_sfr(a.words,0x11,12)
@@ -120,6 +124,7 @@ def check(qemu,output,prefix_bytes=0,icount=None):
         expected_code=code,expected_data=[v-65536 if v>=32768 else v for v in expected],
         capture_ranges=[("heap",HEAP_BEGIN,HEAP_END-HEAP_BEGIN)],
         metadata={"prefix_bytes":prefix_bytes,"expected_acquired":success,"initial_descriptor":descriptor,
+            "reserve_synthesis":reserve_synthesis,
             "factory_allocator_bytes_unchanged":True,"native_allocation_sha256":hashlib.sha256(core["code"]).hexdigest(),
             "heap_reset_only_at_isolated_test_start":True,"factory_player_connected":False})
 
@@ -128,11 +133,14 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--qemu",type=Path,required=True);parser.add_argument("--output",type=Path,required=True)
     parser.add_argument("--first-only",action="store_true")
+    parser.add_argument("--compact-hle",action="store_true",
+                        help="test HLE workspace without native synthesis history")
     args=parser.parse_args();args.output.mkdir(parents=True,exist_ok=False)
     report={"passed":False,"prg_sha256":PRG_SHA,"qemu_sha256":hashlib.sha256(args.qemu.read_bytes()).hexdigest(),"cases":[]}
     try:
-        for prefix in ((0,) if args.first_only else (0,0x2000,0x4000,0x5000,0x7000)):
-            report["cases"].append(check(args.qemu,args.output,prefix,5 if prefix==0x2000 else None))
+        for prefix in ((0,) if args.first_only else (0,0x2000,0x36c0,0x4000,0x5000,0x7000)):
+            report["cases"].append(check(args.qemu,args.output,prefix,5 if prefix==0x2000 else None,
+                                         reserve_synthesis=not args.compact_hle))
         report["passed"]=all(c["passed"] and c["exit_code"]==0 for c in report["cases"])
     except AssertionError as exc:
         detail=exc.args[0] if exc.args else "assertion failed"

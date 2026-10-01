@@ -16,9 +16,19 @@
     if (match) return match[1];
     match = /^Digit([0-9])$/.exec(code);
     if (match) return match[1];
+    // Respect NumLock: navigation events from these switches must continue
+    // through the named-key mapping below, not become numeric key presses.
+    match = /^Numpad([0-9])$/.exec(code);
+    if (match && key === match[1]) return match[1];
+    // NumLock-off Decimal reports Delete; do not turn navigation/editing
+    // into a guest dot contact. Other locale separators need their own mapping.
+    if (code === "NumpadDecimal" && key === ".") return ".";
     if (code === "Space") return " ";
     if (code === "Comma") return ",";
     if (code === "Period") return ".";
+    // Physical quote switch, not host-composed text: the guest input mode
+    // decides between apostrophe and the normal-mode 0x84 event.
+    if (code === "Quote") return "'";
     if (key === "Home") return "StartMenu";
     if ([
       "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Enter",
@@ -36,6 +46,8 @@
       this.onHeldChange = onHeldChange || (() => {});
       this.sources = new Map();
       this.lastSignature = "0:0:0";
+      this.transitionHistory = [];
+      this.transitionSequence = 0;
     }
 
     isMapped(code) {
@@ -54,17 +66,23 @@
       return new Set(this.sources.values());
     }
 
+    recentTransitions() {
+      return this.transitionHistory.map(entry => ({ ...entry,
+        held_sources: entry.held_sources.map(source => ({ ...source })),
+      }));
+    }
+
     press(source, code) {
       if (!this.isMapped(code) || this.sources.get(source) === code) {
         return false;
       }
       this.sources.set(source, code);
-      return this._commit(code);
+      return this._commit(code, false, source);
     }
 
     release(source) {
       if (!this.sources.delete(source)) return false;
-      return this._commit(null);
+      return this._commit(null, false, source);
     }
 
     releaseAll(force = false) {
@@ -106,7 +124,7 @@
       };
     }
 
-    _commit(downCode, force = false) {
+    _commit(downCode, force = false, source = null) {
       const payload = this._snapshot(downCode);
       // Strict QEMU input is the recovered 64-bit matrix.  Several Web/PC
       // labels intentionally alias one physical matrix switch, so compare
@@ -117,10 +135,66 @@
       this.lastSignature = signature;
       this.onHeldChange(this.heldCodes());
       if (!physicalChanged && !force) return false;
+      // Local submission intent only: this is not a server ACK or proof the
+      // guest consumed a key. Bound memory; never record unrelated host typing.
+      this.transitionHistory.push({
+        sequence: ++this.transitionSequence, at_ms: Date.now(),
+        source,
+        held_sources: Array.from(this.sources, ([source, code]) => ({
+          source, code, matrix: this.matrixIndexes[code],
+        })),
+        down_code: downCode, forced: force, ...payload,
+      });
+      if (this.transitionHistory.length > 128) this.transitionHistory.shift();
       this.sendPayload(payload);
       return true;
     }
   }
 
-  return { KeyboardMatrixController, normalizeKeyboardEvent };
+  class MinimumKeyboardContact {
+    constructor(controller, ready, now = () => performance.now(),
+                schedule = (fn, delay) => setTimeout(fn, delay),
+                cancel = id => clearTimeout(id)) {
+      Object.assign(this, { controller, ready, now, schedule, cancel });
+      this.contacts = new Map();
+    }
+    press(source, code, minimumMs = 0) {
+      const previous = this.contacts.get(source);
+      if (previous?.timer !== undefined) this.cancel(previous.timer);
+      this.controller.press(source, code);
+      const contact = { minimumMs, at: this.now(), released: false };
+      this.contacts.set(source, contact);
+      contact.ready = Promise.resolve(this.ready()).then(result => {
+        if (this.contacts.get(source) === contact && result?.applied !== false) {
+          contact.at = this.now();
+        }
+      }, () => {});
+    }
+    release(source) {
+      const contact = this.contacts.get(source);
+      if (!contact) return this.controller.release(source);
+      if (contact.released) return;
+      contact.released = true;
+      const finish = () => {
+        if (this.contacts.get(source) !== contact) return;
+        this.contacts.delete(source);
+        this.controller.release(source);
+      };
+      if (!contact.minimumMs) return finish();
+      contact.ready.then(() => {
+        if (this.contacts.get(source) !== contact) return;
+        const remaining = contact.minimumMs - (this.now() - contact.at);
+        if (remaining > 0) contact.timer = this.schedule(finish, remaining);
+        else finish();
+      });
+    }
+    cancelAll() {
+      for (const contact of this.contacts.values()) {
+        if (contact.timer !== undefined) this.cancel(contact.timer);
+      }
+      this.contacts.clear();
+    }
+  }
+
+  return { KeyboardMatrixController, MinimumKeyboardContact, normalizeKeyboardEvent };
 }));

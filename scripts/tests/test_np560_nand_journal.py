@@ -56,6 +56,13 @@ def program(path, writer, *, read_after_failure=False):
         command(words, 5, 0x101, buffer=0x141, length=2112)
         command(words, 2, 0x181, length=4)
         command(words, 3, 0x180)
+        # The second erase changes no bytes. It must still report success to
+        # the guest without forcing another durable journal record.
+        command(words, 3, 0x180)
+        # OOB alone makes a block non-erased. Its erase must be journaled even
+        # though all ordinary data bytes are still FF.
+        command(words, 2, 0x1c0, column=2110, buffer=0x2460, length=8)
+        command(words, 3, 0x1c0)
     if read_after_failure:
         # Preserve the failed command status in guest registers before reads
         # clear the controller latch. No host register/RAM injection is used.
@@ -68,7 +75,8 @@ def program(path, writer, *, read_after_failure=False):
                                         (0x102, 2110, 0x4040, 8),
                                         (0x141, 0, 0x4060, 16),
                                         (0x141, 2046, 0x4080, 4),
-                                        (0x181, 0, 0x40A0, 4)):
+                (0x181, 0, 0x40A0, 4),
+                (0x1c0, 2110, 0x40C0, 8)):
             command(words, 1, page, col, dest, length)
     final = f"PC=20:{2 * len(words):04x}"
     words.append(0xD0FF)
@@ -103,7 +111,8 @@ def verify_reader(emu):
                                (0x4040, bytes(range(1, 9))),
                                (0x4060, MASKED),
                                (0x4080, bytes.fromhex("aabbddcc")),
-                               (0x40A0, b"\xFF" * 4)):
+                               (0x40A0, b"\xFF" * 4),
+                               (0x40C0, b"\xFF" * 8)):
         actual = base64.b64decode(emu.snapshot("data", address, len(expected))["frame"])
         checks.append({"address": address, "expected": expected.hex(),
                        "actual": actual.hex(), "passed": actual == expected})
@@ -166,7 +175,7 @@ def verify_io_failure(qemu, out, original, reader, final_reader):
         assert re.search(r"\bR2\s*=0000\b", cpu), cpu[:1600]
         assert re.search(r"\bR3\s*=0005\b", cpu), cpu[:1600]
         state = property_value(emu, "nand-journal-state")
-        assert state == "failed SEQUENCE=10 REPLAYED=10 TORN_BYTES=0", state
+        assert state == "failed SEQUENCE=9 REPLAYED=9 TORN_BYTES=0 NOOP_ERASES=0", state
         checks = verify_reader(emu)
         assert all(c["passed"] for c in checks), checks
         nand = property_value(emu, "nand-state")
@@ -216,7 +225,8 @@ def main():
             report["writer_nand"] = property_value(emu, "nand-state")
             if journal:
                 report["writer_journal"] = property_value(emu, "nand-journal-state")
-                assert "SEQUENCE=10" in report["writer_journal"]
+                assert "SEQUENCE=9" in report["writer_journal"]
+                assert "NOOP_ERASES=4" in report["writer_journal"]
                 report["rejections"].append(reject_start(
                     args.qemu, reader, log, "locked by another process", out, "exclusive-lock"))
                 for prop, value in (("nand-journal", ""),
@@ -244,14 +254,14 @@ def main():
             report["checks"] = verify_reader(emu)
             if journal:
                 report["reader_journal"] = property_value(emu, "nand-journal-state")
-                assert "REPLAYED=10" in report["reader_journal"]
+                assert "REPLAYED=9" in report["reader_journal"]
             assert all(c["passed"] for c in report["checks"]), report["checks"]
         finally:
             emu.close()
             report["reader_exit"] = emu.process.returncode
 
         original = log.read_bytes()
-        assert len(original) == 2544, len(original)
+        assert len(original) == 2520, len(original)
         report["journal_bytes"] = len(original)
         bad_base = out / "different-seed.bin"
         bad_base.write_bytes(b"BASE")
@@ -271,7 +281,7 @@ def main():
             path.write_bytes(corrupted)
             report["rejections"].append(reject_start(
                 args.qemu, reader, path, error, out, name))
-        partial = struct.pack("<4sIQIIII", b"NJR1", 1, 11, 0x101, 0, 16, 0)
+        partial = struct.pack("<4sIQIIII", b"NJR1", 1, 10, 0x101, 0, 16, 0)
         for name, tail in (("short-header", b"NJR"), ("short-payload", partial + b"1234")):
             path = out / f"torn-{name}.npj"
             path.write_bytes(original + tail)

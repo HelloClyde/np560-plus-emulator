@@ -24,16 +24,16 @@ def category(path):
     if "tests" in path.parts or name.startswith(("test_", "test-")) or name in (
             "np560_cpu_vmstate_test.c", "np560_journal_faults.c"):
         return "tests"
-    if "web" in path.parts or name in (
+    if "web" in path.parts or name.startswith("serve_") or name in (
             "run-np560.ps1", "run-np560-web.ps1", "build-np560.ps1",
             "np560_lan_proxy.py", "np560_device_backup.py", "manage-np560-device.ps1",
             "move-np560-restored-device.ps1", "preflight-np560.ps1"):
         return "runtime"
-    if name.startswith(("analyse_", "analyze_", "audit_", "scan_", "extract_",
+    if name.startswith(("analyse_", "analyze_", "audit_", "compare_", "scan_", "extract_",
                         "disassemble_", "unpack_", "inspect_", "preprocess_")) or name in (
             "np560_disasm.py", "np560_aux_disasm.py", "np560_upd.py", "np560_aspack_compat.h"):
         return "reverse"
-    if name.startswith(("probe_", "probe-", "monitor_", "capture_", "dump_", "watch_",
+    if name.startswith(("probe_", "probe-", "monitor_", "capture_", "dump_", "trace_", "watch_",
                         "watch-", "benchmark_", "triage_", "search_", "wait_", "verify_",
                         "explore_", "render_", "qmp_read_", "merge_")):
         return "diagnostics"

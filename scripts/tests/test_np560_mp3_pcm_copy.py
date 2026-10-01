@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Version-4 software copy gate: exact bytes, ABI and no partial invalid writes.
+"""Version-4..6 software copy: bytes, guest mute, ABI and invalid-write guards.
 
 An isolated synthetic guest creates the documented HLE workspace and owner;
 it is not a factory heap/lifecycle or playback test. All input construction
@@ -22,17 +22,17 @@ import struct
 
 from build_np560_mp3_resident import load_bundle
 from np560_assembler import _DMCUAssembler
-from test_np560_mac import run
+from test_np560_mac import run, check_original
 
 OWNER, WORK, OUTPUT = 0x514a46, 0x518100, 0x1782
 BUFFERS = (0x1784, 0x2084, 0x1c04, 0x2504)
 
 
 def check(qemu, bundle, output, name, *, phase=0, mutation=None,
-          offset=None, ds=None, bad=False, icount=None):
+          offset=None, ds=None, bad=False, icount=None, muted=False, volume=7, target=None):
     _, rom, manifest = load_bundle(bundle)
     hle = manifest['rom_mp3_hle']
-    assert hle['version'] in (4, 5)
+    assert hle['version'] in (4, 5, 6)
     a = _DMCUAssembler(0x200000)
     def imm(r, value): a.emit(0x68f0 | r, value & 65535)
     def call(target): a.emit(0xbd00 | target >> 16, target & 65535)
@@ -60,6 +60,9 @@ def check(qemu, bundle, output, name, *, phase=0, mutation=None,
     fill(WORK + 0x5700, 576, 0x8123, 31)
     fill(WORK + 0x5b80, 576, 0x4567, 17)
     fill(OUTPUT, 2306, 0x5aa5)  # both guards plus four complete buffers
+    const(0xf014, 0x80 if muted else 0)
+    # DMCU byte address 4A64 is the high lane (current); 4A65 is target.
+    const(0x4a64, (volume << 8) | (volume if target is None else target))
     if mutation:
         for address, value in mutation.items(): const(address, value)
     for reg in range(1, 15): imm(reg, 0x1100 + reg)
@@ -85,7 +88,10 @@ def check(qemu, bundle, output, name, *, phase=0, mutation=None,
     if not bad:
         for ch in range(2):
             start = (BUFFERS[ch*2 + phase] - OUTPUT) // 2
-            want[start:start+576] = source[ch]
+            gain = (0, 0x2027, 0x287a, 0x32f5, 0x4027, 0x50c3, 0x65ad, 0x7fff)
+            scaled = [(((x if x < 32768 else x-65536) * gain[volume] + 16384) // 32768) & 65535
+                      for x in source[ch]] if 0 <= volume < 8 else source[ch]
+            want[start:start+576] = [0] * 576 if muted else scaled
     expected_owner = [0] * 48
     for off, value in fields.items(): expected_owner[off//2] = value
     for address, value in (mutation or {}).items():
@@ -109,6 +115,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('qemu', 'resident-bundle', 'output'):
         parser.add_argument('--'+name, type=Path, required=True)
+    parser.add_argument('--original-prg', type=Path,
+                        help='also execute the unchanged original x1 gain routine at all eight levels')
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     report = dict(passed=False, cases=[], qemu_sha256=hashlib.sha256(args.qemu.read_bytes()).hexdigest())
@@ -128,6 +136,23 @@ def main():
         for index, (name, options) in enumerate(cases):
             report['cases'].append(check(args.qemu, args.resident_bundle, args.output,
                                          name, bad=index >= 2, **options))
+        for phase in (0, 1):
+            report['cases'].append(check(args.qemu, args.resident_bundle, args.output,
+                                         'muted-phase-'+str(phase), phase=phase, muted=True))
+        report['cases'].append(check(args.qemu, args.resident_bundle, args.output,
+                                     'muted-invalid-phase', phase=2, muted=True, bad=True))
+        for volume in range(1, 8):
+            report['cases'].append(check(args.qemu, args.resident_bundle, args.output,
+                                         'gain-'+str(volume), volume=volume, phase=volume % 2))
+        report['cases'].append(check(args.qemu, args.resident_bundle, args.output,
+                                     'mute-overrides-gain', volume=7, muted=True))
+        for current, target in ((1, 7), (7, 1), (3, 0), (0, 7), (0, 0)):
+            report['cases'].append(check(args.qemu, args.resident_bundle, args.output,
+                f'current-{current}-target-{target}', volume=current, target=target))
+        if args.original_prg:
+            for volume in range(8):
+                report['cases'].append(check_original(args.qemu, args.output, args.original_prg,
+                                                     multiplier=1, gain=volume))
         report['passed'] = all(case['passed'] for case in report['cases'])
     except (AssertionError, RuntimeError) as error:
         report['failure'] = str(error)[:2000]

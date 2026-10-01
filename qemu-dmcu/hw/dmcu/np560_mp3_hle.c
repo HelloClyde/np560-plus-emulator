@@ -6,6 +6,7 @@
 #include "cpu.h"
 #include "np560_mp3_codec.h"
 #include "np560_mp3_hle.h"
+#include "np560_eq.h"
 
 /* Version 1 mirrors the NEW software workspace of the reconstructed
  * MP3 decoder, not recovered factory-private fields. Original ring,
@@ -29,11 +30,13 @@ enum {
 };
 
 typedef struct MP3Session {
+    NP560EQ eq;
     NP560MP3Codec *codec;
     NP560MP3Frame frame;
     bool pending;
     unsigned next_pcm_offset, priming_remaining;
     uint64_t frames, granules;
+    unsigned startup_history_frames, startup_history_available;
 } MP3Session;
 
 #define MP3_LIFECYCLE_EVENTS 64
@@ -56,6 +59,17 @@ struct NP560MP3HLE {
     uint64_t pcm_copy_calls, pcm_copy_failures;
     uint64_t final_frame_calls, final_frame_failures;
     uint64_t priming_calls;
+    /* Read-only classification of actual codec returns. NO_PCM deliberately
+     * does not claim missing reservoir: the kernel leaves that ambiguous. */
+    uint64_t codec_results[NP560_MP3_MISSING_HISTORY + 1];
+    uint64_t no_pcm_reasons[4];
+    NP560MP3NoPCMInfo last_no_pcm;
+    uint64_t startup_history_frames, history_after_output, history_no_progress;
+    unsigned max_startup_history_frames;
+    /* v7 parameters only; v8 adds explicitly assumed EQ, not factory DSP. */
+    uint16_t mode_coefficients[10];
+    bool mode_loaded, mode_enabled;
+    uint64_t mode_calls[3], mode_failures;
     uint64_t lifecycle_next;
     MP3LifecycleEvent lifecycle[MP3_LIFECYCLE_EVENTS];
 };
@@ -93,6 +107,8 @@ void np560_mp3_hle_reset(void *opaque)
     s->reset_count++;
     s->lifecycle_next = 0;
     memset(s->lifecycle, 0, sizeof(s->lifecycle));
+    memset(s->mode_coefficients, 0, sizeof(s->mode_coefficients));
+    s->mode_loaded = s->mode_enabled = false;
 }
 
 void np560_mp3_hle_free(NP560MP3HLE *s)
@@ -137,13 +153,13 @@ NP560MP3HLE *np560_mp3_hle_new(DMCUCPU *cpu, uint32_t base, Error **errp)
     s->sessions = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, session_free);
     if (address_space_read(cpu_get_address_space(CPU(cpu), DMCU_AS_CODE),
                            base, MEMTXATTRS_UNSPECIFIED, marker, sizeof(marker)) != MEMTX_OK ||
-        (lduw_le_p(marker + 8) < 1 || lduw_le_p(marker + 8) > 6)) {
+        (lduw_le_p(marker + 8) < 1 || lduw_le_p(marker + 8) > 8)) {
         error_setg(errp, "MP3 HLE gate %06x has no versioned service marker", base);
         np560_mp3_hle_free(s);
         return NULL;
     }
     s->version = lduw_le_p(marker + 8);
-    s->gate_count = s->version >= 4 ? 6 : s->version >= 2 ? 5 : 4;
+    s->gate_count = s->version >= 7 ? 9 : s->version >= 4 ? 6 : s->version >= 2 ? 5 : 4;
     if ((base >> 16) != ((base + s->gate_count * 16 - 1) >> 16)) {
         error_setg(errp, "MP3 HLE gate must fit ROM 01/02");
         np560_mp3_hle_free(s);
@@ -328,7 +344,22 @@ static void publish_pcm(NP560MP3HLE *s, MP3Session *session, AddressSpace *as,
     s->granules++;
 }
 
-/* Version 4 implements only the reconstructed session's software PCM copy.
+/* Compatibility gain from original 08:34C4 and PRG 0x3057E6, not a recovered
+ * implementation of the missing MP3-specific 333E processing. Q15 rounded
+ * multiplication matches the original MULS.ss.r.s fractional operation.
+ * Avoid implementation-defined right shifts of negative signed integers. */
+static const uint16_t mp3_volume_gain[8] = {
+        0, 0x2027, 0x287a, 0x32f5, 0x4027, 0x50c3, 0x65ad, 0x7fff
+};
+
+static int16_t mp3_output_gain(int16_t sample, unsigned level)
+{
+    int32_t rounded = (int32_t)sample * mp3_volume_gain[level] + 16384;
+
+    return rounded >= 0 ? rounded / 32768 : -((32767 - rounded) / 32768);
+}
+
+/* Version 4 implements the reconstructed session's software PCM delivery.
  * DS0:R3 identifies its already-claimed owner, R0 the next output phase.
  * This is NOT hardware DMA: the original PHASE/READY publication, callbacks,
  * DTU buffer programming and individual DAC requests still execute normally.
@@ -339,6 +370,7 @@ static void copy_pcm(NP560MP3HLE *s, CPUDMCUState *env, AddressSpace *as)
     uint32_t owner, workspace, bank, work_offset;
     uint16_t buffers[4];
     uint8_t pcm[2304];
+    MP3Session *session;
     MemTxResult transaction;
     unsigned status = 2, i, j;
 
@@ -382,6 +414,50 @@ static void copy_pcm(NP560MP3HLE *s, CPUDMCUState *env, AddressSpace *as)
     transaction = address_space_read(as, workspace + PCM_LEFT,
                                      MEMTXATTRS_UNSPECIFIED, pcm, sizeof(pcm));
     g_assert(transaction == MEMTX_OK); /* fully validated ordinary RAM */
+    /* Reconstructed MP3 output contract: original 16:EDB4 (and the
+     * original software-gain path 08:34C4) sets BIT8A.7 after the current
+     * and target volume have both reached zero. Keep that guest-owned
+     * ramp/flag; suppress only this published buffer, not decoder history,
+     * decoded source PCM, device timing or the other output phase.
+     * The original callback advances the current level; never ramp it here. */
+    session = g_hash_table_lookup(s->sessions, GUINT_TO_POINTER(workspace + 1));
+    if (s->version >= 8 && s->mode_enabled) {
+        unsigned level = read_word(as, 0x4a64) >> 8;
+        uint16_t gain = level < 8 ? mp3_volume_gain[level] : 32768;
+        bool mute = read_word(as, 0xf014) & 0x0080;
+
+        if (!np560_eq_configure(&session->eq, session->frame.hz,
+                                s->mode_coefficients, true)) {
+            s->mode_failures++;
+            goto done;
+        }
+        for (i = 0; i < sizeof(pcm); i += 2) {
+            double filtered = np560_eq_sample(&session->eq, i / 1152,
+                                              (int16_t)lduw_le_p(pcm + i));
+            /* Advance history even while muted, and clip only after gain. */
+            stw_le_p(pcm + i, mute ? 0 : np560_eq_quantize(filtered, gain));
+        }
+    } else if (read_word(as, 0xf014) & 0x0080) {
+        memset(pcm, 0, sizeof(pcm));
+    } else {
+        uint16_t volume = read_word(as, 0x4a64);
+        /* DMCU logical byte 4A64 (current) is the high lane; 4A65 is
+         * target. Respect the native ramp instead of jumping to target. */
+        unsigned level = volume >> 8;
+
+        /* A zero current level is silent even before the native mute flag
+         * catches up. Never turn the all-zero ramp endpoint into full gain.
+         * Do not turn unrelated/corrupt bytes into a table index. */
+        if (level < 8) {
+            for (i = 0; i < sizeof(pcm); i += 2) {
+                int16_t value = (int16_t)(pcm[i] | (pcm[i + 1] << 8));
+                uint16_t scaled = mp3_output_gain(value, level);
+
+                pcm[i] = scaled;
+                pcm[i + 1] = scaled >> 8;
+            }
+        }
+    }
     for (i = 0; i < 2; i++) {
         transaction = address_space_write(as, buffers[i * 2 + phase],
                                           MEMTXATTRS_UNSPECIFIED,
@@ -393,6 +469,74 @@ done:
     env->gpr[0] = status ? 0 : 576;
     env->gpr[2] = status;
     s->pcm_copy_failures += status != 0;
+}
+
+static void audio_mode_service(NP560MP3HLE *s, CPUDMCUState *env,
+                               AddressSpace *as, unsigned service)
+{
+    unsigned i, sp = env->gpr[15] & 0xffff;
+    uint32_t address;
+    uint16_t coefficients[10], hi, lo, count;
+    uint8_t *stack = s->cpu->internal_data;
+
+    s->mode_calls[service - 6]++;
+    if (service == 8) {
+        s->mode_enabled = false;
+        if (s->version >= 8) {
+            GHashTableIter iter;
+            gpointer value;
+            g_hash_table_iter_init(&iter, s->sessions);
+            while (g_hash_table_iter_next(&iter, NULL, &value)) {
+                np560_eq_reset_history(&((MP3Session *)value)->eq);
+            }
+        }
+        return;
+    }
+    if (service == 7) {
+        if (s->mode_loaded) {
+            s->mode_enabled = true;
+        } else {
+            s->mode_failures++;
+        }
+        return;
+    }
+    /* Ordinary SCALL return frame is four bytes; AJMP veneer adds none.
+     * Read the unbanked stack, preserving all guest registers and flags. */
+    if (sp > 0x10000 - 10) {
+        s->mode_failures++;
+        return;
+    }
+    hi = lduw_le_p(stack + sp + 4);
+    lo = lduw_le_p(stack + sp + 6);
+    count = lduw_le_p(stack + sp + 8);
+    address = ((uint32_t)hi << 16) | lo;
+    if (count != 10 || hi > 0xff || (address & 1) || address > 0x1000000 - 20) {
+        s->mode_failures++;
+        return;
+    }
+    /* Validate every subsection before reading; never cause MMIO side
+     * effects through an untrusted pointer. ROM coefficients are valid. */
+    for (i = 0; i < 20;) {
+        MemoryRegionSection section = memory_region_find(as->root, address + i, 20 - i);
+        uint64_t bytes = int128_get64(section.size);
+        bool valid = section.mr && bytes &&
+            section.offset_within_address_space == address + i &&
+            (memory_region_is_ram(section.mr) || memory_region_is_rom(section.mr)) &&
+            !memory_region_is_ram_device(section.mr);
+        if (section.mr) {
+            memory_region_unref(section.mr);
+        }
+        if (!valid) {
+            s->mode_failures++;
+            return;
+        }
+        i += bytes;
+    }
+    for (i = 0; i < 10; i++) {
+        coefficients[i] = read_word(as, address + 2 * i);
+    }
+    memcpy(s->mode_coefficients, coefficients, sizeof(coefficients));
+    s->mode_loaded = true;
 }
 
 bool np560_mp3_hle_service(void *opaque, CPUDMCUState *env, uint32_t pc)
@@ -409,6 +553,10 @@ bool np560_mp3_hle_service(void *opaque, CPUDMCUState *env, uint32_t pc)
     service = (pc - s->base) / 16;
     if (!gate_matches(s, pc, service)) {
         return false;
+    }
+    if (service >= 6) {
+        audio_mode_service(s, env, as, service);
+        return true;
     }
     if (service == 4) {
         input_space(s, env, as);
@@ -449,10 +597,12 @@ bool np560_mp3_hle_service(void *opaque, CPUDMCUState *env, uint32_t pc)
             g_hash_table_insert(s->sessions, key, session);
         }
         np560_mp3_codec_reset(session->codec);
+        memset(&session->eq, 0, sizeof(session->eq));
         memset(&session->frame, 0, sizeof(session->frame));
         session->pending = false;
         session->next_pcm_offset = session->priming_remaining = 0;
         session->frames = session->granules = 0;
+        session->startup_history_frames = session->startup_history_available = 0;
         for (i = 0; i < 1152; i++) {
             write_word(as, address + PCM_LEFT + i * 2, 0);
         }
@@ -498,6 +648,10 @@ bool np560_mp3_hle_service(void *opaque, CPUDMCUState *env, uint32_t pc)
         unsigned length = read_word(as, address + LENGTH);
         unsigned final = s->version >= 5 ? read_word(as, address + FINAL_INPUT) : 0;
         NP560MP3Status decoded;
+        /* A new input attempt supersedes the preceding publication. Even
+         * staging/EOF validation failures must not leave old PCM marked
+         * ready. Pending-granule/busy paths above retain their own output. */
+        write_word(as, address + PCM_VALID, 0);
         if (body > sizeof(input) - header || length != header + body || final > 1) {
             status = 2;
             goto complete;
@@ -512,6 +666,17 @@ bool np560_mp3_hle_service(void *opaque, CPUDMCUState *env, uint32_t pc)
         for (i = 0; i < body; i++) {
             uint16_t word = read_word(as, address + SCRATCH + (i & ~1u));
             input[header + i] = (i & 1) ? word : word >> 8;
+        }
+        /* Descriptor rejection must happen before the codec commits its
+         * reservoir and synthesis history. Otherwise retrying a corrected
+         * descriptor decodes this packet twice and changes subsequent PCM.
+         * Channel mode is wholly in header byte 3 (high two bits).
+         */
+        if (read_word(as, address + FRAME + 2) !=
+            ((input[3] >> 6) == 3 ? 1 : 2)) {
+            status = 7;
+            detail = 0x800 + NP560_MP3_DECODE_ERROR;
+            goto complete;
         }
         if (final) {
             s->final_frame_calls++;
@@ -530,6 +695,30 @@ bool np560_mp3_hle_service(void *opaque, CPUDMCUState *env, uint32_t pc)
             s->final_frame_failures += decoded != NP560_MP3_OK;
         } else {
             decoded = np560_mp3_codec_decode(session->codec, input, length, &session->frame);
+        }
+        if ((unsigned)decoded < G_N_ELEMENTS(s->codec_results)) {
+            s->codec_results[decoded]++;
+        }
+        if (decoded == NP560_MP3_NO_PCM) {
+            s->last_no_pcm = np560_mp3_codec_no_pcm_info(session->codec);
+            if (s->last_no_pcm.reason < G_N_ELEMENTS(s->no_pcm_reasons)) {
+                s->no_pcm_reasons[s->last_no_pcm.reason]++;
+            }
+            if (s->last_no_pcm.reason == 2) {
+                if (session->frames != 0) {
+                    s->history_after_output++;
+                } else {
+                    if (session->startup_history_frames &&
+                        s->last_no_pcm.available_history <= session->startup_history_available) {
+                        s->history_no_progress++;
+                    }
+                    session->startup_history_available = s->last_no_pcm.available_history;
+                    session->startup_history_frames++;
+                    s->startup_history_frames++;
+                    s->max_startup_history_frames = MAX(s->max_startup_history_frames,
+                                                       session->startup_history_frames);
+                }
+            }
         }
         if (decoded != NP560_MP3_OK || session->frame.consumed != length ||
             session->frame.channels != read_word(as, address + FRAME + 2)) {
@@ -612,7 +801,24 @@ char *np560_mp3_hle_state(NP560MP3HLE *s)
             event->pending ? "true" : "false", event->frames, event->granules,
             event->session_frames, event->session_granules);
     }
-    return g_strdup_printf("{\"enabled\":true,\"base\":%u,\"sessions\":%u,"
+    g_autoptr(GString) modes = g_string_new(NULL);
+    g_autoptr(GString) codec_results = g_string_new(NULL);
+    static const char *const codec_names[] = {
+        "ok", "short", "bad_header", "unsupported", "bad_crc",
+        "no_pcm", "decode_error", "missing_history"
+    };
+    G_STATIC_ASSERT(G_N_ELEMENTS(codec_names) == G_N_ELEMENTS(s->codec_results));
+    for (unsigned i = 0; i < G_N_ELEMENTS(codec_names); i++) {
+        g_string_append_printf(codec_results, "%s\"%s\":%" PRIu64,
+                               i ? "," : "", codec_names[i], s->codec_results[i]);
+    }
+    for (unsigned i = 0; i < 10; i++) {
+        g_string_append_printf(modes, "%s%u", i ? "," : "", s->mode_coefficients[i]);
+    }
+    return g_strdup_printf("{\"audio_mode\":{\"loaded\":%s,\"enabled\":%s,"
+        "\"dsp_implemented\":%s,\"coefficients\":[%s],"
+        "\"calls\":[%" PRIu64 ",%" PRIu64 ",%" PRIu64 "],\"failures\":%" PRIu64 "},"
+        "\"enabled\":true,\"base\":%u,\"sessions\":%u,"
         "\"version\":%u,\"input_space_calls\":%" PRIu64 ","
         "\"input_space_failures\":%" PRIu64 ","
         "\"pcm_copy_calls\":%" PRIu64 ",\"pcm_copy_failures\":%" PRIu64 ","
@@ -621,11 +827,26 @@ char *np560_mp3_hle_state(NP560MP3HLE *s)
         "\"calls\":[%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "],"
         "\"frames\":%" PRIu64 ",\"granules\":%" PRIu64 ",\"failures\":%" PRIu64 ","
         "\"device_resets\":%" PRIu64 ",\"lifecycle_next\":%" PRIu64
-        ",\"lifecycle_events\":[%s]}", s->base, g_hash_table_size(s->sessions),
+        ",\"lifecycle_events\":[%s],\"codec_results\":{%s},"
+        "\"no_pcm_reasons\":{\"invalid_sideinfo\":%" PRIu64
+        ",\"missing_history\":%" PRIu64 ",\"unknown\":%" PRIu64 "},"
+        "\"last_no_pcm\":{\"reason\":%u,\"available_history\":%u,\"required_history\":%u},"
+        "\"history_recovery\":{\"startup_frames\":%" PRIu64
+        ",\"after_output\":%" PRIu64 ",\"no_progress\":%" PRIu64
+        ",\"max_startup_frames\":%u}}",
+        s->mode_loaded ? "true" : "false", s->mode_enabled ? "true" : "false",
+        s->version >= 8 ? "true" : "false",
+        modes->str, s->mode_calls[0], s->mode_calls[1], s->mode_calls[2], s->mode_failures,
+        s->base, g_hash_table_size(s->sessions),
         s->version, s->input_space_calls, s->input_space_failures,
         s->pcm_copy_calls, s->pcm_copy_failures,
         s->final_frame_calls, s->final_frame_failures,
         s->priming_calls,
         s->calls[0], s->calls[1], s->calls[2], s->calls[3], s->frames,
-        s->granules, s->failures, s->reset_count, s->lifecycle_next, events->str);
+        s->granules, s->failures, s->reset_count, s->lifecycle_next, events->str,
+        codec_results->str, s->no_pcm_reasons[1], s->no_pcm_reasons[2],
+        s->no_pcm_reasons[0] + s->no_pcm_reasons[3], s->last_no_pcm.reason,
+        s->last_no_pcm.available_history, s->last_no_pcm.required_history,
+        s->startup_history_frames, s->history_after_output, s->history_no_progress,
+        s->max_startup_history_frames);
 }

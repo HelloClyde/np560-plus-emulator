@@ -29,6 +29,11 @@ class Frame(ct.Structure):
                 ("pcm", ct.c_int16 * 2304)]
 
 
+class NoPCMInfo(ct.Structure):
+    _fields_ = [(name, ct.c_uint32) for name in
+                ('reason', 'available_history', 'required_history')]
+
+
 def library(output):
     source = ROOT / "qemu-dmcu/hw/dmcu"
     assert hashlib.sha256((source / "minimp3/minimp3.h").read_bytes()).hexdigest() == (
@@ -47,6 +52,8 @@ def library(output):
     lib.np560_mp3_codec_decode.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_size_t,
                                          ct.POINTER(Frame)]
     lib.np560_mp3_codec_decode.restype = ct.c_int
+    lib.np560_mp3_codec_no_pcm_info.argtypes = [ct.c_void_p]
+    lib.np560_mp3_codec_no_pcm_info.restype = NoPCMInfo
     return lib
 
 
@@ -74,6 +81,10 @@ def check(lib, path, output):
         # headers/CRC failure must NOT mutate the following decode result.
         lib.np560_mp3_codec_reset(handle)
         for packet, wanted in zip(packets, observed):
+            for oversized in (packet + b'\0', packet + packet):
+                status, row = decode(lib, handle, oversized)
+                assert status == 6 and not any(bytes(row)), 'overlong packet was consumed'
+                checks += 1
             for prefix in (b"", packet[:3], packet[:-1]):
                 status, row = decode(lib, handle, prefix)
                 assert status == 1 and row.consumed == row.samples_per_channel == 0
@@ -103,6 +114,27 @@ def check(lib, path, output):
         assert seek_status in (0, 5)
         if seek_status == 5:
             assert seek.samples_per_channel == 0 and seek.consumed > 0
+            explanation = lib.np560_mp3_codec_no_pcm_info(handle)
+            assert explanation.reason == 2
+            assert explanation.available_history == 0 < explanation.required_history
+        # Invalid sideinfo is a separate no-output path, not reservoir warmup.
+        packet = packets[0]
+        if packet[1] & 1:  # unprotected fixture: avoid triggering CRC first
+            invalid = bytearray(packet)
+            version = (packet[1] >> 3) & 3
+            mono = packet[3] >> 6 == 3
+            side = (17 if mono else 32) if version == 3 else (9 if mono else 17)
+            invalid[4:4+side] = b'\xff' * side
+            lib.np560_mp3_codec_reset(handle)
+            status, bad = decode(lib, handle, bytes(invalid))
+            assert status == 5 and bad.samples_per_channel == 0, status
+            assert lib.np560_mp3_codec_no_pcm_info(handle).reason == 1
+        lib.np560_mp3_codec_reset(handle)
+        assert lib.np560_mp3_codec_no_pcm_info(handle).reason == 0
+        status, clean = decode(lib, handle, packets[0])
+        assert status == 0
+        assert bytes(clean.pcm)[:clean.channels*clean.samples_per_channel*2] == observed[0]
+        assert lib.np560_mp3_codec_no_pcm_info(handle).reason == 0
     finally:
         lib.np560_mp3_codec_free(handle)
     pcm = b"".join(observed)
@@ -129,7 +161,6 @@ def check(lib, path, output):
     errors = [abs(a-b) for a, b in zip(struct.unpack(f"<{samples}h", compared),
                                       struct.unpack(f"<{samples}h", ref.stdout))]
     peak = max(errors, default=0)
-    assert peak <= 8, peak
     result = dict(path=str(path), frames=len(frames), hz=hz, channels=channels,
         pcm_samples=len(pcm)//2, max_pcm16_difference=peak,
         pcm_sha256=hashlib.sha256(pcm).hexdigest(), reset_and_failure_checks=checks,
@@ -139,6 +170,8 @@ def check(lib, path, output):
         factory_player_connected=False, qemu_tested=False)
     (output / "report.json").write_text(json.dumps(result, indent=2)+"\n")
     print(json.dumps(result), flush=True)
+    # Preserve the comparison evidence even when its acceptance bound fails.
+    assert peak <= 8, peak
     return result
 
 

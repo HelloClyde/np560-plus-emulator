@@ -24,6 +24,7 @@ struct NP560NANDJournal {
     uint8_t *erased_block, erased_hash[32];
     uint32_t page_data, page_oob, pages, block_pages;
     uint64_t sequence, replayed, torn_bytes;
+    uint64_t noop_erases;
     uint64_t bytes, compact_at, compactions, reclaimed;
     char *maintenance_error;
 };
@@ -67,21 +68,28 @@ static bool reopen_journal(NP560NANDJournal *s)
 }
 #endif
 
-static void block_hash(NP560NANDJournal *s, uint32_t block, uint8_t *digest)
+static bool block_is_erased(const NP560NANDJournal *s, uint32_t block)
 {
     uint32_t page = block * s->block_pages;
     size_t data_length = (size_t)s->block_pages * s->page_data;
     size_t oob_length = (size_t)s->block_pages * s->page_oob;
+
+    return !memcmp(s->data + (size_t)page * s->page_data,
+                   s->erased_block, data_length) &&
+           !memcmp(s->oob + (size_t)page * s->page_oob,
+                   s->erased_block + data_length, oob_length);
+}
+
+static void block_hash(NP560NANDJournal *s, uint32_t block, uint8_t *digest)
+{
+    uint32_t page = block * s->block_pages;
     GChecksum *checksum;
     gsize length = 32;
 
     /* Native boot may erase thousands of already-erased blocks. Exact
      * memcmp + one cached SHA-256 avoids rehashing 512 MiB of identical FF
      * data during replay, without weakening equality to a short checksum. */
-    if (!memcmp(s->data + (size_t)page * s->page_data,
-                s->erased_block, data_length) &&
-        !memcmp(s->oob + (size_t)page * s->page_oob,
-                s->erased_block + data_length, oob_length)) {
+    if (block_is_erased(s, block)) {
         memcpy(digest, s->erased_hash, 32);
         return;
     }
@@ -623,6 +631,17 @@ bool np560_nand_journal_append(NP560NANDJournal *s, unsigned operation,
         error_setg(errp, "NP560 NAND journal refused invalid mutation");
         return false;
     }
+    /* Erasing an already-FF block changes neither NAND plane.  Preserve the
+     * guest's successful erase command, but do not issue a durable journal
+     * commit for a state transition that did not happen.  Native boot repeats
+     * tens of thousands of these on a host-mounted journal; each old record
+     * forced an fdatasync while guest virtual time was stopped.  Check both
+     * planes exactly, including OOB, before eliding the record. */
+    if (operation == NP560_JOURNAL_ERASE &&
+        block_is_erased(s, page / s->block_pages)) {
+        s->noop_erases++;
+        return true;
+    }
     if (s->bytes >= s->compact_at) {
         Error *local_err = NULL;
 
@@ -657,9 +676,10 @@ char *np560_nand_journal_state(const NP560NANDJournal *s)
         return g_strdup("disabled");
     }
     return g_strdup_printf("%s SEQUENCE=%" PRIu64 " REPLAYED=%" PRIu64
-                           " TORN_BYTES=%" PRIu64,
+                           " TORN_BYTES=%" PRIu64 " NOOP_ERASES=%" PRIu64,
                            s->failed ? "failed" : "durable",
-                           s->sequence, s->replayed, s->torn_bytes);
+                           s->sequence, s->replayed, s->torn_bytes,
+                           s->noop_erases);
 }
 
 void np560_nand_journal_close(NP560NANDJournal *s)

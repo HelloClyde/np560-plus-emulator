@@ -408,6 +408,22 @@ class NpeLoaderEventObserverTests(unittest.TestCase):
         self.assertIn(
             "trace_npe_game_control_write(env, addr", self.helper
         )
+        write_impl = self.helper.index(
+            "static inline QEMU_ALWAYS_INLINE void translated_data_write_impl"
+        )
+        control_call = self.helper.index(
+            "trace_npe_game_control_write(env, addr, actual_physical, value, bits);",
+            write_impl,
+        )
+        minimal_gate = self.helper.index("if (minimal) {", write_impl)
+        self.assertLess(control_call, minimal_gate)
+        self.assertEqual(
+            self.helper.count(
+                "trace_npe_game_control_write(env, addr, actual_physical, "
+                "value, bits);"
+            ),
+            1,
+        )
         self.assertNotIn(
             "npe_game_control_write_count = 0", self.helper
         )
@@ -435,6 +451,23 @@ class NpeLoaderEventObserverTests(unittest.TestCase):
             "OP1:%u/%u/F%u/R%u/N%u/I%u/X%u WRITES:%u TRACE:",
         ):
             self.assertIn(label, self.machine)
+
+    def test_load_branch_rom_call_trace_precedes_minimal_gate(self) -> None:
+        call_start = self.helper.index("if (op == 0xad || op == 0xbd) {")
+        minimal_gate = self.helper.index("if (minimal) {", call_start)
+        observer = self.helper[call_start:minimal_gate]
+        for evidence in (
+            "dmcu_code_address(0x1d, 0x8f96)",
+            "dmcu_code_address(0x03, 0x4224)",
+            "DMCU_NPE_LOAD_ROM_TRACE_SLOTS",
+            "npe_load_rom_call_count++",
+        ):
+            self.assertIn(evidence, observer)
+        for mutator in ("internal_data_write", "address_space_st",
+                        "address_space_write", "cpu_physical_memory_write"):
+            self.assertNotIn(mutator, observer)
+        self.assertIn("NPE_LOAD_ROM=ACTIVE:%u", self.machine)
+        self.assertIn("env->npe_load_branch_active = false;", self.helper)
 
     def test_game_draw_boundary_and_dynamic_data_reads_are_read_only(self) -> None:
         self.assertIn("DMCU_NPE_GAME_BRANCH_TRACE_SLOTS 16", self.cpu_header)

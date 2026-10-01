@@ -9,6 +9,7 @@ _test_sys.path.insert(0, str(_TestPath(__file__).resolve().parent))
 
 import argparse
 import json
+import re
 from pathlib import Path
 import struct
 import time
@@ -52,6 +53,36 @@ def main():
         finally:
             emu.close()
             assert emu.process.returncode == 0
+    # Reuse the SAME writable code and direct links across paused switches.
+    # No reset or host guest-memory writes may hide a stale translated helper.
+    loop = args.output/'key-slots-loop.prg'
+    # Detailed history records changed values, so alternate two candidates.
+    loop_words = words[:10] + [0x68f0, 0x87, 0xa8f0, 0x28d8, 0xd0f7]
+    loop.write_bytes(struct.pack('<%dH' % len(loop_words), *loop_words))
+    emu = Emulator(qemu=args.qemu, firmware=loop, start_paused=True, icount_shift=0)
+    try:
+        previous_candidates = previous_trace = 0
+        for minimal in (False, True, False, True):
+            emu.qmp.execute('qom-set', {'path':'/machine',
+                'property':'control-observers-minimal', 'value':minimal})
+            emu.qmp.execute('cont')
+            time.sleep(.1)
+            emu.qmp.execute('stop')
+            status = emu.key_status()
+            cpu = emu.qmp.execute('qom-get', {'path':'/machine', 'property':'cpu-state'})
+            trace = int(re.search(r'SELECTOR_STATE_WRITES=COUNT:(\d+)', cpu)[1])
+            assert not status['faulted'], cpu[:700]
+            assert status['candidates'] > previous_candidates, status
+            assert status['full_control_observers'] == (not minimal), status
+            assert (trace == previous_trace if minimal else trace > previous_trace), (
+                minimal, previous_trace, trace)
+            results.append(dict(same_process_switch=minimal,
+                candidate_delta=status['candidates']-previous_candidates,
+                trace_delta=trace-previous_trace, passed=True))
+            previous_candidates, previous_trace = status['candidates'], trace
+    finally:
+        emu.close()
+        assert emu.process.returncode == 0
     assert identity == artifact_identity(args.qemu)[1]
     report = dict(passed=True, qemu_sha256=identity, cases=results,
                   scope='guest slot writes / observer contract, not physical key scanning')

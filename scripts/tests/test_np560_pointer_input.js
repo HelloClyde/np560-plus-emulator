@@ -61,8 +61,8 @@ function fixture() {
   sandbox.bindKeyButton(button);
   return {
     sent, timers, captures, sandbox,
-    press() { return handlers.get("pointerdown")({ pointerId: 1, preventDefault() {} }); },
-    release() { return handlers.get("pointerup")({ pointerId: 1, preventDefault() {} }); },
+    press(overrides = {}) { return handlers.get("pointerdown")({ pointerId: 1, button: 0, pointerType: "mouse", preventDefault() {}, ...overrides }); },
+    release(overrides = {}) { return handlers.get("pointerup")({ pointerId: 1, button: 0, pointerType: "mouse", preventDefault() {}, ...overrides }); },
     ack(value = { applied: true }) { pending.shift().resolve(value); },
     fail() { pending.shift().reject(new Error("transport lost")); },
     blur() { sandbox.releaseAllKeys(false); },
@@ -79,6 +79,25 @@ const flush = async () => { for (let i = 0; i < 6; ++i) await Promise.resolve();
 const released = f => f.sent.at(-1).payload.matrix_low === 0;
 
 async function main() {
+  {
+    const f = fixture();
+    for (const button of [1, 2, 3, 4]) f.press({ button });
+    f.press({ pointerType: "pen", button: 2 });
+    assert.equal(f.sent.length, 0, "context/auxiliary clicks must not press a guest key");
+    assert.equal(f.captures.length, 0);
+  }
+  {
+    const f = fixture();
+    f.press({ pointerType: "touch", isPrimary: true });
+    f.ack(); await flush();
+    f.press({ pointerType: "touch", isPrimary: false, pointerId: 2 });
+    await flush();
+    f.advance(200);
+    await f.release({ pointerType: "touch" });
+    assert.equal(released(f), false, "second finger must retain the shared physical key");
+    await f.release({ pointerType: "touch", pointerId: 2 });
+    assert.equal(released(f), true);
+  }
   {
     const f = fixture();
     f.press(); f.advance(5); const release = f.release();

@@ -6,6 +6,7 @@
 #include "qemu/main-loop.h"
 #include "cpu.h"
 #include "decode.h"
+#include "clock-internal.h"
 #include "observer-sites.h"
 #include "exec/exec-all.h"
 #include "exec/tb-flush.h"
@@ -2579,7 +2580,7 @@ static inline QEMU_ALWAYS_INLINE uint32_t translated_data_read_impl(
      * after that read produced the odd word 4D31.  Log both ends of this
      * calculation, without substituting either value, so a single natural
      * boot distinguishes state corruption from DS/bus translation damage.
-     * HELPER(exec) has already advanced env->pc to the next instruction.
+     * The executor helper has already advanced env->pc to the next instruction.
      */
     if (pc == 0x277fb0u && modal_dispatch_index_reads < 256) {
         uint32_t actual_physical =
@@ -2664,7 +2665,7 @@ static inline QEMU_ALWAYS_INLINE uint32_t translated_data_read_impl(
      * initializer visibly populates 51:27C2, while an empty return here makes
      * every native resource open fail with FFFE before touching NAND data.
      */
-    /* HELPER(exec) advances env->pc before performing the operand access, so
+    /* The executor helper advances env->pc before performing the operand access, so
      * match the next-PC values for both words of each far-pointer load. */
     if ((pc == 0x1f1fe8u || pc == 0x1f1fecu ||
          pc == 0x1f1ffau || pc == 0x1f1ffcu) &&
@@ -3409,6 +3410,19 @@ static inline QEMU_ALWAYS_INLINE void translated_data_write_impl(
         env->matrix_event_last = value & MASK16;
     }
 
+    /* Keep the three exact NPE control-word provenance points visible in
+     * minimal mode.  This adds no bus read for ordinary stores; the helper
+     * samples the old value only when the pending store overlaps a watched
+     * word.  Full and minimal observers must report the same guest writes. */
+    if (unlikely((actual_physical < 0x527936u &&
+                  actual_physical + bits / 8u > 0x527934u) ||
+                 (actual_physical < 0x527a52u &&
+                  actual_physical + bits / 8u > 0x527a50u) ||
+                 (actual_physical < 0x527ab6u &&
+                  actual_physical + bits / 8u > 0x527ab4u))) {
+        trace_npe_game_control_write(env, addr, actual_physical, value, bits);
+    }
+
     /* The optional provenance below must not add debug bus reads to normal
      * execution. Retain IRQ corruption checks, the real store and the
      * executable overlay mirror, irrespective of observer configuration. */
@@ -3492,7 +3506,6 @@ static inline QEMU_ALWAYS_INLINE void translated_data_write_impl(
     trace_npe_game_table_write(env, actual_physical, value, bits);
     trace_npe_game_grid_write(env, actual_physical, value, bits);
     trace_npe_game_state_write(env, addr, actual_physical, value, bits);
-    trace_npe_game_control_write(env, addr, actual_physical, value, bits);
     npe_game_data_write_slot = trace_npe_game_data_write_begin(
         env, addr, actual_physical, value, bits);
 
@@ -8347,6 +8360,41 @@ static void trace_control_transfer(CPUDMCUState *env, uint32_t from,
         trace_control_minimal(env, from, sequential, word, ext, sp, fp);
         return;
     }
+    /* Opt-in, bounded clock-editor raster evidence. Read RAM only; no guest
+     * state changes. Enabled only with full observers AND guest_errors log. */
+    if (qemu_loglevel_mask(LOG_GUEST_ERROR)) {
+        static unsigned clock_editor_raster_logs;
+        uint32_t to = env->pc & MASK24;
+        bool text_stage = from == 0x277e84u || from == 0x2781b6u ||
+                          to == 0x2781bau;
+        bool editor_stage = to == 0x174b48u || to == 0x174b58u ||
+                            to == 0x174b5eu || to == 0x174c14u ||
+                            to == 0x174caau || to == 0x174cdcu ||
+                            to == 0x174ce0u;
+
+        if (clock_editor_raster_logs < 32 && (text_stage || editor_stage)) {
+            unsigned buffer, x, y;
+            uint32_t pointer = ((uint32_t)internal_data_read(0x04fcu, 16) << 16) |
+                               internal_data_read(0x04feu, 16);
+            for (buffer = 0; buffer < 2; buffer++) {
+                GString *pixels = g_string_sized_new(1280);
+                for (y = 38; y < 58; y++) {
+                    for (x = 110; x < 174; x++) {
+                        g_string_append_c(pixels, "0123456789abcdef"[
+                            clock_raster_pixel(buffer ? 0x503840u : 0x500000u, x, y)]);
+                    }
+                }
+                qemu_log_mask(LOG_GUEST_ERROR,
+                    "CLOCK_EDITOR_RASTER #%u %06x>%06x b%u ptr%06x mode%04x masks%04x,%04x pixels=%s\n",
+                    clock_editor_raster_logs, from & MASK24, to, buffer, pointer,
+                    internal_data_read(0x4bb0u, 16),
+                    internal_data_read(0x4ba8u, 16),
+                    internal_data_read(0x4baeu, 16), pixels->str);
+                g_string_free(pixels, true);
+            }
+            clock_editor_raster_logs++;
+        }
+    }
     static unsigned timer_idle_bad_leaf_entry_logs;
     static unsigned object_callback_entries;
     static unsigned object_callback_returns;
@@ -9682,6 +9730,19 @@ static void trace_control_transfer(CPUDMCUState *env, uint32_t from,
      * operation-seven UI plus first mode-one update/draw closure.  Arming at
      * 2F:B726 retains loader-time stream access; every checkpoint remains
      * observer-only and never redirects control or changes guest state. */
+    /* This bounded diagnostic may be enabled after game loading.  Do not
+     * depend on the loader-time arming flag used by the older trace below. */
+    if (!env->in_interrupt &&
+        ((target & MASK24) == dmcu_code_address(0x1d, 0x0764) ||
+         (target & MASK24) == dmcu_code_address(0x1e, 0x1466))) {
+        static unsigned movement_decision_logs;
+        if (movement_decision_logs < 32 && qemu_loglevel_mask(LOG_GUEST_ERROR)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "DMCU movement decision #%u from=%06x to=%06x r0=%04x\n",
+                          ++movement_decision_logs, from & MASK24, target & MASK24,
+                          env->gpr[0] & MASK16);
+        }
+    }
     if (env->npe_game_trace_armed && !env->in_interrupt) {
         static const uint16_t frame_clear_child_call_pc[8] = {
             0x5c78, 0x5c92, 0x5d4a, 0x5d84,
@@ -18307,6 +18368,72 @@ static inline QEMU_ALWAYS_INLINE bool exec_control_impl(
     }
     if (op == 0xad || op == 0xbd) {
         target = dmcu_code_address(arg, ext);
+        if (op == 0xbd && start == dmcu_code_address(0x1d, 0x8f96) &&
+            target == dmcu_code_address(0x03, 0x4224)) {
+            static const uint32_t flag_addresses[] = {
+                0x527a38u, 0x527a36u, 0x527a34u,
+            };
+            unsigned flag;
+
+            env->npe_load_branch_entries++;
+            env->npe_load_branch_active = true;
+            env->npe_load_slot = address_space_ldub(
+                &address_space_memory, 0x527a7au,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+            for (flag = 0; flag < ARRAY_SIZE(flag_addresses); flag++) {
+                env->npe_load_slot_flags[flag] = address_space_lduw_le(
+                    &address_space_memory, flag_addresses[flag],
+                    MEMTXATTRS_UNSPECIFIED, NULL);
+            }
+            env->npe_load_trigger_before = address_space_lduw_le(
+                &address_space_memory, 0x527ab4u,
+                MEMTXATTRS_UNSPECIFIED, NULL);
+        }
+        if (env->npe_load_branch_active &&
+            (dmcu_code_segment(target) == 0x01 ||
+             dmcu_code_segment(target) == 0x02)) {
+            uint32_t slot;
+
+            env->npe_load_rom_call_count++;
+            for (slot = 0; slot < env->npe_load_rom_unique_count &&
+                           slot < DMCU_NPE_LOAD_ROM_TRACE_SLOTS; slot++) {
+                if (env->npe_load_rom_call_target[slot] == target &&
+                    env->npe_load_rom_call_op[slot] == op) {
+                    break;
+                }
+            }
+            if (slot == env->npe_load_rom_unique_count) {
+                env->npe_load_rom_unique_count++;
+                if (slot < DMCU_NPE_LOAD_ROM_TRACE_SLOTS) {
+                    env->npe_load_rom_call_from[slot] = start & MASK24;
+                    env->npe_load_rom_call_target[slot] = target & MASK24;
+                    env->npe_load_rom_call_op[slot] = op;
+                }
+            }
+            if (slot < DMCU_NPE_LOAD_ROM_TRACE_SLOTS) {
+                env->npe_load_rom_call_hits[slot]++;
+            }
+        }
+        /* Player resources enter through the original 32:13E8 SJMP thunk.
+         * Opt-in tracing must observe that tail entry too, without pushing
+         * a return address or changing the original stack in any way. */
+        if (!minimal && env->resource_trace_all && op == 0xad &&
+            target == dmcu_code_address(0x2e, 0x0af6)) {
+            uint32_t index = env->root_resource_trace_count++;
+
+            env->root_resource_trace_active = 0;
+            if (index < DMCU_ROOT_RESOURCE_TRACE_SLOTS) {
+                unsigned argument;
+
+                env->root_resource_trace_active = index + 1u;
+                env->root_resource_trace_caller[index] = start & MASK24;
+                env->root_resource_trace_stage[index] = 1u;
+                for (argument = 0; argument < 4; argument++) {
+                    env->root_resource_trace_args[index][argument] =
+                        rom_argument(env, argument + 2) & MASK16;
+                }
+            }
+        }
         if (op == 0xbd) {
             bool target_is_vma03_program =
                 env_archcpu(env)->reset_pc == 0x00030000u &&
@@ -18843,7 +18970,7 @@ static inline QEMU_ALWAYS_INLINE bool exec_control_impl(
                     text_dispatch_logs++;
                 }
             }
-            if (env->root_entry_frame_valid &&
+            if ((env->root_entry_frame_valid || env->resource_trace_all) &&
                 target == dmcu_code_address(0x2e, 0x0af6)) {
                 uint32_t index = env->root_resource_trace_count++;
 
@@ -19499,6 +19626,19 @@ required_far_call_services:
             }
 perform_far_return:
             env->pc = far_return_pop(env);
+            if (env->npe_load_branch_active &&
+                env->pc == dmcu_code_address(0x1d, 0x9066)) {
+                env->npe_load_read_returns++;
+                env->npe_load_read_result = env->gpr[0] & MASK16;
+            }
+            if (env->npe_load_branch_active &&
+                start == dmcu_code_address(0x1d, 0x9150)) {
+                env->npe_load_branch_exits++;
+                env->npe_load_branch_active = false;
+                env->npe_load_trigger_after = address_space_lduw_le(
+                    &address_space_memory, 0x527ab4u,
+                    MEMTXATTRS_UNSPECIFIED, NULL);
+            }
             if (start == dmcu_code_address(0x29, 0x4094)) {
                 qemu_log_mask(
                     LOG_UNIMP,
@@ -19880,6 +20020,14 @@ static bool exec_compare_update(CPUDMCUState *env, uint8_t op,
     case 0x7f: case 0x9f: delta = 2; break;
     default: return false;
     }
+
+    /* Immediate compare/update is one device-register transaction, like
+     * immediate ALU. Keep the counter/ICR value stable until writeback.
+     * Memory forms must not carry BQL into the soft-MMU access; MMIO owns
+     * that lock, while individual SFR callbacks remain synchronized. */
+    g_autoptr(IOThreadLockAuto) compare_device_lock =
+        (op >= 0x6e && op <= 0x7f && dmcu_sfr_has_timing(arg)) ?
+        qemu_iothread_auto_lock(__FILE__, __LINE__) : NULL;
 
     if (op < 0x60) {
         left = reg_read(env, arg >> 4, 16);
@@ -22791,7 +22939,7 @@ execute_architecture:
         unsupported(env, start, word0);
     }
 
-    {
+    if (unlikely(agu_pointers & ((1u << 8) | (1u << 10) | (1u << 14)))) {
         uint32_t pointers = agu_pointers;
         static const unsigned known_agu[] = { 8, 10, 14 };
 
@@ -24170,28 +24318,18 @@ required_stack_checks:
     return env->pc == next ? DMCU_EXEC_NEXT : DMCU_EXEC_LOOKUP;
 }
 
-/* Constant specialization keeps optional history's large stack frame and
- * register spills out of the normal executor, without maintaining two CPU
- * implementations. Both variants share the exact instruction semantics. */
-static __attribute__((noinline)) uint32_t dmcu_exec_minimal(CPUDMCUState *env,
-                                  uint32_t word0, uint32_t word1,
-                                  uint32_t metadata)
+/* Select the observer mode when translating a TB. Both helpers specialize
+ * the same instruction semantics without a mode dispatch on every guest
+ * instruction; the machine property setter flushes translated TBs. */
+uint32_t HELPER(exec_minimal)(CPUDMCUState *env, uint32_t word0,
+                              uint32_t word1, uint32_t metadata)
 {
     return dmcu_exec_impl(env, word0, word1, metadata, true);
 }
 
-static __attribute__((noinline)) uint32_t dmcu_exec_full(CPUDMCUState *env,
-                               uint32_t word0, uint32_t word1)
+uint32_t HELPER(exec_full)(CPUDMCUState *env, uint32_t word0, uint32_t word1)
 {
     return dmcu_exec_impl(env, word0, word1, 0, false);
-}
-
-uint32_t HELPER(exec)(CPUDMCUState *env, uint32_t word0, uint32_t word1,
-                      uint32_t metadata)
-{
-    return env->control_observers_minimal ?
-        dmcu_exec_minimal(env, word0, word1, metadata) :
-        dmcu_exec_full(env, word0, word1);
 }
 
 hwaddr dmcu_cpu_get_phys_page_debug(CPUState *cs, vaddr addr)

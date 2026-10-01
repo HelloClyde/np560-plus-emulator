@@ -15,6 +15,21 @@ from scripts import inject_np560_npe_fat16 as fat
 
 
 class NpeFat16ImportTests(unittest.TestCase):
+    def test_default_fixture_is_tianjiang_with_valid_short_name(self) -> None:
+        self.assertEqual(fat.DEFAULT_NPE.name, "天降风云V1.3.npe")
+        self.assertEqual(
+            fat.game_stem_for_import(fat.DEFAULT_NPE, None), "天降风云",
+        )
+        self.assertEqual(len(fat.encode_short_name("天降风云", "NPE")), 11)
+        self.assertEqual(
+            fat.game_stem_for_import(_TestPath("英雄传奇.npe"), None),
+            "英雄传奇",
+        )
+        self.assertEqual(
+            fat.game_stem_for_import(fat.DEFAULT_NPE, "测试游戏"),
+            "测试游戏",
+        )
+
     def test_logical_sector_mapping_matches_recovered_factory_locations(self) -> None:
         self.assertEqual(fat.logical_block_and_sector(1), (0, 0x21))
         self.assertEqual(fat.logical_block_and_sector(223), (0, 0xFF))

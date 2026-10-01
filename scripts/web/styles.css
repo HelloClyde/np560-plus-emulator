@@ -89,6 +89,8 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .keyboard { display: grid; grid-template-columns: repeat(10, 1fr); gap: .28rem; }
 .keyboard button { min-width: 0; padding: .42rem .1rem; font-size: .76rem; }
 .keyboard .wide { grid-column: span 2; }
+.matrix-keyboard { grid-template-columns: repeat(8, minmax(0, 1fr)); }
+.input-deck .matrix-keyboard [data-matrix-index]::after { content: none; }
 .input-deck [data-matrix-index] { position: relative; padding-bottom: 1rem; }
 .input-deck [data-matrix-index]::after {
   content: "M" attr(data-matrix-index);

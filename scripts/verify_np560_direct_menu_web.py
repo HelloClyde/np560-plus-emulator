@@ -14,11 +14,13 @@ import hashlib
 import json
 import re
 import struct
+import sys
 import time
 from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "tests"))
 from test_np560_system_boot import (
     application_calls,
     require_bottom_up_lcd_rows,

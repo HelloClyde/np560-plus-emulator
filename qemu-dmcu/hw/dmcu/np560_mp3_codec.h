@@ -12,6 +12,15 @@
  */
 typedef struct NP560MP3Codec NP560MP3Codec;
 
+/* Read-only explanation of the last complete-frame NO_PCM result. This
+ * does not change its return status, consumed input or reservoir commit. */
+typedef struct NP560MP3NoPCMInfo {
+    uint32_t reason; /* 0 none, 1 invalid sideinfo, 2 missing history, 3 unknown */
+    uint32_t available_history, required_history;
+} NP560MP3NoPCMInfo;
+
+NP560MP3NoPCMInfo np560_mp3_codec_no_pcm_info(const NP560MP3Codec *codec);
+
 typedef enum NP560MP3Status {
     NP560_MP3_OK,
     NP560_MP3_SHORT,
@@ -34,6 +43,9 @@ typedef struct NP560MP3Frame {
 NP560MP3Codec *np560_mp3_codec_new(void);
 void np560_mp3_codec_free(NP560MP3Codec *codec);
 void np560_mp3_codec_reset(NP560MP3Codec *codec);
+/* Exactly one framed packet. Surplus bytes are a DECODE_ERROR, not a
+ * request to consume only the first frame; history stays unchanged and the
+ * output frame is empty on rejection. Stream splitting belongs to the caller. */
 NP560MP3Status np560_mp3_codec_decode(NP560MP3Codec *codec,
                                      const uint8_t *input, size_t length,
                                      NP560MP3Frame *frame);

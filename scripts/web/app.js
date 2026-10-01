@@ -19,7 +19,11 @@ const audioToggle = document.getElementById("audio-toggle");
 const audioStatus = document.getElementById("audio-status");
 const audioOutput = new NP560AudioOutput.AudioOutput({
   fetchJSON: (url, options) => api(url, options),
-  onStatus: message => { audioStatus.textContent = message; }
+  onStatus: message => { audioStatus.textContent = message; },
+  onEnabledChange: enabled => {
+    audioToggle.textContent = enabled ? "关闭声音" : "启用声音";
+    audioToggle.setAttribute("aria-pressed", String(enabled));
+  }
 });
 audioToggle.addEventListener("click", async () => {
   audioToggle.disabled = true;
@@ -30,8 +34,6 @@ audioToggle.addEventListener("click", async () => {
     audioStatus.textContent = `声音不可用：${error.message}`;
   } finally {
     audioToggle.disabled = false;
-    audioToggle.textContent = audioOutput.enabled ? "关闭声音" : "启用声音";
-    audioToggle.setAttribute("aria-pressed", String(audioOutput.enabled));
   }
 });
 window.addEventListener("pagehide", () => audioOutput.stop());
@@ -51,7 +53,7 @@ const matrixIndexes = {
   O: 48, L: 49, P: 56,
   "1": 2, "2": 3, "3": 0, "4": 8, "5": 16,
   "6": 24, "7": 32, "8": 40, "9": 48, "0": 56,
-  ",": 20, ".": 54, " ": 54,
+  ",": 20, ".": 54, " ": 54, "'": 28,
   // Original MP3 controls: 0E:992E dispatches E2 to the file picker,
   // E1 to the track list, and EA to settings; 0D:555A handles 8E exit.
   // The skin labels those actions F1..F4. In the normal/lowercase modes:
@@ -72,6 +74,11 @@ const matrixIndexes = {
   ArrowLeft: 45, Escape: 28, Backspace: 28,
   ArrowRight: 29, Enter: 53
 };
+// Raw switches expose the complete hardware matrix without inventing names
+// for side keys. These are pointer controls only, not PC keyboard bindings.
+for (let index = 0; index < 64; index += 1) {
+  matrixIndexes[`Matrix${String(index).padStart(2, "0")}`] = index;
+}
 // Original TBC=8009 runs at 64 Hz. 08:40D0 makes the keyboard worker eligible
 // after four ticks, and 31:BE70 requires two scans for a new physical key:
 // nominally up to 125 ms depending on phase (busy guest code can delay it).
@@ -86,6 +93,8 @@ const keyLeaseId = typeof globalThis.crypto?.randomUUID === "function"
   : `web-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 let keyRequestQueue = Promise.resolve();
 let keyPayloadGeneration = 0;
+// Transport acknowledgements are distinct from guest scan/consumption.
+const keyTransportHistory = [];
 let backendReleasePending = false;
 let releaseRequestsInFlight = 0;
 let keyHeartbeatInFlight = false;
@@ -281,38 +290,118 @@ function payloadIsReleased(payload) {
     payload.matrix_low === 0 && payload.matrix_high === 0;
 }
 
+async function downloadKeyDiagnostic() {
+  const button = document.getElementById("download-key-diagnostic");
+  const message = document.getElementById("key-diagnostic-status");
+  if (button.disabled) return;
+  button.disabled = true;
+  message.textContent = "正在读取…";
+  let url;
+  let link;
+  try {
+    const startedAt = new Date().toISOString();
+    const inputPolicy = {
+      keyboard_minimum_host_ms: keyboardShortTap?.checked ? 150 : 0,
+      pointer_minimum_host_ms: minimumPointerHoldMs,
+      lease_ms: keyLeaseMs,
+      note: "Policy at capture start, not historical per-contact settings. Minimum intervals use host time after request completion; they do not guarantee guest scan/debounce acceptance.",
+    };
+    const held = Array.from(keyboardInput.heldCodes(), code => ({
+      code, matrix: matrixIndexes[code],
+    }));
+    const transitions = keyboardInput.recentTransitions();
+    const transport = keyTransportHistory.map(entry => ({ ...entry }));
+    const before = await api("/api/key-status");
+    const lcd = await api("/api/state?source=lcd");
+    const after = await api("/api/key-status");
+    const report = {
+      schema: "np560-key-diagnostic-v1", started_at: startedAt,
+      finished_at: new Date().toISOString(),
+      note: "Sequential read-only snapshots, not atomic. Counters are cumulative; no per-key attribution.",
+      held_at_start: held, matrix_mapping: matrixIndexes,
+      input_policy_at_start: inputPolicy,
+      frontend_submissions_at_start: transitions,
+      transport_at_start: transport,
+      transport_note: "Last 128 queued key requests: server acceptance is not guest consumption. Emergency beacons and heartbeat requests are not included. Reload clears history.",
+      frontend_submissions_note: "Last 128 local matrix submission intents, not transport ACKs or guest events. source identifies the triggering control; held_sources lists active controls. Alias changes without a matrix change are not submissions. May start mid-contact; reload clears history.",
+      key_status_before: before, lcd, key_status_after: after,
+    };
+    url = URL.createObjectURL(new Blob([JSON.stringify(report, null, 2)],
+      { type: "application/json" }));
+    link = document.createElement("a");
+    link.href = url;
+    link.download = `np560-keys-${startedAt.replace(/[:.]/g, "-")}.json`;
+    document.body.appendChild(link);
+    link.click();
+    message.textContent = "已请求下载；请附上页面、按键顺序及预期结果。";
+  } catch (error) {
+    message.textContent = `诊断读取失败：${error.message}`;
+  } finally {
+    if (link) link.remove();
+    if (url) setTimeout(() => URL.revokeObjectURL(url), 1000);
+    button.disabled = false;
+  }
+}
+
+document.getElementById("download-key-diagnostic")?.addEventListener("click", downloadKeyDiagnostic);
+
 function updatePressedButtons(heldCodes) {
+  const heldIndexes = new Set(Array.from(heldCodes, code => matrixIndexes[code]));
   document.querySelectorAll("[data-key]").forEach(button => {
-    button.classList.toggle("is-pressed", heldCodes.has(button.dataset.key));
-    button.setAttribute("aria-pressed", heldCodes.has(button.dataset.key) ? "true" : "false");
+    const pressed = heldIndexes.has(matrixIndexes[button.dataset.key]);
+    button.classList.toggle("is-pressed", pressed);
+    button.setAttribute("aria-pressed", pressed ? "true" : "false");
   });
 }
 
 function queueKeyPayload(payload, keepalive = false) {
   const generation = ++keyPayloadGeneration;
+  const trace = {
+    generation, queued_at_ms: Date.now(), sent_at_ms: null,
+    completed_at_ms: null, outcome: "queued", ...payload,
+  };
+  keyTransportHistory.push(trace);
+  if (keyTransportHistory.length > 128) keyTransportHistory.shift();
   const released = payloadIsReleased(payload);
   if (released) releaseRequestsInFlight += 1;
   backendReleasePending = true;
-  const request = keyRequestQueue.catch(() => {}).then(() => api("/api/key", {
+  const request = keyRequestQueue.catch(() => {}).then(() => {
+    trace.sent_at_ms = Date.now();
+    trace.outcome = "pending";
+    return api("/api/key", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       ...payload, lease_id: keyLeaseId, lease_ms: keyLeaseMs,
     }),
     keepalive,
-  }));
+    });
+  });
   keyRequestQueue = request;
   void request.then(result => {
+    // A valid JSON response is not necessarily an ACK object (e.g. null).
+    // Keep malformed replies unconfirmed without stranding the release
+    // counter inside this detached completion handler.
+    const applied = result && typeof result === "object" && !Array.isArray(result)
+      ? result.applied : undefined;
+    trace.completed_at_ms = Date.now();
+    trace.outcome = applied === true ? "accepted"
+      : applied === false ? "rejected" : "unconfirmed";
     if (generation === keyPayloadGeneration) {
       // A different live page may still own the server-side lease.  Keep a
       // rejected make locally held so maintainKeyLease() can retry it after
       // that lease expires; a rejected break belongs to this stale page and
       // needs no further synchronization.
-      keyLeaseAccepted = !released && result.applied !== false;
-      backendReleasePending = !released;
+      // Only an explicit ACK proves ownership. An incomplete reply to a
+      // break cannot prove release either; keep it eligible for retry.
+      keyLeaseAccepted = !released && applied === true;
+      backendReleasePending = !released ||
+        (applied !== true && applied !== false);
     }
     if (released) releaseRequestsInFlight -= 1;
   }, error => {
+    trace.completed_at_ms = Date.now();
+    trace.outcome = "error";
     if (generation === keyPayloadGeneration) keyLeaseAccepted = false;
     if (released) releaseRequestsInFlight -= 1;
     statusText.textContent = error.message;
@@ -337,6 +426,7 @@ function clearPointerReleaseTimers() {
 
 function releaseAllKeys(force = false) {
   clearPointerReleaseTimers();
+  if (typeof keyboardContact !== "undefined") keyboardContact.cancelAll();
   return keyboardInput.releaseAll(force);
 }
 
@@ -399,6 +489,7 @@ async function maintainKeyLease() {
 
 let lastDiagnosticsPoll = -Infinity;
 let latestRegisters = "";
+let fastDisplayAvailable = true;
 async function poll() {
   if (polling) return;
   polling = true;
@@ -407,13 +498,29 @@ async function poll() {
     let query = settings.source === "lcd" ? "" :
       `?source=memory&base=${settings.base}&size=${size}`;
     const diagnosticsDue = performance.now() - lastDiagnosticsPoll >= 2000;
+    const displayOnly = settings.source === "lcd" && !diagnosticsDue && fastDisplayAvailable;
     if (!diagnosticsDue) query += `${query ? "&" : "?"}diagnostics=0`;
-    const state = await api(`/api/state${query}`);
+    let state;
+    let usedDisplayOnly = displayOnly;
+    if (displayOnly) {
+      try {
+        state = await api("/api/display");
+      } catch (_) {
+        // Pages served by an already-running older bridge still need to work
+        // after app.js is updated on disk. Fall back once to its full API.
+        fastDisplayAvailable = false;
+        usedDisplayOnly = false;
+        state = await api(`/api/state${query}`);
+      }
+    } else {
+      state = await api(`/api/state${query}`);
+    }
     if (diagnosticsDue) lastDiagnosticsPoll = performance.now();
     synchronizeReleasedBackend();
     const raw = atob(state.frame);
     const bytes = Uint8Array.from(raw, character => character.charCodeAt(0));
     drawFrame(bytes, state);
+    if (usedDisplayOnly) return;
     if (state.registers !== null && state.registers !== undefined) {
       latestRegisters = state.registers;
       registerView.textContent = latestRegisters || "没有寄存器数据";
@@ -453,7 +560,9 @@ function buildKeyboard() {
     ["Z", "X", "C", "V", "B", "N", "M", ",", ".", "Escape"],
     ["Tab", "PageUp", " ", "PageDown", "Enter"]
   ];
-  const labels = { Backspace: "退格", Escape: "返回", Tab: "切换", PageUp: "上页", PageDown: "下页", " ": "空格", Enter: "确认" };
+  // Host shortcuts can share one matrix switch; do not advertise them as
+  // independent guest functions. The firmware/game decides the action.
+  const labels = { Backspace: "退格 / Esc 同键", Escape: "Esc", Tab: "Tab / 下同键", PageUp: "PgUp / 上同键", PageDown: "PgDn / 下同键", " ": "空格 / 点号同键", Enter: "确认" };
   const keyboard = document.getElementById("keyboard");
   for (const key of rows.flat()) {
     const button = document.createElement("button");
@@ -464,6 +573,18 @@ function buildKeyboard() {
     button.title = `${button.textContent} · 实体矩阵 M${button.dataset.matrixIndex}`;
     button.setAttribute("aria-pressed", "false");
     if (["Backspace", "Escape", "Tab", "PageUp", "PageDown", " ", "Enter"].includes(key)) button.classList.add("wide");
+    keyboard.appendChild(button);
+  }
+}
+
+function buildRawMatrixKeyboard() {
+  const keyboard = document.getElementById("matrix-keyboard");
+  for (let index = 0; index < 64; index += 1) {
+    const number = String(index).padStart(2, "0");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.dataset.key = `Matrix${number}`;
+    button.textContent = `M${number}`;
     keyboard.appendChild(button);
   }
 }
@@ -484,6 +605,10 @@ function bindKeyButton(button) {
     keyboardInput.release(sourceName);
   };
   const press = event => {
+    // Only the normal contact activates a key, not mouse context/auxiliary
+    // buttons or a pen barrel button. Do not filter isPrimary: a second
+    // touch must remain available for multi-finger game controls.
+    if (event.button !== 0) return;
     event.preventDefault();
     const sourceName = source(event);
     if (pointerReleaseTimers.has(sourceName)) {
@@ -536,6 +661,7 @@ function bindKeyButton(button) {
 }
 
 buildKeyboard();
+buildRawMatrixKeyboard();
 document.querySelectorAll("[data-key]").forEach(bindKeyButton);
 document.getElementById("frame-settings").addEventListener("submit", event => {
   try { applySettings(event); } catch (error) { statusText.textContent = error.message; }
@@ -575,25 +701,33 @@ function keyboardSource(event) {
   return `keyboard:${event.code || event.key}`;
 }
 
+const keyboardContact = new NP560KeyboardInput.MinimumKeyboardContact(
+  keyboardInput, () => keyRequestQueue);
+const keyboardShortTap = document.getElementById("keyboard-short-tap");
+keyboardShortTap?.addEventListener("change", () => releaseAllKeys(false));
+
 function editableTarget(target) {
-  return target instanceof Element && Boolean(target.closest(
-    "input, select, textarea, [contenteditable='true']"
+  return target instanceof Element && (target.isContentEditable || Boolean(
+    target.closest("input, select, textarea")
   ));
 }
 
 window.addEventListener("keydown", event => {
+  // IME composition is text input, not a physical guest key. Some browsers
+  // report the composition boundary with keyCode 229 before isComposing.
+  if (event.isComposing || event.keyCode === 229) return;
   if (editableTarget(event.target) || event.ctrlKey || event.metaKey || event.altKey) return;
   const code = normalizeKeyboardEvent(event);
   if (!keyboardInput.isMapped(code)) return;
   event.preventDefault();
   if (event.repeat) return;
-  keyboardInput.press(keyboardSource(event), code);
+  keyboardContact.press(keyboardSource(event), code, keyboardShortTap?.checked ? 150 : 0);
 });
 window.addEventListener("keyup", event => {
   const sourceName = keyboardSource(event);
   if (!keyboardInput.hasSource(sourceName)) return;
   event.preventDefault();
-  keyboardInput.release(sourceName);
+  keyboardContact.release(sourceName);
 });
 window.addEventListener("blur", () => { releaseAllKeys(false); });
 document.addEventListener("visibilitychange", () => {

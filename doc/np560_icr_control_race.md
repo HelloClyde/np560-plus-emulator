@@ -91,6 +91,25 @@ HLE calls=[3,19,18,0]，第二个 MPEG1 granule 仍待取出。
 不是应该修改核心锁断言或将新失败说成旧固件缺失。收窄到上述边界后再验证，
 初修构建不作为交付版本。
 
+## 2026-09-23：立即数比较后增减指令的事务锁
+
+检查 `exec_compare_update` 时发现 6E/6F/7E/7F 对设备 SFR 的读取和写回分别
+同步，但两者之间没有保持 BQL，与已修复的立即数 ALU 路径不一致。
+`test_np560_sfr_device_lock.py --compare-update` 在隔离客机运行这四种原始编码，
+在实际 `alu_sub` 计算处只读观察线程锁：旧核心四次均为 0；新增条件 guard 后
+四次均为 1。这证明事务锁范围的缺口，不等于已观测到某款游戏实际丢失事件。
+
+8E/8F/9E/9F 的内存操作数形式仍不在整个指令上持锁，四次计算处均为 0；
+设备 SFR 回调自身始终有锁，避免跨 cpu_ld/st 持锁造成 MMIO 递归获取 BQL。
+普通 GPR 形式和非设备 SFR 不增加锁。没有修改比较标志或增减语义。
+
+前后证据分别为 `tmp/np560-cmp-update-lock-20260923-before/report.json` 和
+`tmp/np560-cmp-update-lock-20260923-after/report.json`；
+原 ICR/ALU/位指令回归 `tmp/np560-cmp-update-icr-20260923-after/report.json` 通过。
+新核心 SHA256 `a5fafe2b0733a0f2adbf00344ff5d11a67b3479ffe67e916d51ee2b9eb8073c4`。
+GDB 检查只用于自建小型 guest，无 NAND、无宿主写 guest 状态；所有检查均正常结束。
+尚未将用户错键、音效缺失或其它现象归因于该处。
+
 ## 边界
 
 此修复关闭的是已观察到的宿主 ICR 控制位竞争。它不证明全部中断时序、所有采样率、

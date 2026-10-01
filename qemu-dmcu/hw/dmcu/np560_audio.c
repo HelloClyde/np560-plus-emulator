@@ -24,17 +24,46 @@ static bool np560_audio_enabled(NP560AudioState *s)
     return (s->control & 0x8001) == 1;
 }
 
+static void np560_audio_request_schedule(NP560AudioState *s)
+{
+    /* Accumulate the fractional nanoseconds across individual requests.
+     * A limit=1 ptimer truncates that fraction anew on every reload. Anchor
+     * to the previous deadline, not callback dispatch time, to avoid drift.
+     * The sum is floor(N * 1e9 / hz), with error strictly below 1 ns. */
+    uint64_t numerator = 1000000000ULL + s->request_fraction;
+
+    s->request_deadline_ns += numerator / s->request_hz;
+    s->request_fraction = numerator % s->request_hz;
+    timer_mod(s->request_timer, s->request_deadline_ns);
+}
+
 static void np560_audio_request_tick(void *opaque)
 {
     NP560AudioState *s = opaque;
     uint64_t before[2] = {s->sample_writes[0], s->sample_writes[1]};
+    int64_t deadline = s->request_deadline_ns;
     unsigned channel;
+
+    if (!s->request_running) {
+        return;
+    }
+    /* Arm before delivering requests: a device write during delivery may
+     * stop/reconfigure the clock and must win over this periodic reload. */
+    np560_audio_request_schedule(s);
 
     /* Both request lines belong to this one sample-clock event. Render
      * once before either DAC latches; host time spent handling channel 0
      * must not advance the presentation ring before channel 1. */
     np560_audio_sync(s);
     s->request_in_progress = true;
+    s->current_request_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    /* Observation only: instruction boundaries may dispatch a timer after
+     * its deadline. Never backdate DAC writes or relax presentation checks. */
+    s->request_last_deadline_ns = deadline;
+    s->request_last_lateness_ns = s->current_request_ns - deadline;
+    s->request_late_ticks += s->request_last_lateness_ns > 0;
+    s->request_max_lateness_ns = MAX(s->request_max_lateness_ns,
+                                    s->request_last_lateness_ns);
     s->request_ticks++;
     /* Original 24:9A1E routes REG61 to DTU0/F1E0 and REG60 to DTU1/F1E2.
      * Raise one latched request per channel, never copy a buffer or invoke
@@ -73,18 +102,14 @@ static void np560_audio_request_config(NP560AudioState *s)
     if (running == s->request_running && hz == s->request_hz) {
         return;
     }
-    ptimer_transaction_begin(s->request_timer);
-    ptimer_stop(s->request_timer);
-    if (hz) {
-        ptimer_set_freq(s->request_timer, hz);
-    }
-    ptimer_set_limit(s->request_timer, 1, 1);
-    if (running) {
-        ptimer_run(s->request_timer, 0);
-    }
+    timer_del(s->request_timer);
     s->request_hz = hz;
     s->request_running = running;
-    ptimer_transaction_commit(s->request_timer);
+    s->request_fraction = 0;
+    s->request_deadline_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (running) {
+        np560_audio_request_schedule(s);
+    }
 }
 
 static void np560_audio_sync(NP560AudioState *s)
@@ -146,6 +171,8 @@ static void np560_audio_control_event(NP560AudioState *s, unsigned reg,
     memcpy(event->writes, s->request_writes, sizeof(event->writes));
     memcpy(event->empty, s->request_without_write, sizeof(event->empty));
     memcpy(event->outside, s->writes_outside_request, sizeof(event->outside));
+    memcpy(event->last_request_ns, s->last_request_ns,
+           sizeof(event->last_request_ns));
 }
 
 void np560_audio_write(NP560AudioState *s, unsigned reg, uint16_t value)
@@ -154,10 +181,18 @@ void np560_audio_write(NP560AudioState *s, unsigned reg, uint16_t value)
      * value. CPU, banked/IGNDS MMIO, and DTU use this one device boundary. */
     np560_audio_sync(s);
     if (reg == DMCU_SFR_DAC0 || reg == DMCU_SFR_DAC1) {
+        uint16_t old_value = s->sample[reg - DMCU_SFR_DAC0];
+
         s->sample[reg - DMCU_SFR_DAC0] = value;
         s->sample_writes[reg - DMCU_SFR_DAC0]++;
         if (!s->request_in_progress) {
             s->writes_outside_request[reg - DMCU_SFR_DAC0]++;
+            /* Retain direct ramp writes, not every streamed PCM value.
+             * old_value and the most recent request-write time distinguish
+             * a short final hold from a sample never written to the DAC. */
+            np560_audio_control_event(s, reg, old_value, value);
+        } else {
+            s->last_request_ns[reg - DMCU_SFR_DAC0] = s->current_request_ns;
         }
     } else if (reg == DMCU_SFR_DACC) {
         uint16_t old_value = s->control;
@@ -191,18 +226,23 @@ void np560_audio_reset(void *opaque)
     s->sample[1] = s->cpu->env.sfr[DMCU_SFR_DAC1];
     s->control = s->cpu->env.sfr[DMCU_SFR_DACC];
     s->pll = s->cpu->env.sfr[DMCU_SFR_AUDIO_PLL];
-    ptimer_transaction_begin(s->request_timer);
-    ptimer_stop(s->request_timer);
-    ptimer_set_limit(s->request_timer, 1, 1);
-    ptimer_transaction_commit(s->request_timer);
+    timer_del(s->request_timer);
+    s->request_fraction = 0;
+    s->request_deadline_ns = s->epoch_ns;
     s->request_running = false;
     s->request_in_progress = false;
     s->request_hz = 0;
     s->request_ticks = 0;
+    s->request_late_ticks = 0;
+    s->request_last_deadline_ns = 0;
+    s->request_last_lateness_ns = 0;
+    s->request_max_lateness_ns = 0;
     memset(s->request_writes, 0, sizeof(s->request_writes));
     memset(s->request_without_write, 0, sizeof(s->request_without_write));
     memset(s->request_multiple_writes, 0, sizeof(s->request_multiple_writes));
     memset(s->writes_outside_request, 0, sizeof(s->writes_outside_request));
+    s->current_request_ns = 0;
+    memset(s->last_request_ns, 0, sizeof(s->last_request_ns));
     np560_audio_request_config(s);
     timer_mod(s->timer, s->epoch_ns + NP560_AUDIO_TICK_NS);
 }
@@ -210,9 +250,8 @@ void np560_audio_reset(void *opaque)
 void np560_audio_init(NP560AudioState *s, DMCUCPU *cpu)
 {
     s->cpu = cpu;
-    s->request_timer = ptimer_init(np560_audio_request_tick, s,
-                                  PTIMER_POLICY_NO_COUNTER_ROUND_DOWN |
-                                  PTIMER_POLICY_TRIGGER_ONLY_ON_DECREMENT);
+    s->request_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                   np560_audio_request_tick, s);
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, np560_audio_tick, s);
     np560_audio_reset(s);
 }
@@ -220,7 +259,7 @@ void np560_audio_init(NP560AudioState *s, DMCUCPU *cpu)
 void np560_audio_destroy(NP560AudioState *s)
 {
     timer_free(s->timer);
-    ptimer_free(s->request_timer);
+    timer_free(s->request_timer);
 }
 
 char *np560_audio_snapshot(NP560AudioState *s)
@@ -251,12 +290,14 @@ char *np560_audio_snapshot(NP560AudioState *s)
             "\"old_value\":%u,\"value\":%u,\"enabled\":%s,\"running\":%s,"
             "\"ticks\":%" PRIu64 ",\"writes\":[%" PRIu64 ",%" PRIu64 "],"
             "\"without_write\":[%" PRIu64 ",%" PRIu64 "],"
-            "\"outside\":[%" PRIu64 ",%" PRIu64 "]}",
+            "\"outside\":[%" PRIu64 ",%" PRIu64 "],"
+            "\"last_request_ns\":[%" PRId64 ",%" PRId64 "]}",
             sequence == event_first ? "" : ",", sequence, event->virtual_ns,
             event->frame, event->pc, event->reg, event->old_value, event->value,
             event->enabled ? "true" : "false", event->running ? "true" : "false",
             event->ticks, event->writes[0], event->writes[1],
-            event->empty[0], event->empty[1], event->outside[0], event->outside[1]);
+            event->empty[0], event->empty[1], event->outside[0], event->outside[1],
+            event->last_request_ns[0], event->last_request_ns[1]);
     }
     return g_strdup_printf(
         "{\"format\":\"s16le\",\"sample_rate\":%u,\"channels\":2,"
@@ -265,6 +306,9 @@ char *np560_audio_snapshot(NP560AudioState *s)
         "\"registers\":[%u,%u,%u],\"writes\":[%" PRIu64 ",%" PRIu64
         ",%" PRIu64 "],\"request_clock\":{\"running\":%s,\"hz\":%u,"
         "\"pll\":%u,\"ticks\":%" PRIu64 "},"
+        "\"request_timing\":{\"late_ticks\":%" PRIu64
+        ",\"last_deadline_ns\":%" PRId64 ",\"last_lateness_ns\":%" PRId64
+        ",\"max_lateness_ns\":%" PRId64 "},"
         "\"request_delivery\":{\"writes\":[%" PRIu64 ",%" PRIu64 "],"
         "\"without_write\":[%" PRIu64 ",%" PRIu64 "],"
         "\"multiple_writes\":[%" PRIu64 ",%" PRIu64 "],"
@@ -276,7 +320,9 @@ char *np560_audio_snapshot(NP560AudioState *s)
         s->sample[0], s->sample[1], s->control,
         s->sample_writes[0], s->sample_writes[1], s->control_writes,
         s->request_running ? "true" : "false", s->request_hz, s->pll,
-        s->request_ticks, s->request_writes[0], s->request_writes[1],
+        s->request_ticks, s->request_late_ticks, s->request_last_deadline_ns,
+        s->request_last_lateness_ns, s->request_max_lateness_ns,
+        s->request_writes[0], s->request_writes[1],
         s->request_without_write[0], s->request_without_write[1],
         s->request_multiple_writes[0], s->request_multiple_writes[1],
         s->writes_outside_request[0], s->writes_outside_request[1],

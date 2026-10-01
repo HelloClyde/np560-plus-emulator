@@ -11,6 +11,4 @@
 
 uint32_t dmcu_exec_metadata(uint16_t word, uint32_t pc);
 unsigned dmcu_decode_cycles(uint16_t word, uint32_t pc);
-void dmcu_instruction_clock_step_decoded(CPUDMCUState *env, uint16_t word,
-                                         unsigned cycles);
 #endif

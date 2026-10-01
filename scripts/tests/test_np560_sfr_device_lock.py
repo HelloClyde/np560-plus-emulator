@@ -33,7 +33,11 @@ def main():
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--icr", action="store_true",
                    help="also require locked interrupt/DTU controls and ICR ALU/bit/alias access")
+    p.add_argument("--compare-update", action="store_true",
+                   help="check immediate SFR compare/update transaction locks; memory forms must not hold BQL")
     args = p.parse_args()
+    if args.icr and args.compare_update:
+        p.error("run --icr and --compare-update separately to isolate ALU observations")
     args.output.mkdir(parents=True, exist_ok=False)
     # Direct timer + DAC writes, direct counter read; then their data-bus
     # aliases. The aliases already acquire BQL in QEMU's MMIO dispatch.
@@ -49,6 +53,11 @@ def main():
                   0x3f10, 0x88f4, 0xf1c2,
                   0x68f0, 0xfffe, 0x3f10, 0xb4f0, 0xf1c2,
                   0x3f10, 0x9461, 0xf1c2, 0x6821, 0x8000]
+    if args.compare_update:
+        words += [0x6810, 0, 0x68f0, 0, 0xa8f0, 0x2400]
+        for op in (0x6e, 0x6f, 0x7e, 0x7f, 0x8e, 0x8f, 0x9e, 0x9f):
+            words += [0x6861, 0x43, (op << 8) | 0x61,
+                      0 if op < 0x80 else 0x2400]
     words += [0x6872, 0, 0xD0FF]
     guest = args.output / "caller.prg"
     guest.write_bytes(struct.pack(f"<{len(words)}H", *words))
@@ -66,7 +75,11 @@ end
 continue
 end
 """
+    compare_observer = ("break alu_sub\ncommands\nsilent\n"
+                        'printf "COMPARE_LOCK locked=%d\\n", co_tls_iothread_locked\n'
+                        "continue\nend\n") if args.compare_update else ""
     script.write_text("set pagination off\nset confirm off\nset $hits = 0\n" +
+                     compare_observer +
                      "break np560_sfr_device_write\n" +
                      body.replace("KIND", "WRITE").replace("STOP_CONDITION", "reg == 0x72") +
                      "break np560_sfr_device_read\n" +
@@ -96,14 +109,18 @@ end
     icr_complete = (not args.icr or
         (sum(kind == "WRITE" and r == 0x61 for kind, r in observed) == 10 and
          ("WRITE", 0x21) in observed and ("READ", 0x61) in observed))
-    report = {"passed": not timed_out and process.returncode == 0 and
+    compare_locks = [int(v) for v in re.findall(r"COMPARE_LOCK locked=([01])", output)]
+    compare_complete = not args.compare_update or compare_locks == [1]*4 + [0]*4
+    report = {"passed": not timed_out and process.returncode == 0 and compare_complete and
               observed[:5] == expected and
               set(expected) <= set(observed[5:]) and
               observed[-1:] == [("WRITE", 0x72)] and all(v for _, _, v in rows) and icr_complete,
               "qemu_sha256": hashlib.sha256(args.qemu.read_bytes()).hexdigest(),
               "returncode": process.returncode, "timed_out": timed_out, "observations": rows,
               "command": command, "host_guest_memory_writes": 0,
-              "icr_requested": args.icr, "icr_complete": icr_complete}
+              "icr_requested": args.icr, "icr_complete": icr_complete,
+              "compare_update_requested": args.compare_update,
+              "compare_locks": compare_locks, "compare_complete": compare_complete}
     (args.output / "report.json").write_text(json.dumps(report, indent=2)+"\n")
     print(json.dumps(report, indent=2), flush=True)
     return 0 if report["passed"] else 1

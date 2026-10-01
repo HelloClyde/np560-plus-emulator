@@ -15,7 +15,38 @@
 
 struct NP560MP3Codec {
     mp3dec_t decoder;
+    NP560MP3NoPCMInfo no_pcm;
 };
+
+NP560MP3NoPCMInfo np560_mp3_codec_no_pcm_info(const NP560MP3Codec *codec)
+{
+    return codec ? codec->no_pcm : (NP560MP3NoPCMInfo){0};
+}
+
+static void classify_no_pcm(NP560MP3Codec *codec, const uint8_t *input,
+                            unsigned bytes, unsigned header)
+{
+    mp3dec_scratch_t scratch = {0};
+    bs_t bits;
+    int required;
+    /* The validated caller supplies exactly one complete frame. Upstream
+     * resets history when the preceding header is absent/incompatible. */
+    unsigned available = codec->decoder.header[0] == 0xff &&
+                         hdr_compare(codec->decoder.header, input) ?
+                         codec->decoder.reserv : 0;
+    bs_init(&bits, input + 4, bytes - 4);
+    if (header == 6) {
+        get_bits(&bits, 16);
+    }
+    required = L3_read_side_info(&bits, scratch.gr_info, input);
+    codec->no_pcm.available_history = available;
+    if (required < 0 || bits.pos > bits.limit) {
+        codec->no_pcm.reason = 1;
+    } else {
+        codec->no_pcm.required_history = required;
+        codec->no_pcm.reason = available < required ? 2 : 3;
+    }
+}
 
 NP560MP3Codec *np560_mp3_codec_new(void)
 {
@@ -131,6 +162,7 @@ static NP560MP3Status codec_decode(NP560MP3Codec *codec,
     if (!codec || (!input && length)) {
         return NP560_MP3_BAD_HEADER;
     }
+    codec->no_pcm = (NP560MP3NoPCMInfo){0};
     if (length < 4) {
         return NP560_MP3_SHORT;
     }
@@ -161,8 +193,13 @@ static NP560MP3Status codec_decode(NP560MP3Codec *codec,
     if (length < header + side || (!final && length < bytes)) {
         return NP560_MP3_SHORT;
     }
-    if (final && length > bytes) {
-        return NP560_MP3_BAD_HEADER;
+    if (length > bytes) {
+        /* This API owns one already-framed packet, not a byte stream.
+         * Reject surplus bytes before committing synthesis/reservoir state.
+         * Ordinary HLE previously rejected the partial consumption later
+         * as DECODE_ERROR; preserve that status without the state mutation.
+         */
+        return final ? NP560_MP3_BAD_HEADER : NP560_MP3_DECODE_ERROR;
     }
     if (header == 6) {
         uint16_t crc = crc_byte(crc_byte(0xffff, input[2]), input[3]);
@@ -197,14 +234,17 @@ static NP560MP3Status codec_decode(NP560MP3Codec *codec,
             return NP560_MP3_DECODE_ERROR;
         }
     }
+    if (!final && samples == 0) {
+        classify_no_pcm(codec, input, bytes, header);
+    }
     codec->decoder = candidate;
     frame->consumed = bytes;
     frame->hz = hz;
     frame->channels = channels;
     if (samples == 0) {
-        /* Upstream doesn't expose every no-output reason. Preserve that
-         * uncertainty; don't report missing history as proven or hide it
-         * with synthesized silence. The service adapter handles recovery. */
+        /* Preserve the existing return/consumption contract. The separate
+         * read-only explanation must not synthesize silence or turn an
+         * invalid sideinfo result into successful decoder priming. */
         return NP560_MP3_NO_PCM;
     }
     frame->samples_per_channel = samples;

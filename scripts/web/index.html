@@ -40,6 +40,10 @@
         <div class="input-deck-heading">
           <h2>实体按键（已恢复映射）</h2>
           <p>Home 是原厂主界面/开始键：学习页可切到开始菜单，其它页面可能先返回学习页。按住时保持真实矩阵电平。</p>
+          <p>《英雄传奇》：F4 打开游戏菜单，也可在存档槽选择页取消并返回场景；Esc 不等于游戏的通用返回键。</p>
+          <p>《天降风云》实测：空格对应对白提示的“发音键”，可交谈、翻页和结束普通对白；Enter 并非通用对白继续键。场景过渡结束后，F4 打开游戏菜单。其它界面仍按游戏提示操作。</p>
+          <p>MP3 播放器：选项设置页用 F4 返回播放页，Esc 在该页不是返回键；主播放页的 F4 是最小化。同一按键的作用由原厂程序当前界面决定。</p>
+          <p>原厂关屏后可尝试上方向键唤醒：当前已验证的关屏路径中，Enter 不唤醒，上键会恢复“每日一句”。这不代表所有待机状态都相同；唤醒后再按页面提示操作。</p>
         </div>
         <div class="softkeys" aria-label="功能键">
           <button type="button" data-key="F1">F1</button><button type="button" data-key="F2">F2</button>
@@ -53,17 +57,39 @@
           <button type="button" data-key="ArrowRight" class="right">▶</button>
           <button type="button" data-key="ArrowDown" class="down">▼</button>
         </div>
-        <button type="button" data-key="Escape" class="mobile-back">返回 / 退出</button>
+        <button type="button" data-key="Escape" class="mobile-back">Esc（依程序定义）</button>
+        <button type="button" data-key=" " class="mobile-back" title="与完整键盘空格同一个矩阵键；游戏按当前模式解释">发音 / 交谈（空格）</button>
+        <label><input id="keyboard-short-tap" type="checkbox">电脑键盘短按辅助（至少 150 ms）</label>
+        <p class="unmapped-note">默认关闭，保持原始按键时序。开启可减少轻点漏键，但快速换向可能短暂重叠；不改变原机键位。切换此选项会释放当前按键。</p>
         <details class="keyboard-panel">
           <summary>完整键盘（字母、数字及更多功能键）</summary>
+          <p>快捷键别名：Tab、PageDown 与下方向键同键，PageUp 与上方向键同键；Backspace 与 Esc 同键，空格与点号同键。数字与字母顶排共用实体键，由原厂输入模式解释。F1–F4 是网页快捷键名称，并不保证对应游戏中的同名功能。</p>
           <div id="keyboard" class="keyboard" aria-label="仿真键盘"></div>
+          <button type="button" data-key="Matrix35">MP3 播放器（M35）</button>
+          <p>已验证从原厂桌面进入播放器；其它界面是否响应由原厂程序决定，不是网页强制跳转。</p>
+          <button type="button" data-key="Matrix15">帮助（M15）</button>
+          <p>已验证打开 MP3 播放器的原厂帮助；上下翻页。其它应用是否响应由固件决定，不模拟通用帮助窗口。</p>
+          <p>MP3 播放器内：B 是白屏模式，再按 B 恢复画面，音乐继续；空格依次设 A 点、设 B 点循环、取消循环。这些是播放器功能，不是所有游戏的通用键义。</p>
+          <button type="button" data-key="Matrix26">大写／符号模式状态（M26）</button>
+          <p>此键通过原厂程序切换模式位和状态图标，不直接输入字符；应用强制键表时不一定改变输出。电脑 Shift 不代替此键，原机面板印字尚未确认。</p>
+          <p>桌面实测：按此键并松开后，下一次 Q 为大写 Q，之后恢复小写；Esc 同键可能先输出单引号，空格同键可能先输出点号。它不是永久大写锁定，各应用仍按自身模式处理。</p>
+          <p>模式也影响 F1–F3 和逗号键：普通模式下逗号开关输出功能事件 0x85，大写／符号模式才输出逗号；F1–F3 在两种模式下的事件也不同。网页发送的是同一个实体开关，不强制输入按钮上印的字符或功能。</p>
         </details>
-        <p class="unmapped-note">只启用已由 V3.80 事件表确认的实体键；照片中其余侧键仍标记为未映射，不会向 guest 发送事件。</p>
+        <p class="unmapped-note">常用区只标注已确认的映射；照片中其余侧键仍标记为未映射。下方原始矩阵区可直接操作全部开关，不表示实体名称已经确认。</p>
+        <details class="keyboard-panel">
+          <summary>原始矩阵键盘（高级，M00–M63）</summary>
+          <p>这些编号不是原机键名，也不是游戏动作。按下会发送真实矩阵电平，可能切换程序或退出游戏，请先保存。与常用区相同编号的按钮是同一个键；亮起仅代表网页持有该键，不代表原厂程序已消费。</p>
+          <p>电脑单引号键与 Esc 共用 M28：固件大写／符号模式输出单引号，其它两种键表输出 0x84。电脑 Shift 不会代替机器切换输入模式。</p>
+          <div id="matrix-keyboard" class="keyboard matrix-keyboard" aria-label="原始矩阵开关"></div>
+        </details>
       </div>
     </section>
 
     <details class="debug-panel">
       <summary>LCD 与调试</summary>
+      <button type="button" id="download-key-diagnostic">下载按键与画面诊断</button>
+      <span id="key-diagnostic-status" role="status"></span>
+      <p>出现错键后下载 JSON 并附上预期结果。包含本页最近 128 次矩阵提交意图（不是服务端确认或固件消费记录，刷新页面会清空）。仅手动读取，不发送按键、不暂停游戏；固件事件是累计状态，不保证属于最后一次点击。文件含按键记录、画面和本地运行路径，请按需分享。</p>
       <div class="debug-grid">
         <form id="frame-settings" class="settings">
           <label>画面来源

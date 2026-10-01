@@ -14,10 +14,12 @@ import hashlib
 import json
 import re
 import struct
+import sys
 import tempfile
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "tests"))
 from test_np560_dtu import write_word
 from test_np560_mp3_header import CASES, PARSER, PARSER_SHA256, TABLES, TABLES_SHA256, original_slice
 from web.np560_web import Emulator

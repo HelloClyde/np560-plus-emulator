@@ -1,6 +1,7 @@
 /* QEMU machine model for the Noah NP560+ learning computer. */
 
 #include "qemu/osdep.h"
+#include <glib/gstdio.h>
 #include "qemu/datadir.h"
 #include "qapi/error.h"
 #include "qapi/visitor.h"
@@ -24,6 +25,7 @@
 #include "np560_audio.h"
 #include "np560_nand_journal.h"
 #include "np560_mp3_hle.h"
+#include "np560_npe_hle.h"
 
 #define TYPE_NP560_MACHINE MACHINE_TYPE_NAME("np560")
 OBJECT_DECLARE_SIMPLE_TYPE(NP560MachineState, NP560_MACHINE)
@@ -2642,6 +2644,14 @@ typedef struct NP560ST7529State {
 } NP560ST7529State;
 
 typedef struct NP560KeyboardState {
+    bool contact_trace_enabled;
+    uint64_t contact_trace_count;
+    struct {
+        int64_t ns;
+        uint32_t low, high, pc;
+        uint16_t drive, input;
+        bool scan;
+    } contact_trace[128];
     uint16_t last_event;
     uint64_t events_read;
     uint64_t latch_reads;
@@ -7577,6 +7587,8 @@ struct NP560MachineState {
     uint32_t rom_mp3_hle_base;
     uint32_t rom_mp3_arena_image;
     NP560MP3HLE *mp3_hle;
+    char *rom_npe_codec_socket;
+    NP560NPEHLE *npe_hle;
     bool soc_rom_skeleton;
     bool hle_ui;
     bool firmware_vma03;
@@ -7882,6 +7894,85 @@ static void np560_set_instruction_clock(Object *obj, bool enabled, Error **errp)
     cpu->env.instruction_clock_enabled = enabled;
 }
 
+static bool np560_get_clock_profile_enabled(Object *obj, Error **errp)
+{
+    return NP560_MACHINE(obj)->cpu->env.instruction_clock_profile_enabled;
+}
+
+static void np560_set_clock_profile_enabled(Object *obj, bool enabled,
+                                            Error **errp)
+{
+    if (runstate_is_running()) {
+        error_setg(errp, "Pause the CPU before changing cycle profiling");
+        return;
+    }
+    NP560_MACHINE(obj)->cpu->env.instruction_clock_profile_enabled = enabled;
+}
+
+static char *np560_get_clock_profile(Object *obj, Error **errp)
+{
+    CPUDMCUState *env = &NP560_MACHINE(obj)->cpu->env;
+    GString *result;
+    bool first = true;
+    struct {
+        uint32_t word;
+        uint64_t count;
+    } top_words[24] = { 0 };
+
+    /* A coherent endpoint, not an asynchronous sample of a live vCPU. */
+    if (runstate_is_running()) {
+        error_setg(errp, "Pause the CPU before reading cycle profiling");
+        return NULL;
+    }
+    result = g_string_new(NULL);
+    g_string_append_printf(result, "{\"enabled\":%s,\"opcodes\":{",
+        env->instruction_clock_profile_enabled ? "true" : "false");
+    for (unsigned op = 0; op < 256; op++) {
+        uint64_t count = env->instruction_clock_unknown_opcodes[op];
+        if (count) {
+            g_string_append_printf(result, "%s\"%02x\":%" PRIu64,
+                                   first ? "" : ",", op, count);
+            first = false;
+        }
+    }
+    g_string_append(result, "},\"executed\":{");
+    first = true;
+    for (unsigned op = 0; op < 256; op++) {
+        uint64_t count = env->instruction_clock_executed_opcodes[op];
+        if (count) {
+            g_string_append_printf(result, "%s\"%02x\":%" PRIu64,
+                                   first ? "" : ",", op, count);
+            first = false;
+        }
+    }
+    for (unsigned word = 0; word < 65536; word++) {
+        uint64_t count = env->instruction_clock_executed_words[word];
+
+        if (count <= top_words[23].count) {
+            continue;
+        }
+        for (unsigned index = 0; index < 24; index++) {
+            if (count > top_words[index].count) {
+                if (index < 23) {
+                    memmove(&top_words[index + 1], &top_words[index],
+                            (23 - index) * sizeof(top_words[0]));
+                }
+                top_words[index].word = word;
+                top_words[index].count = count;
+                break;
+            }
+        }
+    }
+    g_string_append(result, "},\"top_words\":{");
+    for (unsigned index = 0; index < 24 && top_words[index].count; index++) {
+        g_string_append_printf(result, "%s\"%04x\":%" PRIu64,
+                               index ? "," : "", top_words[index].word,
+                               top_words[index].count);
+    }
+    g_string_append(result, "},\"scope\":\"unknown costs at PC>=010000; executed counts all clocked instruction words; top_words lists cumulative top 24 full words\"}");
+    return g_string_free(result, false);
+}
+
 static char *np560_get_instruction_clock_state(Object *obj, Error **errp)
 {
     CPUDMCUState *env = &NP560_MACHINE(obj)->cpu->env;
@@ -7889,13 +7980,19 @@ static char *np560_get_instruction_clock_state(Object *obj, Error **errp)
     return g_strdup_printf("ENABLED:%u MODEL:documented-partial-v1 HZ:%u "
         "INSTRUCTIONS:%" PRIu64 " NS:%" PRIu64 " FRACTION:%08x FAULT:%u "
         "CYCLES:%" PRIu64 " DATA_WAITS:%" PRIu64 " EXTERNAL_DATA:%" PRIu64
-        " UNKNOWN_MAP:%" PRIu64 " UNKNOWN_COST:%" PRIu64 " LAST_UNKNOWN:%04x",
+        " UNKNOWN_MAP:%" PRIu64 " UNKNOWN_COST:%" PRIu64 " LAST_UNKNOWN:%04x"
+        " UNKNOWN_SRAM:%" PRIu64 " UNKNOWN_OPCODE:%" PRIu64
+        " CLKCON:%04x PLL:%04x AUDIO_PLL:%04x",
         env->instruction_clock_enabled, dmcu_system_clock_hz(env),
         env->instruction_clock_count, env->instruction_clock_ns,
         env->instruction_clock_fraction, env->instruction_clock_fault,
         env->instruction_clock_cycles, env->instruction_clock_data_waits,
         env->instruction_clock_external_data, env->instruction_clock_unknown_map,
-        env->instruction_clock_unknown, env->instruction_clock_last_unknown);
+        env->instruction_clock_unknown, env->instruction_clock_last_unknown,
+        env->instruction_clock_unknown_sram,
+        env->instruction_clock_unknown - env->instruction_clock_unknown_sram,
+        env->sfr[DMCU_SFR_CLKCON], env->sfr[DMCU_SFR_PLL],
+        env->sfr[DMCU_SFR_AUDIO_PLL]);
 }
 
 static void np560_set_control_observers_minimal(Object *obj, bool enabled,
@@ -7911,13 +8008,34 @@ static void np560_set_control_observers_minimal(Object *obj, bool enabled,
         error_setg(errp, "Minimal observers are not supported with legacy ROM/UI HLE");
         return;
     }
-    cpu->control_observers_minimal = enabled;
-    cpu->env.control_observers_minimal = enabled;
+    if (cpu->control_observers_minimal != enabled) {
+        cpu->control_observers_minimal = enabled;
+        cpu->env.control_observers_minimal = enabled;
+        /* Helper selection is baked into each TB. A paused mode switch must
+         * not resume code translated for the previous observer contract. */
+        tb_flush(CPU(cpu));
+    }
 }
 
 static void np560_set_dtu_refill_trace(Object *obj, bool enabled, Error **errp)
 {
     NP560_MACHINE(obj)->cpu->dtu_refill_trace_enabled = enabled;
+}
+
+static bool np560_get_resource_trace_all(Object *obj, Error **errp)
+{
+    return NP560_MACHINE(obj)->cpu->env.resource_trace_all;
+}
+
+static void np560_set_resource_trace_all(Object *obj, bool enabled, Error **errp)
+{
+    if (runstate_is_running()) {
+        error_setg(errp, "Pause the CPU before changing resource observers");
+        return;
+    }
+    /* Reuse the bounded resource trace without fabricating a captured root
+     * framebuffer. Off by default; CPU reset clears this diagnostic flag. */
+    NP560_MACHINE(obj)->cpu->env.resource_trace_all = enabled;
 }
 
 static char *np560_get_dtu_refill_state(Object *obj, Error **errp)
@@ -8993,19 +9111,18 @@ static uint16_t np560_key_matrix_input(const NP560MachineState *s,
      * index is column * 8 + row.  Explicit 64-bit Web matrix state exposes
      * every evidenced position; retain the older navigation aliases so QMP
      * clients that only set key-state remain compatible. */
-    if (keys & ((1u << 0) | (1u << 12))) {             /* up: index 61 */
-        matrix |= 1ull << 61;
-    }
-    if (keys & ((1u << 1) | (1u << 7) |
-                (1u << 13))) {                         /* down: index 37 */
-        matrix |= 1ull << 37;
-    }
-    if (keys & ((1u << 2) | (1u << 5) |
-                (1u << 6))) {                          /* back: index 28 */
-        matrix |= 1ull << 28;
-    }
-    if (keys & ((1u << 3) | (1u << 4))) {             /* enter: index 20 */
-        matrix |= 1ull << 20;
+    /* Same recovered switch positions as the Web matrix. In particular,
+     * left/right are M45/M29, not the old back/comma guesses M28/M20.
+     * Function-key labels are host shortcuts, not claimed physical names. */
+    static const uint8_t legacy_matrix_indexes[16] = {
+        61, 37, 45, 29, 53, 28, 28, 37,
+        60, 52, 44, 4, 61, 37, 54, 55,
+    };
+
+    for (index = 0; index < ARRAY_SIZE(legacy_matrix_indexes); index++) {
+        if (keys & (1u << index)) {
+            matrix |= 1ull << legacy_matrix_indexes[index];
+        }
     }
     /* 2E:5F28 first raises the matrix bank with OR C0FC, then clears one
      * strobe bit through AND ~row before reading F160.  Selected rows are
@@ -9020,6 +9137,25 @@ static uint16_t np560_key_matrix_input(const NP560MachineState *s,
         }
     }
     return input;
+}
+
+static void np560_record_contact(NP560MachineState *s, bool scan,
+                                 uint16_t input)
+{
+    NP560KeyboardState *k = &s->keyboard;
+    unsigned slot;
+
+    if (!k->contact_trace_enabled) {
+        return;
+    }
+    slot = k->contact_trace_count++ % ARRAY_SIZE(k->contact_trace);
+    k->contact_trace[slot].ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    k->contact_trace[slot].low = s->cpu->env.web_matrix_state_low;
+    k->contact_trace[slot].high = s->cpu->env.web_matrix_state_high;
+    k->contact_trace[slot].pc = s->cpu->env.pc & 0xffffff;
+    k->contact_trace[slot].drive = k->matrix_drive;
+    k->contact_trace[slot].input = input;
+    k->contact_trace[slot].scan = scan;
 }
 
 static uint64_t np560_key_matrix_read(void *opaque, hwaddr offset,
@@ -9052,6 +9188,7 @@ static uint64_t np560_key_matrix_read(void *opaque, hwaddr offset,
             }
         }
         if ((input & 0x00ff) != 0x00ff) {
+            np560_record_contact(s, true, input);
             s->keyboard.matrix_active_reads++;
             s->keyboard.matrix_last_active_drive = s->keyboard.matrix_drive;
             s->keyboard.matrix_last_active_input = input;
@@ -10130,12 +10267,15 @@ static char *np560_get_key_pipeline_status(Object *obj, Error **errp)
     faulted = env->missing_rom_valid || env->invalid_control_valid ||
               env->unsupported_valid;
     return g_strdup_printf(
-        "{\"maps\":%u,\"event\":%u,"
+        "{\"full_control_observers\":%s,\"maps\":%u,\"event\":%u,"
         "\"candidates\":%u,\"candidate\":%u,"
         "\"acknowledgements\":%u,\"acknowledgement\":%u,"
         "\"modal_acknowledgements\":%u,"
         "\"modal_acknowledgement\":%u,"
         "\"matrix_reads\":%" G_GUINT64_FORMAT ","
+        "\"matrix_active_reads\":%" G_GUINT64_FORMAT ","
+        "\"matrix_last_active_pc\":%u,"
+        "\"virtual_time_ns\":%" G_GINT64_FORMAT ","
         "\"matrix_rearmed\":%s,\"application_state\":%u,"
         "\"primary_action_selector_calls\":%u,"
         "\"primary_action_selector_returns\":%u,"
@@ -10189,6 +10329,7 @@ static char *np560_get_key_pipeline_status(Object *obj, Error **errp)
         "\"render_callback_field_r0\":%u,"
         "\"render_callback_field_r1\":%u,"
         "\"faulted\":%s}",
+        env->control_observers_minimal ? "false" : "true",
         env->matrix_event_maps,
         env->matrix_event_last & 0xffffu,
         env->matrix_candidate_writes,
@@ -10200,6 +10341,9 @@ static char *np560_get_key_pipeline_status(Object *obj, Error **errp)
         env->matrix_modal_dispatches,
         env->matrix_modal_event_last & 0xffffu,
         s->keyboard.matrix_reads,
+        s->keyboard.matrix_active_reads,
+        s->keyboard.matrix_last_active_pc,
+        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
         matrix_rearmed ? "true" : "false",
         application_state,
         env->npe_game_primary_action_selector_calls,
@@ -10260,6 +10404,139 @@ static char *np560_get_key_pipeline_status(Object *obj, Error **errp)
         env->npe_game_render_callback_words[0x1e / 2],
         env->npe_game_render_callback_words[0x20 / 2],
         faulted ? "true" : "false");
+}
+
+/* Execute the whole snapshot at one vCPU work boundary. Four separate QOM
+ * writes can otherwise expose a transient all-released or mixed matrix to
+ * the scanner, even when the Web client intended one simultaneous change. */
+static void np560_key_input_read(CPUState *cpu, run_on_cpu_data data)
+{
+    CPUDMCUState *env = &DMCU_CPU(cpu)->env;
+    uint32_t *words = data.host_ptr;
+
+    words[0] = env->web_key_state;
+    words[1] = env->web_key_code;
+    words[2] = env->web_matrix_state_low;
+    words[3] = env->web_matrix_state_high;
+}
+
+typedef struct NP560InputWrite {
+    NP560MachineState *machine;
+    uint32_t words[4];
+} NP560InputWrite;
+
+static void np560_key_input_write(CPUState *cpu, run_on_cpu_data data)
+{
+    CPUDMCUState *env = &DMCU_CPU(cpu)->env;
+    NP560InputWrite *request = data.host_ptr;
+    const uint32_t *words = request->words;
+    bool changed = env->web_matrix_state_low != words[2] ||
+                   env->web_matrix_state_high != words[3];
+
+    env->web_key_state = words[0];
+    env->web_key_code = words[1];
+    env->web_matrix_state_low = words[2];
+    env->web_matrix_state_high = words[3];
+    if (changed) {
+        np560_record_contact(request->machine, false, 0);
+    }
+}
+
+typedef struct NP560ContactRead {
+    NP560MachineState *machine;
+    char *json;
+} NP560ContactRead;
+
+static void np560_contact_read(CPUState *cpu, run_on_cpu_data data)
+{
+    NP560ContactRead *request = data.host_ptr;
+    NP560KeyboardState *k = &request->machine->keyboard;
+    uint64_t first = k->contact_trace_count > 128 ?
+                     k->contact_trace_count - 128 : 0;
+    GString *out = g_string_new(NULL);
+
+    g_string_append_printf(out, "{\"enabled\":%s,\"count\":%" PRIu64
+        ",\"dropped\":%" PRIu64 ",\"scope\":\"atomic matrix changes and active bus reads; legacy writes not traced\",\"events\":[",
+        k->contact_trace_enabled ? "true" : "false", k->contact_trace_count, first);
+    for (uint64_t i = first; i < k->contact_trace_count; i++) {
+        unsigned slot = i % ARRAY_SIZE(k->contact_trace);
+        g_string_append_printf(out, "%s{\"sequence\":%" PRIu64
+            ",\"ns\":%" PRId64 ",\"scan\":%s,\"low\":%u,\"high\":%u,"
+            "\"pc\":%u,\"drive\":%u,\"input\":%u}",
+            i == first ? "" : ",", i, k->contact_trace[slot].ns,
+            k->contact_trace[slot].scan ? "true" : "false",
+            k->contact_trace[slot].low, k->contact_trace[slot].high,
+            k->contact_trace[slot].pc, k->contact_trace[slot].drive,
+            k->contact_trace[slot].input);
+    }
+    g_string_append(out, "]}");
+    request->json = g_string_free(out, false);
+}
+
+static char *np560_get_contact_trace(Object *obj, Error **errp)
+{
+    NP560ContactRead request = { .machine = NP560_MACHINE(obj) };
+    run_on_cpu(CPU(request.machine->cpu), np560_contact_read,
+               RUN_ON_CPU_HOST_PTR(&request));
+    return request.json;
+}
+
+static bool np560_get_contact_enabled(Object *obj, Error **errp)
+{
+    return NP560_MACHINE(obj)->keyboard.contact_trace_enabled;
+}
+
+static void np560_set_contact_enabled(Object *obj, bool value, Error **errp)
+{
+    if (runstate_is_running()) {
+        error_setg(errp, "pause before changing contact trace mode");
+        return;
+    }
+    NP560_MACHINE(obj)->keyboard.contact_trace_enabled = value;
+}
+
+static char *np560_get_key_input_snapshot(Object *obj, Error **errp)
+{
+    NP560MachineState *s = NP560_MACHINE(obj);
+    uint32_t words[4];
+
+    run_on_cpu(CPU(s->cpu), np560_key_input_read, RUN_ON_CPU_HOST_PTR(words));
+    return g_strdup_printf("%08x:%08x:%08x:%08x",
+                           words[0], words[1], words[2], words[3]);
+}
+
+static void np560_set_key_input_snapshot(Object *obj, const char *value,
+                                         Error **errp)
+{
+    NP560MachineState *s = NP560_MACHINE(obj);
+    NP560InputWrite request = { .machine = s };
+    uint32_t *words = request.words;
+    unsigned i, digit;
+
+    /* Fixed-width hex avoids JSON's 53-bit integer limit. Parse everything
+     * before scheduling a write; invalid payloads must leave input intact. */
+    if (strlen(value) != 35) {
+        goto invalid;
+    }
+    for (i = 0; i < 4; i++) {
+        if (i && value[i * 9 - 1] != ':') {
+            goto invalid;
+        }
+        for (digit = 0; digit < 8; digit++) {
+            int nibble = g_ascii_xdigit_value(value[i * 9 + digit]);
+
+            if (nibble < 0) {
+                goto invalid;
+            }
+            words[i] = (words[i] << 4) | nibble;
+        }
+    }
+    run_on_cpu(CPU(s->cpu), np560_key_input_write, RUN_ON_CPU_HOST_PTR(&request));
+    return;
+
+invalid:
+    error_setg(errp, "key-input-snapshot requires four 8-digit hex words: "
+               "state:code:matrix-low:matrix-high");
 }
 
 static void np560_get_key_matrix_pulse_index(Object *obj, Visitor *v,
@@ -10394,6 +10671,31 @@ static char *np560_get_mp3_hle_state(Object *obj, Error **errp)
     return np560_mp3_hle_state(NP560_MACHINE(obj)->mp3_hle);
 }
 
+static char *np560_get_npe_hle_state(Object *obj, Error **errp)
+{
+    return np560_npe_hle_state(NP560_MACHINE(obj)->npe_hle);
+}
+
+static bool np560_rom_services(void *opaque, CPUDMCUState *env, uint32_t pc)
+{
+    NP560MachineState *s = opaque;
+
+    return (s->npe_hle && np560_npe_hle_service(s->npe_hle, env, pc)) ||
+           (s->mp3_hle && np560_mp3_hle_service(s->mp3_hle, env, pc));
+}
+
+static void np560_rom_services_reset(void *opaque)
+{
+    NP560MachineState *s = opaque;
+
+    if (s->mp3_hle) {
+        np560_mp3_hle_reset(s->mp3_hle);
+    }
+    if (s->npe_hle) {
+        np560_npe_hle_reset(s->npe_hle);
+    }
+}
+
 static void np560_set_rom_hle(Object *obj, bool value, Error **errp)
 {
     NP560_MACHINE(obj)->rom_hle = value;
@@ -10443,6 +10745,22 @@ static void np560_set_soc_rom(Object *obj, const char *value, Error **errp)
 
     g_free(s->soc_rom);
     s->soc_rom = g_strdup(value);
+}
+
+static char *np560_get_npe_codec_socket(Object *obj, Error **errp)
+{
+    NP560MachineState *s = NP560_MACHINE(obj);
+
+    return g_strdup(s->rom_npe_codec_socket ? s->rom_npe_codec_socket : "");
+}
+
+static void np560_set_npe_codec_socket(Object *obj, const char *value,
+                                       Error **errp)
+{
+    NP560MachineState *s = NP560_MACHINE(obj);
+
+    g_free(s->rom_npe_codec_socket);
+    s->rom_npe_codec_socket = g_strdup(value);
 }
 
 static char *np560_get_usb_loader(Object *obj, Error **errp)
@@ -10572,11 +10890,9 @@ static void np560_save_nand_checkpoint(NP560MachineState *s,
 {
     static const uint8_t magic[8] = { 'N', 'P', '5', '6', '0', 'N', '1', 0 };
     NP560NANDState *nand = &s->nand;
-    const size_t payload_size = NP560_NAND_DATA_SIZE + NP560_NAND_OOB_SIZE;
-    const size_t checkpoint_size = NP560_NAND_CHECKPOINT_HEADER_SIZE +
-                                   payload_size;
-    g_autofree uint8_t *checkpoint = NULL;
-    g_autoptr(GError) gerror = NULL;
+    uint8_t checkpoint[NP560_NAND_CHECKPOINT_HEADER_SIZE] = { 0 };
+    g_autofree char *temporary = NULL;
+    int fd, saved_errno;
 
     if (!path || !*path) {
         error_setg(errp, "NP560+ NAND checkpoint output path is empty");
@@ -10622,7 +10938,6 @@ static void np560_save_nand_checkpoint(NP560MachineState *s,
         }
     }
 
-    checkpoint = g_malloc0(checkpoint_size);
     memcpy(checkpoint, magic, sizeof(magic));
     stl_le_p(checkpoint + 8, NP560_NAND_CHECKPOINT_VERSION);
     stl_le_p(checkpoint + 12, NP560_NAND_CHECKPOINT_HEADER_SIZE);
@@ -10636,16 +10951,38 @@ static void np560_save_nand_checkpoint(NP560MachineState *s,
              np560_nand_trace_hash(nand->data, NP560_NAND_DATA_SIZE));
     stl_le_p(checkpoint + 52,
              np560_nand_trace_hash(nand->oob, NP560_NAND_OOB_SIZE));
-    memcpy(checkpoint + NP560_NAND_CHECKPOINT_HEADER_SIZE,
-           nand->data, NP560_NAND_DATA_SIZE);
-    memcpy(checkpoint + NP560_NAND_CHECKPOINT_HEADER_SIZE +
-           NP560_NAND_DATA_SIZE, nand->oob, NP560_NAND_OOB_SIZE);
-
-    if (!g_file_set_contents(path, (const gchar *)checkpoint,
-                             checkpoint_size, &gerror)) {
-        error_setg(errp, "Unable to save NP560+ NAND checkpoint '%s': %s",
-                   path, gerror->message);
+    /* The QOM setter runs under BQL, so the two NAND planes stay stable.
+     * Stream them without another 528-MiB allocation. Publish only after
+     * all writes/sync/close succeed; a failed export preserves the old file. */
+    temporary = g_strdup_printf("%s.export.XXXXXX", path);
+    fd = g_mkstemp_full(temporary, O_WRONLY | O_BINARY | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        error_setg_errno(errp, errno, "Unable to create NAND export for '%s'", path);
+        return;
     }
+    if (qemu_write_full(fd, checkpoint, sizeof(checkpoint)) != sizeof(checkpoint) ||
+        qemu_write_full(fd, nand->data, NP560_NAND_DATA_SIZE) != NP560_NAND_DATA_SIZE ||
+        qemu_write_full(fd, nand->oob, NP560_NAND_OOB_SIZE) != NP560_NAND_OOB_SIZE ||
+        qemu_fdatasync(fd) < 0) {
+        saved_errno = errno ? errno : EIO;
+        qemu_close(fd);
+        goto export_failed;
+    }
+    if (qemu_close(fd) < 0) {
+        saved_errno = errno ? errno : EIO;
+        goto export_failed;
+    }
+    if (g_rename(temporary, path) < 0) {
+        saved_errno = errno ? errno : EIO;
+        goto export_failed;
+    }
+    return;
+
+export_failed:
+    /* Only remove this call's exclusively created temporary, never path. */
+    g_unlink(temporary);
+    error_setg_errno(errp, saved_errno, "Unable to save NP560+ NAND checkpoint '%s'",
+                    path);
 }
 
 static char *np560_get_nand_save(Object *obj, Error **errp)
@@ -11146,6 +11483,9 @@ static void np560_load_nand_image(NP560MachineState *s)
                                      NP560_NAND_OOB_SIZE;
         uint32_t data_hash;
         uint32_t oob_hash;
+        uint8_t header[NP560_NAND_CHECKPOINT_HEADER_SIZE];
+        struct stat st;
+        FILE *stream;
 
         filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, s->nand_checkpoint);
         if (!filename) {
@@ -11153,43 +11493,54 @@ static void np560_load_nand_image(NP560MachineState *s)
                          s->nand_checkpoint);
             exit(EXIT_FAILURE);
         }
-        if (!g_file_get_contents(filename, &image, &image_size, &gerror)) {
+        stream = fopen(filename, "rb");
+        if (!stream) {
             error_report("Unable to load NP560+ NAND checkpoint '%s': %s",
-                         filename, gerror->message);
+                         filename, strerror(errno));
             exit(EXIT_FAILURE);
         }
-        if (image_size != expected_size ||
-            memcmp(image, checkpoint_magic, sizeof(checkpoint_magic)) ||
-            ldl_le_p(image + 8) != NP560_NAND_CHECKPOINT_VERSION ||
-            ldl_le_p(image + 12) != NP560_NAND_CHECKPOINT_HEADER_SIZE ||
-            ldl_le_p(image + 16) != NP560_NAND_PAGE_DATA ||
-            ldl_le_p(image + 20) != NP560_NAND_PAGE_OOB ||
-            ldl_le_p(image + 24) != NP560_NAND_PAGES_PER_BLOCK ||
-            ldl_le_p(image + 28) != NP560_NAND_BLOCKS ||
-            ldq_le_p(image + 32) != NP560_NAND_DATA_SIZE ||
-            ldq_le_p(image + 40) != NP560_NAND_OOB_SIZE) {
+        if (fstat(fileno(stream), &st) || st.st_size != expected_size ||
+            fread(header, 1, sizeof(header), stream) != sizeof(header) ||
+            memcmp(header, checkpoint_magic, sizeof(checkpoint_magic)) ||
+            ldl_le_p(header + 8) != NP560_NAND_CHECKPOINT_VERSION ||
+            ldl_le_p(header + 12) != NP560_NAND_CHECKPOINT_HEADER_SIZE ||
+            ldl_le_p(header + 16) != NP560_NAND_PAGE_DATA ||
+            ldl_le_p(header + 20) != NP560_NAND_PAGE_OOB ||
+            ldl_le_p(header + 24) != NP560_NAND_PAGES_PER_BLOCK ||
+            ldl_le_p(header + 28) != NP560_NAND_BLOCKS ||
+            ldq_le_p(header + 32) != NP560_NAND_DATA_SIZE ||
+            ldq_le_p(header + 40) != NP560_NAND_OOB_SIZE) {
+            fclose(stream);
             error_report("NP560+ NAND checkpoint '%s' has an incompatible "
                          "header or size", filename);
             exit(EXIT_FAILURE);
         }
-        data_hash = np560_nand_trace_hash(
-            (const uint8_t *)image + NP560_NAND_CHECKPOINT_HEADER_SIZE,
-            NP560_NAND_DATA_SIZE);
-        oob_hash = np560_nand_trace_hash(
-            (const uint8_t *)image + NP560_NAND_CHECKPOINT_HEADER_SIZE +
-            NP560_NAND_DATA_SIZE, NP560_NAND_OOB_SIZE);
-        if (data_hash != ldl_le_p(image + 48) ||
-            oob_hash != ldl_le_p(image + 52)) {
+        /* Before guest startup: read directly into the device planes. A short
+         * read, changed size, or bad checksum aborts; partial data never runs.
+         */
+        if (fread(nand->data, 1, NP560_NAND_DATA_SIZE, stream) !=
+                NP560_NAND_DATA_SIZE ||
+            fread(nand->oob, 1, NP560_NAND_OOB_SIZE, stream) !=
+                NP560_NAND_OOB_SIZE ||
+            fgetc(stream) != EOF || ferror(stream)) {
+            fclose(stream);
+            error_report("Unable to read complete NP560+ NAND checkpoint '%s'",
+                         filename);
+            exit(EXIT_FAILURE);
+        }
+        if (fclose(stream)) {
+            error_report("Unable to close NP560+ NAND checkpoint '%s': %s",
+                         filename, strerror(errno));
+            exit(EXIT_FAILURE);
+        }
+        data_hash = np560_nand_trace_hash(nand->data, NP560_NAND_DATA_SIZE);
+        oob_hash = np560_nand_trace_hash(nand->oob, NP560_NAND_OOB_SIZE);
+        if (data_hash != ldl_le_p(header + 48) ||
+            oob_hash != ldl_le_p(header + 52)) {
             error_report("NP560+ NAND checkpoint '%s' failed its checksum",
                          filename);
             exit(EXIT_FAILURE);
         }
-        memcpy(nand->data,
-               image + NP560_NAND_CHECKPOINT_HEADER_SIZE,
-               NP560_NAND_DATA_SIZE);
-        memcpy(nand->oob,
-               image + NP560_NAND_CHECKPOINT_HEADER_SIZE +
-               NP560_NAND_DATA_SIZE, NP560_NAND_OOB_SIZE);
         nand->image_bytes = NP560_NAND_DATA_SIZE;
         nand->restored_checkpoint = true;
         return;
@@ -11759,7 +12110,8 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
                               MEMTXATTRS_UNSPECIFIED, NULL),
         address_space_lduw_le(&address_space_memory, 0x5128d2,
                               MEMTXATTRS_UNSPECIFIED, NULL),
-        address_space_ldub(&address_space_memory, 0x5128d3,
+        /* Logical odd byte addresses select the low word lane on DMCU. */
+        address_space_ldub(&address_space_memory, 0x5128d3 ^ 1u,
                            MEMTXATTRS_UNSPECIFIED, NULL),
         address_space_lduw_le(&address_space_memory, 0x5128d6,
                               MEMTXATTRS_UNSPECIFIED, NULL),
@@ -19219,6 +19571,43 @@ static char *np560_get_cpu_state(Object *obj, Error **errp)
         }
     }
     {
+        uint32_t trace_count = MIN(env->npe_load_rom_unique_count,
+                                   DMCU_NPE_LOAD_ROM_TRACE_SLOTS);
+        uint32_t sequence;
+
+        g_string_append_printf(
+            text,
+            "\nNPE_LOAD_ROM=ACTIVE:%u ENTER:%u EXIT:%u "
+            "READ:%u/R%04x SLOT:%u FLAGS:%04x,%04x,%04x "
+            "TRIGGER:%04x>%04x CALLS:%u UNIQUE:%u TRACE:",
+            env->npe_load_branch_active,
+            env->npe_load_branch_entries,
+            env->npe_load_branch_exits,
+            env->npe_load_read_returns,
+            env->npe_load_read_result,
+            env->npe_load_slot,
+            env->npe_load_slot_flags[0],
+            env->npe_load_slot_flags[1],
+            env->npe_load_slot_flags[2],
+            env->npe_load_trigger_before,
+            env->npe_load_trigger_after,
+            env->npe_load_rom_call_count,
+            env->npe_load_rom_unique_count);
+        for (sequence = 0; sequence < trace_count; sequence++) {
+            g_string_append_printf(
+                text, "#%u/%s/%02x:%04x>%02x:%04x/n%u%s",
+                sequence + 1u,
+                env->npe_load_rom_call_op[sequence] == 0xbdu ?
+                    "call" : "jump",
+                dmcu_code_segment(env->npe_load_rom_call_from[sequence]),
+                dmcu_code_pc(env->npe_load_rom_call_from[sequence]),
+                dmcu_code_segment(env->npe_load_rom_call_target[sequence]),
+                dmcu_code_pc(env->npe_load_rom_call_target[sequence]),
+                env->npe_load_rom_call_hits[sequence],
+                sequence + 1u == trace_count ? "" : ";");
+        }
+    }
+    {
         uint32_t trace_count = MIN(env->npe_game_branch_trace_count,
                                    DMCU_NPE_GAME_BRANCH_TRACE_SLOTS);
         uint32_t trace_index;
@@ -22395,9 +22784,19 @@ static void np560_init(MachineState *machine)
             exit(EXIT_FAILURE);
         }
         s->mp3_hle = np560_mp3_hle_new(s->cpu, s->rom_mp3_hle_base, &error_fatal);
-        s->cpu->rom_service_opaque = s->mp3_hle;
-        s->cpu->rom_service = np560_mp3_hle_service;
-        s->cpu->rom_service_reset = np560_mp3_hle_reset;
+    }
+    if (s->rom_npe_codec_socket && *s->rom_npe_codec_socket) {
+        if (!s->soc_rom_skeleton || s->rom_hle || s->hle_ui) {
+            error_report("rom-npe-codec-socket requires a strict skeleton, not legacy ROM/UI HLE");
+            exit(EXIT_FAILURE);
+        }
+        s->npe_hle = np560_npe_hle_new(s->cpu, s->rom_npe_codec_socket,
+                                       &error_fatal);
+    }
+    if (s->mp3_hle || s->npe_hle) {
+        s->cpu->rom_service_opaque = s;
+        s->cpu->rom_service = np560_rom_services;
+        s->cpu->rom_service_reset = np560_rom_services_reset;
     }
     cpu_reset(cs);
     np560_timers_init(&s->periodic_timers, s->cpu);
@@ -22411,6 +22810,8 @@ static void np560_init(MachineState *machine)
                             np560_get_audio_pcm, NULL);
     object_property_add_str(OBJECT(machine), "rom-mp3-hle-state",
                             np560_get_mp3_hle_state, NULL);
+    object_property_add_str(OBJECT(machine), "rom-npe-hle-state",
+                            np560_get_npe_hle_state, NULL);
     object_property_add_str(OBJECT(machine), "timer0-state",
                             np560_get_timer0_state, NULL);
     object_property_add_str(OBJECT(machine), "timebase-state",
@@ -22428,6 +22829,9 @@ static void np560_init(MachineState *machine)
     object_property_add_bool(OBJECT(machine), "control-observers-minimal",
                              np560_get_control_observers_minimal,
                              np560_set_control_observers_minimal);
+    object_property_add_bool(OBJECT(machine), "resource-trace-all",
+                             np560_get_resource_trace_all,
+                             np560_set_resource_trace_all);
     object_property_add_bool(OBJECT(machine), "instruction-clock",
                              np560_get_instruction_clock,
                              np560_set_instruction_clock);
@@ -22435,6 +22839,10 @@ static void np560_init(MachineState *machine)
         "Experimental one-cycle instruction baseline using PLL/CLKCON; not complete cycle timing");
     object_property_add_str(OBJECT(machine), "instruction-clock-state",
                             np560_get_instruction_clock_state, NULL);
+    object_property_add_bool(OBJECT(machine), "instruction-clock-profile-enabled",
+        np560_get_clock_profile_enabled, np560_set_clock_profile_enabled);
+    object_property_add_str(OBJECT(machine), "instruction-clock-profile",
+                           np560_get_clock_profile, NULL);
     object_property_set_description(OBJECT(machine), "control-observers-minimal",
         "Experimental opt-in: omit historical control observers; retain strict faults and key ACK");
     object_property_add_str(OBJECT(machine), "dtu-refill-state",
@@ -22442,6 +22850,15 @@ static void np560_init(MachineState *machine)
     object_property_add_str(OBJECT(machine), "audio-file-trace",
                             np560_get_audio_file_trace, NULL);
     np560_keyboard_reset(s);
+    object_property_add_bool(OBJECT(machine), "key-contact-trace-enabled",
+        np560_get_contact_enabled, np560_set_contact_enabled);
+    object_property_add_str(OBJECT(machine), "key-contact-trace",
+                            np560_get_contact_trace, NULL);
+    object_property_add_str(OBJECT(machine), "key-input-snapshot",
+                            np560_get_key_input_snapshot,
+                            np560_set_key_input_snapshot);
+    object_property_set_description(OBJECT(machine), "key-input-snapshot",
+        "Atomic input snapshot: state:code:matrix-low:matrix-high (8-digit hex words)");
     object_property_add_uint32_ptr(OBJECT(machine), "key-state",
         &s->cpu->env.web_key_state, OBJ_PROP_FLAG_READWRITE);
     object_property_add_uint32_ptr(OBJECT(machine), "key-code",
@@ -22567,6 +22984,11 @@ static void np560_machine_class_init(ObjectClass *oc, void *data)
                                   np560_set_soc_rom);
     object_class_property_set_description(oc, "soc-rom",
         "Optional raw flat dump of SoC resident code at 00:0000 (up to 2 MiB)");
+    object_class_property_add_str(oc, "rom-npe-codec-socket",
+                                  np560_get_npe_codec_socket,
+                                  np560_set_npe_codec_socket);
+    object_class_property_set_description(oc, "rom-npe-codec-socket",
+        "Experimental NPE ROM audio bridge via local Unix codec socket (incomplete)");
     object_class_property_add_str(oc, "usb-loader", np560_get_usb_loader,
                                   np560_set_usb_loader);
     object_class_property_set_description(oc, "usb-loader",
@@ -22695,6 +23117,7 @@ static void np560_machine_finalize(Object *obj)
         s->cpu->rom_service_opaque = NULL;
     }
     np560_mp3_hle_free(s->mp3_hle);
+    np560_npe_hle_free(s->npe_hle);
 
     migrate_del_blocker(&s->migration_blocker);
     unregister_savevm(NULL, "np560-incomplete-state", s);
@@ -22729,6 +23152,7 @@ static void np560_machine_finalize(Object *obj)
     g_free(s->debug_code_save);
     g_free(s->debug_program_load);
     g_free(s->boot_mode);
+    g_free(s->rom_npe_codec_socket);
     g_free(s->reset_data_snapshot);
     g_free(s->reset_action_ui_snapshot);
     g_free(s->reset_action_code_page_snapshot);

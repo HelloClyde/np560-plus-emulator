@@ -26,9 +26,11 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 if __package__:
-    from .device_config import BOUND_FLAGS, create_device, load_device
+    from .device_config import BOUND_FLAGS, RUNTIME_FLAGS, create_device, load_device
+    from .rom_bundle import player_bundle_settings
 else:
-    from device_config import BOUND_FLAGS, create_device, load_device
+    from device_config import BOUND_FLAGS, RUNTIME_FLAGS, create_device, load_device
+    from rom_bundle import player_bundle_settings
 
 
 ROOT = Path(__file__).resolve().parent
@@ -137,7 +139,11 @@ class QMPClient:
         self.lock = threading.Lock()
         self.sequence = 0
 
-    def connect(self, timeout: float = 8.0) -> None:
+    def connect(self, timeout: float = 30.0) -> None:
+        # The greeting can arrive before the large NAND-backed machine has
+        # finished initialization and can answer qmp_capabilities. Keep one
+        # bounded startup deadline for both stages; ordinary commands retain
+        # their own timeout behavior.
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -145,7 +151,10 @@ class QMPClient:
                 sock.settimeout(max(0.001, deadline - time.monotonic()))
                 sock.connect(str(self.socket_path))
                 self.sock = sock
-                self.stream = sock.makefile("rwb", buffering=0)
+                # QMP audio replies contain tens of KiB of base64 PCM. Raw
+                # SocketIO.readline reads one byte at a time; buffer reads
+                # and explicitly flush each command instead.
+                self.stream = sock.makefile("rwb", buffering=65536)
                 greeting = self._read_message()
                 if "QMP" not in greeting:
                     raise QMPError("QMP greeting is missing")
@@ -172,6 +181,16 @@ class QMPClient:
                 sock.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
+            # makefile() retains a reference to the socket handle, so merely
+            # calling sock.close() here would defer closesocket until the
+            # buffered reader closes. On Windows shutdown can race with recv;
+            # stream.close() then waits on that reader's buffer lock. Detach
+            # and close the handle first so the pending I/O is cancelled.
+            # The file object still owns the now-detached socket object, not
+            # the numeric handle (which the OS may immediately reuse).
+            descriptor = sock.detach()
+            if descriptor != -1:
+                socket.close(descriptor)
         if stream is not None:
             try:
                 stream.close()
@@ -222,6 +241,7 @@ class QMPClient:
                 raise QMPError("QMP is not connected")
             try:
                 stream.write(json.dumps(request).encode("utf-8") + b"\r\n")
+                stream.flush()
             except socket.timeout:
                 raise
             except (OSError, ValueError) as error:
@@ -269,6 +289,7 @@ class Emulator:
                  rom_hle: bool = False,
                  rom_mp3_hle_base: int = 0,
                  rom_mp3_arena_image: int = 0,
+                 rom_npe_codec_socket: str | None = None,
                  hle_ui: bool = False,
                  startup_context: int = 0,
                  adc_level: int = 8,
@@ -287,14 +308,17 @@ class Emulator:
             raise ValueError("nand_image and nand_checkpoint are mutually exclusive")
         if rom_mp3_hle_base and (rom_hle or hle_ui or not soc_rom_skeleton or soc_rom is None):
             raise ValueError("MP3 HLE requires its marked strict skeleton, not legacy HLE")
-        if nand_journal is not None and nand_save_on_exit is not None:
-            for protected in (nand_journal, nand_image, nand_checkpoint):
-                if protected is not None and (
-                    nand_save_on_exit.resolve() == protected.resolve() or
-                    (nand_save_on_exit.exists() and protected.exists() and
-                     nand_save_on_exit.samefile(protected))
-                ):
-                    raise ValueError("NAND export must not overwrite the journal or its base")
+        if rom_npe_codec_socket and (rom_hle or hle_ui or not soc_rom_skeleton or soc_rom is None):
+            raise ValueError("NPE codec HLE requires a marked strict skeleton, not legacy HLE")
+        if rom_npe_codec_socket and any(c in rom_npe_codec_socket for c in ',\r\n\x00'):
+            raise ValueError("NPE codec socket path contains an invalid character")
+        self._export_protected = tuple(path for path in (
+            qemu, firmware, mask_rom, soc_rom, usb_loader, burn_code, driver_code,
+            * ((nand_journal, Path(str(nand_journal) + '.lock'),
+                nand_image, nand_checkpoint) if nand_journal is not None else ()),
+        ) if path is not None)
+        if nand_save_on_exit is not None:
+            self._validate_export_target(nand_save_on_exit)
         tag = f"np560-{os.getpid()}-{uuid.uuid4().hex[:12]}"
         self.audio_stream_id = tag
         self.qmp_path = Path(tempfile.gettempdir()) / f"{tag}.qmp"
@@ -310,6 +334,7 @@ class Emulator:
         self._closed = False
         self._exit_watcher = None
         self.process = None
+        self.codec_process: subprocess.Popen | None = None
         self.qmp = QMPClient(self.qmp_path)
         self.legacy_key_latch = rom_hle
         self.nand_save_on_exit = nand_save_on_exit
@@ -332,6 +357,8 @@ class Emulator:
             if not rom_mp3_hle_base:
                 raise ValueError('arena release image requires explicit MP3 HLE')
             machine_options.append(f"rom-mp3-arena-image={rom_mp3_arena_image}")
+        if rom_npe_codec_socket:
+            machine_options.append(f"rom-npe-codec-socket={rom_npe_codec_socket}")
         if soc_rom is not None:
             machine_options.append(f"soc-rom={soc_rom}")
             if soc_rom_skeleton:
@@ -376,6 +403,10 @@ class Emulator:
             if journal:
                 journal.record("qemu_spawned", qemu_pid=self.process.pid)
             self.qmp.connect()
+            self.atomic_key_input = any(
+                item.get("name") == "key-input-snapshot"
+                for item in self.qmp.execute("qom-list", {"path": "/machine"})
+            )
             self._exit_watcher = threading.Thread(
                 target=self._observe_exit, name="np560-qemu-exit", daemon=True,
             )
@@ -398,10 +429,19 @@ class Emulator:
     def health(self) -> dict:
         """Read process liveness without QMP, keys, or guest state mutation."""
         returncode = self.process.poll()
+        codec = getattr(self, "codec_process", None)
+        codec_returncode = codec.poll() if codec is not None else None
         return {
             **(self.journal.snapshot() if self.journal else {}),
             "qemu_pid": self.process.pid, "qemu_returncode": returncode,
             "qemu_alive": returncode is None,
+            "npe_codec_pid": codec.pid if codec is not None else None,
+            "npe_codec_returncode": codec_returncode,
+            "npe_codec_alive": (codec_returncode is None
+                                if codec is not None else None),
+            "key_input_transport": ("atomic-snapshot" if
+                                    getattr(self, "atomic_key_input", False)
+                                    else "legacy-properties"),
             "guest_health": "not_checked", "qemu_log": str(self.log_path),
         }
 
@@ -443,6 +483,14 @@ class Emulator:
         if save_error is not None:
             raise save_error
 
+    def _validate_export_target(self, target: Path) -> None:
+        # Recheck at export time too: an explicit API target or a path alias
+        # created after startup must not replace boot inputs or a held lock.
+        for protected in self._export_protected:
+            if target.resolve() == protected.resolve() or (
+                    target.exists() and protected.exists() and target.samefile(protected)):
+                raise ValueError(f"NAND export must not overwrite protected input: {protected}")
+
     def save_nand(self, path: Path | None = None,
                   *, timeout: float | None = None) -> Path:
         """Atomically serialize the live NAND data and OOB through QEMU."""
@@ -450,6 +498,7 @@ class Emulator:
         if target is None:
             raise ValueError("NAND save output was not configured")
         target = target.resolve()
+        self._validate_export_target(target)
         if not target.parent.is_dir():
             raise ValueError(f"NAND save directory not found: {target.parent}")
         self.qmp.execute("qom-set", {
@@ -478,6 +527,27 @@ class Emulator:
             "path": "/machine", "property": "debug-data-write",
             "value": f"0x{address:x}@{data.hex()}",
         })
+
+    def display(self) -> dict:
+        """Capture only the live panel signals needed by a regular Web frame.
+
+        The complete /api/state path remains available for diagnostics. It
+        also hashes LCD GRAM and reads CPU/NAND state, which need not interrupt
+        the guest five times per second merely to refresh its display.
+        """
+        if self.process.poll() is not None:
+            raise QMPError(f"QEMU exited with status {self.process.returncode}")
+        frame = self.qmp.execute("qom-get", {
+            "path": "/machine", "property": "lcd-frame",
+        })
+        annunciators = self.qmp.execute("qom-get", {
+            "path": "/machine", "property": "lcd-annunciators",
+        })
+        return {
+            "source": "lcd", "format": "gray5", "width": 240,
+            "height": 120, "stride": 240, "frame": frame,
+            "lcd_annunciators": annunciators,
+        }
 
     def snapshot(self, source: str, base: int, size: int, *, diagnostics: bool = True) -> dict:
         if self.process.poll() is not None:
@@ -635,6 +705,32 @@ class Emulator:
             "registers": registers,
         }
 
+    def opcode_profile(self) -> dict:
+        """Take one coherent opt-in instruction histogram snapshot."""
+        if not getattr(self, "opcode_profile_enabled", False):
+            raise ValueError("instruction opcode profiling is not enabled")
+        if self.process.poll() is not None:
+            raise QMPError(f"QEMU exited with status {self.process.returncode}")
+        was_running = bool(self.qmp.execute("query-status").get("running"))
+        if was_running:
+            self.qmp.execute("stop")
+        try:
+            raw = self.qmp.execute("qom-get", {
+                "path": "/machine", "property": "instruction-clock-profile",
+            })
+            return json.loads(raw)
+        finally:
+            if was_running:
+                self.qmp.execute("cont")
+
+    def npe_hle_state(self) -> dict:
+        """Read only the opt-in NPE service counters, without a frame capture."""
+        if self.process.poll() is not None:
+            raise QMPError(f"QEMU exited with status {self.process.returncode}")
+        return {"state": self.qmp.execute("qom-get", {
+            "path": "/machine", "property": "rom-npe-hle-state",
+        })}
+
     def completed_frame(self) -> dict:
         """Return the last fully written ST7529 window without diagnostics."""
         if self.process.poll() is not None:
@@ -665,6 +761,10 @@ class Emulator:
         """Read the device's virtual-time PCM ring without consuming it."""
         if self.process.poll() is not None:
             raise QMPError(f"QEMU exited with status {self.process.returncode}")
+        codec = getattr(self, "codec_process", None)
+        codec_returncode = codec.poll() if codec is not None else None
+        if codec_returncode is not None:
+            raise QMPError(f"NPE codec exited with status {codec_returncode}")
         raw = self.qmp.execute("qom-get", {"path": "/machine", "property": "audio-pcm"})
         if not isinstance(raw, str):
             raise QMPError("audio-pcm returned a non-string value")
@@ -757,7 +857,7 @@ class Emulator:
             "render_callback_object_valid", "direction_helper_active",
             "faulted",
         }
-        return {
+        result = {
             name: (
                 bool(status[name]) if name in boolean_fields else
                 int(status[name]) & (
@@ -766,6 +866,16 @@ class Emulator:
             )
             for name in fields
         }
+        # Optional observer fields: older cores must not manufacture zero
+        # readings for counters they do not implement.
+        for name in ("matrix_active_reads", "matrix_last_active_pc", "virtual_time_ns"):
+            if name in status:
+                result[name] = int(status[name])
+        if "full_control_observers" in status:
+            if type(status["full_control_observers"]) is not bool:
+                raise QMPError("invalid full_control_observers availability flag")
+            result["full_control_observers"] = status["full_control_observers"]
+        return result
 
     def control(self, action: str) -> None:
         commands = {
@@ -795,6 +905,16 @@ class Emulator:
         effective_state = state
         if not self.legacy_key_latch and (matrix_low or matrix_high):
             effective_state = 0
+        if getattr(self, "atomic_key_input", False):
+            self.qmp.execute("qom-set", {
+                "path": "/machine", "property": "key-input-snapshot",
+                "value": ":".join(f"{value & 0xFFFFFFFF:08x}" for value in (
+                    effective_state, effective_code, matrix_low, matrix_high)),
+            })
+            return
+        # Old binaries retain the historical API. Do not retry atomically
+        # failed writes through this path: transport errors are not evidence
+        # that a different protocol is safe.
         for name, value in (("key-code", effective_code),
                             ("key-matrix-low", matrix_low),
                             ("key-matrix-high", matrix_high),
@@ -975,7 +1095,8 @@ class RequestHandler(SimpleHTTPRequestHandler):
             return
         if parsed.path == "/api/health":
             health = self.emulator.health()
-            self._json(health, HTTPStatus.OK if health["qemu_alive"] else
+            self._json(health, HTTPStatus.OK if (health["qemu_alive"] and
+                        health["npe_codec_alive"] is not False) else
                        HTTPStatus.SERVICE_UNAVAILABLE)
             return
         if parsed.path == "/api/diagnostics":
@@ -984,9 +1105,27 @@ class RequestHandler(SimpleHTTPRequestHandler):
             except (ValueError, OSError, QMPError) as exc:
                 self._error(exc)
             return
+        if parsed.path == "/api/opcode-profile":
+            try:
+                self._json(self.emulator.opcode_profile())
+            except (ValueError, OSError, QMPError) as exc:
+                self._error(exc)
+            return
+        if parsed.path == "/api/npe-hle-state":
+            try:
+                self._json(self.emulator.npe_hle_state())
+            except (ValueError, OSError, QMPError) as exc:
+                self._error(exc)
+            return
         if parsed.path == "/api/frame":
             try:
                 self._json(self.emulator.completed_frame())
+            except (ValueError, OSError, QMPError) as exc:
+                self._error(exc)
+            return
+        if parsed.path == "/api/display":
+            try:
+                self._json(self.emulator.display())
             except (ValueError, OSError, QMPError) as exc:
                 self._error(exc)
             return
@@ -1095,9 +1234,21 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--firmware", type=Path, default=DEFAULT_FIRMWARE)
     parser.add_argument("--mask-rom", type=Path)
     parser.add_argument("--soc-rom", type=Path)
+    parser.add_argument('--soc-rom-bundle', type=Path,
+                        help='load resident.bin and validated v6 HLE addresses from its build manifest')
     parser.add_argument("--rom-mp3-hle-base", type=lambda s: int(s, 0), default=0)
     parser.add_argument("--rom-mp3-arena-image", type=lambda s: int(s, 0), default=0)
+    parser.add_argument("--rom-npe-codec-socket",
+                        help="experimental Unix socket for a locally supplied NPE decoder; strict ROM only")
+    parser.add_argument("--rom-npe-codec-dll", type=Path,
+                        help="start/stop an experimental local NPE codec service using this user-supplied DLL")
+    parser.add_argument("--rom-npe-codec-owned", action="store_true",
+                        help="start/stop the independent experimental mode-5 NPE codec; strict ROM only")
+    parser.add_argument("--rom-npe-codec-pythonpath", type=Path,
+                        help="optional Python dependency directory for the locally started codec service")
     parser.add_argument("--instruction-clock", action="store_true")
+    parser.add_argument("--profile-instruction-opcodes", action="store_true",
+                        help="opt-in CPU opcode histogram for isolated performance diagnostics")
     parser.add_argument("--full-control-observers", action="store_true",
                         help="enable expensive historical reverse-engineering traces")
     parser.add_argument(
@@ -1184,7 +1335,36 @@ def parse_args(argv=None) -> argparse.Namespace:
         help=("diagnostic only: hold these high 32 matrix bits before the "
               "first guest instruction; release them through /api/key"),
     )
+    parser.add_argument('--experimental-eq', action='store_true',
+                        help='allow v8 bundle with assumed EQ DSP; requires --soc-rom-bundle')
     args = parser.parse_args(argv)
+    if sum(bool(value) for value in (args.rom_npe_codec_dll,
+                                     args.rom_npe_codec_socket,
+                                     args.rom_npe_codec_owned)) > 1:
+        parser.error('NPE codec DLL, owned backend and external socket are mutually exclusive')
+    if args.rom_npe_codec_pythonpath and not args.rom_npe_codec_dll:
+        parser.error('--rom-npe-codec-pythonpath requires --rom-npe-codec-dll')
+    if args.rom_npe_codec_dll and not args.rom_npe_codec_dll.is_file():
+        parser.error(f'NPE codec DLL not found: {args.rom_npe_codec_dll}')
+    if (args.rom_npe_codec_pythonpath and
+            not args.rom_npe_codec_pythonpath.is_dir()):
+        parser.error(f'NPE codec dependency directory not found: {args.rom_npe_codec_pythonpath}')
+    if args.experimental_eq and not args.soc_rom_bundle:
+        parser.error('--experimental-eq requires --soc-rom-bundle')
+    if args.soc_rom_bundle:
+        supplied = {token.split('=', 1)[0] for token in argv if token.startswith('--')}
+        conflicts = supplied & {'--device', '--soc-rom', '--mask-rom', '--soc-rom-skeleton',
+                                '--rom-mp3-hle-base', '--rom-mp3-arena-image', '--rom-hle', '--hle-ui',
+                                '--rom-npe-codec-owned', '--rom-npe-codec-dll',
+                                '--rom-npe-codec-socket', '--rom-npe-codec-pythonpath'}
+        if conflicts:
+            parser.error('--soc-rom-bundle binds ROM settings; remove: ' + ', '.join(sorted(conflicts)))
+        try:
+            for key, value in player_bundle_settings(args.soc_rom_bundle, args.firmware,
+                    allow_experimental_eq=args.experimental_eq).items():
+                setattr(args, key, value)
+        except (ValueError, OSError, TypeError, AttributeError) as error:
+            parser.error(str(error))
     args.device_identity = None
     if args.device:
         supplied = {token.split("=", 1)[0] for token in argv if token.startswith("--")}
@@ -1194,7 +1374,8 @@ def parse_args(argv=None) -> argparse.Namespace:
                          ", ".join(sorted(conflicts)))
         try:
             args.device_identity = load_device(
-                args.device, args, qemu_override="--qemu" in supplied)
+                args.device, args, qemu_override="--qemu" in supplied,
+                runtime_overrides=supplied & RUNTIME_FLAGS)
         except (ValueError, OSError, subprocess.SubprocessError) as error:
             parser.error(str(error))
     return args
@@ -1252,6 +1433,59 @@ def main() -> int:
     return run_server(args)
 
 
+def start_owned_npe_codec(args: argparse.Namespace, journal: RunJournal,
+                          cleanup: ExitStack) -> subprocess.Popen:
+    """Own the selected local decoder for exactly this Web/QEMU lifetime."""
+    socket_dir = Path(cleanup.enter_context(
+        tempfile.TemporaryDirectory(prefix="np560-npe-codec-")))
+    socket_path = socket_dir / "codec.sock"
+    log_path = journal.directory / "npe-codec.log"
+    log = log_path.open("wb")
+    cleanup.callback(log.close)
+    env = os.environ.copy()
+    if args.rom_npe_codec_pythonpath is not None:
+        extra = str(args.rom_npe_codec_pythonpath.resolve())
+        env["PYTHONPATH"] = extra + (os.pathsep + env["PYTHONPATH"]
+                                      if env.get("PYTHONPATH") else "")
+    command = [sys.executable, str(PROJECT / "scripts" / "serve_np560_npe_codec.py"),
+               "--socket", str(socket_path)]
+    if args.rom_npe_codec_owned:
+        command += ["--backend", "owned"]
+    else:
+        command += ["--dll", str(args.rom_npe_codec_dll.resolve())]
+    journal.record("npe_codec_starting", command=command, log=str(log_path))
+    process = subprocess.Popen(
+        command, cwd=PROJECT, env=env, stdout=log, stderr=subprocess.STDOUT,
+        preexec_fn=terminate_child_with_parent if os.name == "posix" else None,
+    )
+
+    def stop_codec() -> None:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        journal.record("npe_codec_stopped", codec_pid=process.pid,
+                       codec_returncode=process.returncode)
+
+    cleanup.callback(stop_codec)
+    deadline = time.monotonic() + 10
+    while not socket_path.is_socket():
+        if process.poll() is not None:
+            raise RuntimeError(
+                f"NPE codec exited before listening (code {process.returncode}); "
+                f"see {log_path}")
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"NPE codec did not listen within 10 seconds; see {log_path}")
+        time.sleep(0.02)
+    args.rom_npe_codec_socket = str(socket_path)
+    journal.record("npe_codec_listening", codec_pid=process.pid,
+                   socket=str(socket_path), log=str(log_path))
+    return process
+
+
 def run_server(args: argparse.Namespace) -> int:
     journal = RunJournal(args.run_log_dir, host=args.host, port=args.port,
                          boot_mode=args.boot_mode,
@@ -1277,19 +1511,24 @@ def run_server(args: argparse.Namespace) -> int:
             server.block_on_close = False
             artifacts = {}
             for name in ("qemu", "firmware", "soc_rom", "mask_rom", "usb_loader",
-                         "burn_code", "driver_code", "nand_image", "nand_checkpoint"):
+                         "burn_code", "driver_code", "nand_image", "nand_checkpoint",
+                         "rom_npe_codec_dll"):
                 path = getattr(args, name)
                 if path is not None:
                     size, digest = artifact_identity(path)
                     artifacts[name] = {
                         "path": str(path.resolve()), "size": size, "sha256": digest,
                     }
-            for name in ("np560_web.py", "device_config.py", "app.js", "keyboard_input.js", "audio_output.js", "index.html"):
+            for name in ("np560_web.py", "device_config.py", "rom_bundle.py", "app.js", "keyboard_input.js", "audio_output.js", "index.html"):
                 size, digest = artifact_identity(ROOT / name)
                 artifacts[name] = {"size": size, "sha256": digest}
             journal.record("artifacts_identified", artifacts=artifacts,
                            host=server.server_address[0], port=server.server_port)
+            codec_process = None
+            if args.rom_npe_codec_dll is not None or args.rom_npe_codec_owned:
+                codec_process = start_owned_npe_codec(args, journal, cleanup)
             emulator = start_emulator(args, journal)
+            emulator.codec_process = codec_process
             cleanup.callback(close_runtime)
             emulator.device_identity = getattr(args, "device_identity", None)
             for address, path in args.debug_program_load:
@@ -1338,6 +1577,7 @@ def run_server(args: argparse.Namespace) -> int:
 
 def start_emulator(args: argparse.Namespace, journal: RunJournal) -> Emulator:
     instruction_clock = getattr(args, "instruction_clock", False)
+    opcode_profile = getattr(args, "profile_instruction_opcodes", False)
     realtime = getattr(args, 'realtime', False)
     minimal_observers = not (getattr(args, "full_control_observers", False) or
                             args.rom_hle or args.hle_ui)
@@ -1345,6 +1585,8 @@ def start_emulator(args: argparse.Namespace, journal: RunJournal) -> Emulator:
         raise ValueError("--instruction-clock requires --icount-shift 0")
     if realtime and not instruction_clock:
         raise ValueError('--realtime requires --instruction-clock')
+    if opcode_profile and not instruction_clock:
+        raise ValueError('--profile-instruction-opcodes requires --instruction-clock')
     emulator = Emulator(
         qemu=args.qemu, firmware=args.firmware,
         mask_rom=args.mask_rom, soc_rom=args.soc_rom,
@@ -1357,6 +1599,7 @@ def start_emulator(args: argparse.Namespace, journal: RunJournal) -> Emulator:
         hle_ui=args.hle_ui,
         rom_mp3_hle_base=getattr(args, "rom_mp3_hle_base", 0),
         rom_mp3_arena_image=getattr(args, "rom_mp3_arena_image", 0),
+        rom_npe_codec_socket=getattr(args, "rom_npe_codec_socket", None),
         startup_context=args.startup_context,
         adc_level=args.adc_level,
         external_power=args.external_power,
@@ -1375,6 +1618,8 @@ def start_emulator(args: argparse.Namespace, journal: RunJournal) -> Emulator:
         try:
             if instruction_clock:
                 emulator.qmp.execute("qom-set", {"path": "/machine", "property": "instruction-clock", "value": True})
+            if opcode_profile:
+                emulator.qmp.execute("qom-set", {"path": "/machine", "property": "instruction-clock-profile-enabled", "value": True})
             if minimal_observers:
                 emulator.qmp.execute("qom-set", {"path": "/machine", "property": "control-observers-minimal", "value": True})
             if not (args.debug_program_load or args.initial_key_matrix_low or args.initial_key_matrix_high):
@@ -1382,6 +1627,7 @@ def start_emulator(args: argparse.Namespace, journal: RunJournal) -> Emulator:
         except BaseException:
             emulator.close()
             raise
+    emulator.opcode_profile_enabled = opcode_profile
     return emulator
 
 

@@ -39,6 +39,10 @@ def check(qemu, bundle, output, hle):
             expected.append((pc, reg, value))
     if hle:
         words += [0xbd00 | (gate+48) >> 16, (gate+48) & 65535]
+    else:
+        for value in (1, 0):
+            expected.append((0x200000 + len(words)*2, 0x70, value))
+            words += [0x6870, value]
     final = 0x200000 + len(words)*2
     words += [0xd0ff]
     with tempfile.TemporaryDirectory(prefix="np560-audio-events-") as directory:
@@ -70,7 +74,7 @@ def check(qemu, bundle, output, hle):
             assert before == snapshot(), "reading a snapshot mutated device evidence"
             events = before["lifecycle_events" if hle else "control_events"]
             count = before["lifecycle_next" if hle else "control_event_next"]
-            assert count == (71 if hle else 70) and len(events) == 64
+            assert count == (71 if hle else 72) and len(events) == 64
             assert [e["sequence"] for e in events] == list(range(count-64,count))
             assert all(a["virtual_ns"] <= b["virtual_ns"] for a,b in zip(events,events[1:]))
             if hle:
@@ -86,10 +90,11 @@ def check(qemu, bundle, output, hle):
                 for event in events:
                     pc,reg,value = expected[event["sequence"]]
                     assert (event["pc"],event["reg"],event["value"]) == (pc,reg,value), event
-                    assert event["old_value"] == value  # repeated writes retained
+                    assert event["old_value"] == (1-value if reg == 0x70 else value)
+                    assert event["last_request_ns"] == [0, 0]
                     assert not event["enabled"] and not event["running"]
                     assert event["ticks"] == 0 and event["writes"] == [0,0]
-                assert before["writes"] == [0,0,35]
+                assert before["writes"] == [2,0,35]
             emu.qmp.execute("system_reset")
             reset = snapshot()
             assert reset["lifecycle_next" if hle else "control_event_next"] == 0

@@ -12,9 +12,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import re
+import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "tests"))
 from test_np560_system_boot import (
     application_calls,
     require_bottom_up_lcd_rows,

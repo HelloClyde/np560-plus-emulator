@@ -6,10 +6,17 @@ param(
     [string]$Firmware,
     [string]$MaskRom,
     [string]$SocRom,
+    [string]$SocRomBundle,
+    [switch]$ExperimentalEq,
     [switch]$SocRomSkeleton,
     [uint32]$RomMp3HleBase = 0,
     [uint32]$RomMp3ArenaImage = 0,
+    [string]$RomNpeCodecSocket,
+    [string]$RomNpeCodecDll,
+    [switch]$RomNpeCodecOwned,
+    [string]$RomNpeCodecPythonPath,
     [switch]$InstructionClock,
+    [switch]$ProfileInstructionOpcodes,
     [switch]$Realtime,
     [switch]$FullControlObservers,
     [string]$UsbLoader,
@@ -57,10 +64,11 @@ if ($Device -and $CreateDevice) {
 }
 if ($Device) {
     foreach ($boundSetting in @(
-        'Firmware', 'MaskRom', 'SocRom', 'SocRomSkeleton', 'UsbLoader', 'BurnCode',
+        'Firmware', 'MaskRom', 'SocRom', 'SocRomBundle', 'SocRomSkeleton', 'UsbLoader', 'BurnCode',
         'DriverCode', 'NandImage', 'NandCheckpoint', 'NandSaveOnExit', 'NandJournal',
         'BootMode', 'RomHle', 'HleUi', 'IcountShift', 'StartupContext', 'AdcLevel',
-        'ExternalPower'
+        'ExternalPower', 'RomNpeCodecSocket', 'RomNpeCodecDll',
+        'RomNpeCodecOwned', 'RomNpeCodecPythonPath'
     )) {
         if ($PSBoundParameters.ContainsKey($boundSetting)) {
             throw "Device configuration binds $boundSetting; remove the override."
@@ -86,8 +94,29 @@ if ($SocRom -and -not (Test-Path -LiteralPath $SocRom -PathType Leaf)) {
 if ($SocRom -and $MaskRom) {
     throw 'SocRom and MaskRom cannot be used together.'
 }
+if ($ExperimentalEq -and -not $SocRomBundle) { throw 'ExperimentalEq requires SocRomBundle.' }
+if ($SocRomBundle) {
+    if (-not (Test-Path -LiteralPath $SocRomBundle -PathType Container)) {
+        throw "ROM bundle directory not found: $SocRomBundle"
+    }
+    foreach ($setting in @('SocRom', 'MaskRom', 'SocRomSkeleton', 'RomMp3HleBase', 'RomMp3ArenaImage', 'RomNpeCodecSocket', 'RomNpeCodecDll', 'RomNpeCodecOwned', 'RomNpeCodecPythonPath', 'RomHle', 'HleUi')) {
+        if ($PSBoundParameters.ContainsKey($setting)) { throw "SocRomBundle binds $setting; remove the override." }
+    }
+}
 if ($SocRomSkeleton -and -not $SocRom) {
     throw 'SocRomSkeleton requires SocRom.'
+}
+if (@($RomNpeCodecDll, $RomNpeCodecSocket, $RomNpeCodecOwned.IsPresent).Where({ [bool]$_ }).Count -gt 1) {
+    throw 'RomNpeCodecDll, RomNpeCodecOwned and RomNpeCodecSocket are mutually exclusive.'
+}
+if ($RomNpeCodecPythonPath -and -not $RomNpeCodecDll) {
+    throw 'RomNpeCodecPythonPath requires RomNpeCodecDll.'
+}
+if ($RomNpeCodecDll -and -not (Test-Path -LiteralPath $RomNpeCodecDll -PathType Leaf)) {
+    throw "NPE codec DLL not found: $RomNpeCodecDll"
+}
+if ($RomNpeCodecPythonPath -and -not (Test-Path -LiteralPath $RomNpeCodecPythonPath -PathType Container)) {
+    throw "NPE codec dependency directory not found: $RomNpeCodecPythonPath"
 }
 if ($UsbLoader -and -not (Test-Path -LiteralPath $UsbLoader -PathType Leaf)) {
     throw "USB loader not found: $UsbLoader"
@@ -166,6 +195,7 @@ if ($IcountShift -ge 0) {
     $pythonArguments += @('--icount-shift', [string]$IcountShift)
 }
 if ($InstructionClock) { $pythonArguments += '--instruction-clock' }
+if ($ProfileInstructionOpcodes) { $pythonArguments += '--profile-instruction-opcodes' }
 if ($Realtime) { $pythonArguments += '--realtime' }
 if ($FullControlObservers) { $pythonArguments += '--full-control-observers' }
 if ($RomMp3HleBase) {
@@ -173,6 +203,22 @@ if ($RomMp3HleBase) {
 }
 if ($RomMp3ArenaImage) {
     $pythonArguments += @('--rom-mp3-arena-image', [string]$RomMp3ArenaImage)
+}
+if ($RomNpeCodecSocket) {
+    $pythonArguments += @('--rom-npe-codec-socket', $RomNpeCodecSocket)
+}
+if ($RomNpeCodecDll) {
+    $dllWindows = (Resolve-Path -LiteralPath $RomNpeCodecDll).Path -replace '\\', '/'
+    $wslDll = (& wsl.exe -d $distro -- wslpath -a -- $dllWindows).Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $wslDll) { throw 'Unable to translate NPE codec DLL path into WSL.' }
+    $pythonArguments += @('--rom-npe-codec-dll', $wslDll)
+}
+if ($RomNpeCodecOwned) { $pythonArguments += '--rom-npe-codec-owned' }
+if ($RomNpeCodecPythonPath) {
+    $depsWindows = (Resolve-Path -LiteralPath $RomNpeCodecPythonPath).Path -replace '\\', '/'
+    $wslDeps = (& wsl.exe -d $distro -- wslpath -a -- $depsWindows).Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $wslDeps) { throw 'Unable to translate NPE codec dependency path into WSL.' }
+    $pythonArguments += @('--rom-npe-codec-pythonpath', $wslDeps)
 }
 if ($ShutdownToken) {
     $pythonArguments += @('--shutdown-token', $ShutdownToken)
@@ -193,6 +239,13 @@ if ($MaskRom) {
         throw 'Unable to translate the mask ROM path into WSL.'
     }
     $pythonArguments += @('--mask-rom', $wslMaskRom)
+}
+if ($SocRomBundle) {
+    $bundleWindows = (Resolve-Path -LiteralPath $SocRomBundle).Path -replace '\\', '/'
+    $wslBundle = (& wsl.exe -d $distro -- wslpath -a -- $bundleWindows).Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $wslBundle) { throw 'Unable to translate ROM bundle path into WSL.' }
+    $pythonArguments += @('--soc-rom-bundle', $wslBundle)
+    if ($ExperimentalEq) { $pythonArguments += '--experimental-eq' }
 }
 if ($SocRom) {
     $socRomWindows = (Resolve-Path -LiteralPath $SocRom).Path -replace '\\', '/'

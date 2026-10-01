@@ -44,7 +44,7 @@ def run(qemu, output, name, words, expected, *, rom=None, tail=None,
         boot_mode="firmware", expected_disassembly=None,
         expected_lcd=None, expected_annunciators=None, expected_lcd_state=None,
         timeout=10, poll_interval=0.01, capture_ranges=None, expected_code=None,
-        profile_pc=False, rom_mp3_hle_base=0, minimal=False):
+        profile_pc=False, rom_mp3_hle_base=0, minimal=False, verify_hle_reset=False):
     final = (0x030000 if boot_mode == "firmware-vma03" else 0x200000) + len(words) * 2
     words = [*words, 0xD0FF]
     program = bytearray(pack(words))
@@ -171,6 +171,16 @@ def run(qemu, output, name, words, expected, *, rom=None, tail=None,
                     "actual_sha256": hashlib.sha256(actual).hexdigest(),
                     "expected_sha256": hashlib.sha256(expected_bytes).hexdigest()}
                 assert not differences, result[property_name]
+            if verify_hle_reset:
+                assert rom_mp3_hle_base, 'reset observation requires HLE'
+                # This owned synthetic guest is already stopped. Observe
+                # the board reset before allowing any boot code to run.
+                emulator.qmp.execute('system_reset')
+                reset_state = json.loads(emulator.qmp.execute('qom-get', {
+                    'path':'/machine', 'property':'rom-mp3-hle-state'}))
+                result['hle_after_reset'] = reset_state
+                assert reset_state['device_resets'] == result['rom_mp3_hle']['device_resets'] + 1
+                assert reset_state['sessions'] == 0
             result["passed"] = True
             print(f"passed {name}", flush=True)
         finally:

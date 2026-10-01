@@ -52,8 +52,11 @@ def run(qemu: Path, name: str, words: list[int], expected: dict[int, int]) -> No
             emulator.close()
 
 
-def run_original_waiter(qemu: Path, original_prg: Path) -> None:
+def run_original_waiter(qemu: Path, original_prg: Path, *, count: int = 3,
+                        instruction_clock: bool = False) -> dict:
     """Unmodified original waiter must complete through real Timer2 IRQs."""
+    if not 1 <= count <= 1000:
+        raise ValueError("bounded Timer2 wait requires count 1..1000")
     original = original_prg.read_bytes()
     with tempfile.TemporaryDirectory(prefix="np560-original-t2-wait-") as directory:
         root = Path(directory)
@@ -72,13 +75,20 @@ def run_original_waiter(qemu: Path, original_prg: Path) -> None:
         # Supply architectural startup configuration, not a patched waiter:
         # RAM vectors, PLL ratio 1:1 (4 MHz), CLKCON divide-by-one.
         caller = [0x68FF, 0x4000, 0x6800, 0x0002, 0x68E9, 0x8000,
-                  0xEE00, 0x682E, 0, 0xFE00, 0x68F0, 3, 0xBD08, 0x4F00,
-                  0x68F4, 0x600D, 0xD0FF]
+                  0xEE00, 0x682E, 0, 0xFE00,
+                  # Inactive DAC control writes mark call boundaries in the
+                  # existing virtual-time event log; no audio requests start.
+                  0x6872, 0x8000, 0x68F0, count, 0xBD08, 0x4F00,
+                  0x6872, 0x8000, 0x68F4, 0x600D, 0xD0FF]
         final_pc = f"PC=20:{2 * (len(caller) - 1):04x}"
         firmware.write_bytes(struct.pack(f"<{len(caller)}H", *caller))
         emulator = Emulator(qemu=qemu, firmware=firmware, soc_rom=resident,
-                            soc_rom_skeleton=True, start_paused=True)
+                            soc_rom_skeleton=True, start_paused=True,
+                            icount_shift=0 if instruction_clock else None)
         try:
+            if instruction_clock:
+                emulator.qmp.execute("qom-set", {"path": "/machine",
+                    "property": "instruction-clock", "value": True})
             emulator.qmp.execute("cont")
             deadline = time.monotonic() + 5
             state = ""
@@ -99,10 +109,20 @@ def run_original_waiter(qemu: Path, original_prg: Path) -> None:
             timer = emulator.qmp.execute("qom-get", {
                 "path": "/machine", "property": "timer2-state"})
             expired = re.search(r"\bEXPIRED:(\d+)", timer)
-            assert expired and int(expired[1]) >= 3, timer
+            assert expired and int(expired[1]) >= count, timer
             assert "RUNNING:0" in timer and "ICR:0000" in timer, timer
             assert "PRELOAD:0000" in timer and "CONTROL:0000" in timer, timer
-            print("Original 08:47A4: hardware Timer2 returns, countdown=0, restored SP/config; " + timer)
+            events = emulator.audio()['control_events']
+            assert len(events) == 2 and all(e['reg'] == 0x72 and not e['enabled'] for e in events)
+            elapsed_ms = (events[1]['virtual_ns'] - events[0]['virtual_ns']) / 1e6
+            if instruction_clock:
+                assert count <= elapsed_ms < count + 0.5, (count, elapsed_ms)
+                assert int(expired[1]) == count, timer
+            result = dict(count=count, elapsed_ms=elapsed_ms,
+                          instruction_clock=instruction_clock, timer=timer,
+                          host_guest_memory_writes=0, original_waiter_unchanged=True)
+            print("Original 08:47A4: " + str(result), flush=True)
+            return result
         finally:
             emulator.close()
 

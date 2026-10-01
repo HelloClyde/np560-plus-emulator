@@ -48,6 +48,20 @@ class WebSpeedTests(unittest.TestCase):
         self.assertFalse(any(c.args[1].get('property') == 'cpu-state'
                              for c in emu.qmp.execute.call_args_list if len(c.args) > 1))
 
+    def test_regular_display_reads_only_panel_and_annunciators(self):
+        emu = web.Emulator.__new__(web.Emulator)
+        emu.process = Mock()
+        emu.process.poll.return_value = None
+        emu.qmp = Mock()
+        emu.qmp.execute.side_effect = lambda cmd, args: 'test-' + args['property']
+        panel = emu.display()
+        self.assertEqual(panel['frame'], 'test-lcd-frame')
+        self.assertEqual(panel['lcd_annunciators'], 'test-lcd-annunciators')
+        self.assertEqual(panel['format'], 'gray5')
+        self.assertEqual([call.args[1]['property'] for call in
+                          emu.qmp.execute.call_args_list],
+                         ['lcd-frame', 'lcd-annunciators'])
+
     def test_start_configures_observers_before_first_instruction(self):
         args = SimpleNamespace(**{k:None for k in ('qemu','firmware','mask_rom','soc_rom',
             'usb_loader','burn_code','driver_code','nand_image','nand_checkpoint','nand_save_on_exit')})

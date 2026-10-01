@@ -17,7 +17,8 @@ import unittest
 from unittest.mock import patch
 
 from web import np560_web as web
-from web.device_config import create_device, load_device
+from web.device_config import create_device, load_device, validate_settings, RUNTIME_DEFAULTS
+from web.rom_bundle import NPE_ENTRY_OFFSETS
 
 
 class DeviceConfigTests(unittest.TestCase):
@@ -32,15 +33,92 @@ class DeviceConfigTests(unittest.TestCase):
             self.inputs[key] = path
         self.config = self.root / "my device" / "device.json"
 
-    def create(self):
+    def create(self, **settings):
         args = web.parse_args([])
         for key, value in self.inputs.items():
             setattr(args, key, value)
         args.boot_mode = "firmware-vma03"
         args.soc_rom_skeleton = True
         args.icount_shift = 5
+        for key, value in settings.items():
+            setattr(args, key, value)
         create_device(self.config, args)
         return args
+
+    def test_player_runtime_settings_survive_device_reopen(self):
+        self.create(rom_mp3_hle_base=138790, rom_mp3_arena_image=93952,
+                    instruction_clock=True, realtime=True, icount_shift=0)
+        stored = self.config.read_bytes()
+        loaded = web.parse_args(['--device', str(self.config)])
+        self.assertEqual(loaded.rom_mp3_hle_base, 138790)
+        self.assertEqual(loaded.rom_mp3_arena_image, 93952)
+        self.assertTrue(loaded.instruction_clock)
+        self.assertTrue(loaded.realtime)
+        self.assertEqual(loaded.icount_shift, 0)
+        self.assertEqual(self.config.read_bytes(), stored)
+
+    def test_owned_npe_backend_survives_reopen_and_requires_marked_rom(self):
+        with self.assertRaisesRegex(ValueError, 'NPE-owned device ROM lacks'):
+            self.create(rom_npe_codec_owned=True)
+        self.assertFalse(self.config.exists())
+        image = bytearray(max(NPE_ENTRY_OFFSETS) + 4)
+        for entry in NPE_ENTRY_OFFSETS:
+            image[entry:entry + 4] = b'\x00\x0f\x20\xc6'
+        self.inputs['soc_rom'].write_bytes(image)
+        self.create(rom_npe_codec_owned=True)
+        loaded = web.parse_args(['--device', str(self.config)])
+        self.assertTrue(loaded.rom_npe_codec_owned)
+
+    def test_v2_device_still_loads_without_rewriting(self):
+        self.create()
+        self.update(lambda data: (data.update(schema='np560-device-v2'),
+                                  data['settings'].pop('rom_npe_codec_owned')))
+        stored = self.config.read_bytes()
+        loaded = web.parse_args(['--device', str(self.config)])
+        self.assertFalse(loaded.rom_npe_codec_owned)
+        self.assertEqual(self.config.read_bytes(), stored)
+
+    def test_instruction_clock_requires_zero_shift_even_without_realtime(self):
+        for shift in (None, 1, 5):
+            with self.subTest(shift=shift):
+                self.config = self.root / str(shift) / 'device.json'
+                with self.assertRaisesRegex(ValueError, 'instruction_clock.*icount_shift 0'):
+                    self.create(instruction_clock=True, realtime=False, icount_shift=shift)
+                self.assertFalse(self.config.exists(), 'invalid device must not be persisted')
+
+    def test_reopen_rejects_invalid_instruction_clock_before_launch(self):
+        self.create()
+        self.update(lambda data: data['settings'].update(instruction_clock=True, realtime=False))
+        before = self.config.read_bytes()
+        with self.assertRaises(SystemExit):
+            web.parse_args(['--device', str(self.config)])
+        self.assertEqual(self.config.read_bytes(), before)
+
+    def test_legacy_device_still_loads_without_rewriting(self):
+        self.create()
+        def legacy(data):
+            data['schema'] = 'np560-device-v1'
+            for key in RUNTIME_DEFAULTS:
+                del data['settings'][key]
+        self.update(legacy)
+        stored = self.config.read_bytes()
+        loaded = web.parse_args(['--device', str(self.config)])
+        for key, expected in RUNTIME_DEFAULTS.items():
+            self.assertEqual(getattr(loaded, key), expected)
+        legacy_override = web.parse_args(['--device', str(self.config),
+                                          '--rom-mp3-hle-base', '138790'])
+        self.assertEqual(legacy_override.rom_mp3_hle_base, 138790)
+        self.assertEqual(self.config.read_bytes(), stored)
+
+    def test_invalid_runtime_settings_rejected(self):
+        self.create()
+        settings = json.loads(self.config.read_text())['settings']
+        for changed in ({'rom_mp3_hle_base': 3}, {'rom_mp3_hle_base': -2},
+                        {'rom_mp3_hle_base': 0x1000000}, {'rom_mp3_hle_base': True},
+                        {'rom_mp3_arena_image': 93952}, {'realtime': True},
+                        {'instruction_clock': 1}, {'rom_npe_codec_owned': 1}):
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                validate_settings({**settings, **changed})
 
     def update(self, mutate):
         data = json.loads(self.config.read_text(encoding="utf-8"))
@@ -93,7 +171,10 @@ class DeviceConfigTests(unittest.TestCase):
         for extra in (["--rom-hle"], ["--adc-level=8"], ["--nand-journal", "other"],
                       ["--boot-mode", "firmware"], ["--startup-context", "0"],
                       ["--nand-save-on-exit", str(self.config)],
-                      ["--initial-key-matrix-low", "0"]):
+                      ["--initial-key-matrix-low", "0"], ['--instruction-clock'],
+                      ['--realtime'], ['--rom-mp3-hle-base', '138790'],
+                      ['--rom-mp3-arena-image', '93952'],
+                      ['--rom-npe-codec-owned']):
             with self.subTest(extra=extra), patch.object(web.sys, "stderr"), \
                     self.assertRaises(SystemExit) as error:
                 web.parse_args(["--device", str(self.config)] + extra)

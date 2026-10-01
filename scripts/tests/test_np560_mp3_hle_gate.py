@@ -65,6 +65,16 @@ def check(qemu, bundle, output, name, *, enabled=True, unknown=False,
             (output/f"{name}.cpu.txt").write_text(state)
             stats = json.loads(emu.qmp.execute("qom-get", {"path":"/machine", "property":"rom-mp3-hle-state"}))
             result["hle"] = stats
+            if enabled:
+                assert stats['codec_results'] == dict.fromkeys((
+                    'ok', 'short', 'bad_header', 'unsupported', 'bad_crc',
+                    'no_pcm', 'decode_error', 'missing_history'), 0), stats
+                assert stats['no_pcm_reasons'] == dict.fromkeys((
+                    'invalid_sideinfo', 'missing_history', 'unknown'), 0), stats
+                assert stats['last_no_pcm'] == dict.fromkeys((
+                    'reason', 'available_history', 'required_history'), 0), stats
+                assert stats['history_recovery'] == dict.fromkeys((
+                    'startup_frames', 'after_output', 'no_progress', 'max_startup_frames'), 0), stats
             assert "ROM_HLE=off" in state and "HLE_UI=off" in state
             if missing:
                 assert f"ROM_MISSING={target>>16:02x}:{target&65535:04x}" in state

@@ -15,10 +15,17 @@ from scripts.probe_np560_npe_action_target import (
     movement_state,
     position_state,
     spiral_directions,
+    wait_for_direction_path,
 )
 
 
 class NPEActionTargetProbeTests(unittest.TestCase):
+    def test_disabled_observers_are_unavailable_not_zero_evidence(self):
+        status = {"full_control_observers": False, "direction_helper_calls": 0}
+        self.assertIsNone(movement_state(status))
+        with self.assertRaisesRegex(RuntimeError, '--full-control-observers'):
+            wait_for_direction_path(None, status, 'up', timeout=1, poll_interval=.1)
+
     def test_spiral_directions_expand_two_legs_per_length(self) -> None:
         self.assertEqual(list(spiral_directions(12)), [
             "right", "down",

@@ -10,8 +10,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "tests"))
 from test_np560_dtu import read_sfr, read_word, write_word
 from test_np560_mac import run
 
@@ -78,7 +80,93 @@ def timing(qemu, output, original, rate, count, increment, icount):
                    {"original_functions": ["08:385C..38A2", "08:37F4..381E"],
                     "sample_rate": rate, "diagnostic_sample_count": count,
                     "expected_increment_q16_ms": increment,
-                    "actual_decoder_sample_count_proven": False}, icount)
+                   "actual_decoder_sample_count_proven": False}, icount)
+
+
+def repeat_pcm(qemu, output, original, count, repeat, icount):
+    """Execute the real post-decoder repeat helper, not a missing codec stub."""
+    words = initial()
+    samples = [0x8000, 0x7FFF]
+    for i, sample in enumerate(samples):
+        write_word(words, 0x2984 + i * 2, sample)
+    for address in range(0x0FFE, 0x1012, 2):
+        write_word(words, address, 0x5AA5)
+    push(words, [0, 0x2984, 0, 0x1000, count, repeat])
+    words += [0xBD08, 0x372A, 0x50FC]
+    expected_samples = [value for value in samples[:count] for _ in range(repeat)]
+    expected = {i: expected_samples[i] if i < len(expected_samples) else 0x5AA5
+                for i in range(8)}
+    for i in range(8):
+        read_word(words, 0x1000 + i * 2, i)
+    read_word(words, 0x0FFE, 8)
+    read_word(words, 0x1010, 9)
+    read_sfr(words, 0x10, 10)
+    read_sfr(words, 0x11, 12)
+    expected.update({8: 0x5AA5, 9: 0x5AA5, 10: 0xA2, 12: 0xA2,
+                     11: 0x4444, 15: 0x6000})
+    return execute(qemu, output, original, f"repeat-pcm-{count}-{repeat}", words,
+                   expected, {"original_function": "08:372A..3788",
+                              "diagnostic_pcm": samples, "count": count,
+                              "repeat": repeat, "codec_executed": False,
+                              "filter_executed": False}, icount)
+
+
+def swap_audio_words(qemu, output, original, count, icount):
+    """Execute the original in-place byte-lane swap used by the NPE path."""
+    words = initial()
+    for address, value in ((0x87FE, 0x5AA5), (0x8800, 0x1234),
+                           (0x8802, 0xABCD), (0x8804, 0x5AA5)):
+        write_word(words, address, value)
+    push(words, [0, 0x8800, count])
+    words += [0xBD2C, 0x0E1E, 0x50F6]
+    for address, register in ((0x87FE, 2), (0x8800, 3),
+                              (0x8802, 4), (0x8804, 5)):
+        read_word(words, address, register)
+    expected = {2: 0x5AA5, 3: 0x3412 if count else 0x1234,
+                4: 0xCDAB if count == 2 else 0xABCD, 5: 0x5AA5,
+                11: 0x4444, 15: 0x6000}
+    return execute(qemu, output, original, f"swap-audio-words-{count}",
+                   words, expected,
+                   {"original_function": "2C:0E1E..0E5C",
+                    "caller": "25:E218", "word_count": count,
+                    "codec_executed": False}, icount)
+
+
+def gain_pcm(qemu, output, original, current, target, count, icount):
+    """Real NPE x2 gain helper with the full PRG, including its gain table."""
+    words = initial()
+    samples = [-30000, 30000]
+    for address, value in ((0x2982, 0x5AA5), (0x2988, 0x5AA5),
+                           (0x4A64, (current << 8) | target)):
+        write_word(words, address, value)
+    for i, sample in enumerate(samples):
+        write_word(words, 0x2984 + i * 2, sample & 65535)
+    push(words, [0, 0x2984, count])
+    words += [0xBD08, 0x3536, 0x50F6]
+    level = current + (target > current) - (target < current)
+    table = [0, 0x2027, 0x287A, 0x32F5, 0x4027, 0x50C3, 0x65AD, 0x7FFF]
+    assert original[0x3057E6:0x3057F6] == b''.join(x.to_bytes(2, 'little') for x in table)
+    output_samples = []
+    for sample in samples:
+        value = 0
+        for _ in range(2):
+            value = ((value + sample * table[level] * 2 + 32768) // 65536) * 65536
+            value = min(2147483647, max(-2147483648, value))
+        output_samples.append((value // 65536 if count else sample) & 65535)
+    for address, register in ((0x2984, 2), (0x2986, 3), (0x4A64, 4),
+                              (0x2982, 5), (0x2988, 6)):
+        read_word(words, address, register)
+    read_sfr(words, 0x10, 8)
+    read_sfr(words, 0x11, 9)
+    expected = {2: output_samples[0], 3: output_samples[1],
+                4: (level << 8) | target, 5: 0x5AA5, 6: 0x5AA5,
+                8: 0xA2, 9: 0xA2, 11: 0x4444, 15: 0x6000}
+    return execute(qemu, output, original, f'gain-{current}-{target}-{count}',
+                   words, expected, {'original_function': '08:3536..35AA',
+                                    'diagnostic_pcm': samples, 'count': count,
+                                    'current': current, 'target': target,
+                                    'coefficient': table[level],
+                                    'codec_executed': False}, icount)
 
 
 def main():
@@ -95,11 +183,24 @@ def main():
               "qemu_sha256": hashlib.sha256(args.qemu.read_bytes()).hexdigest(),
               "codec_executed": False, "cases": [], "original_ranges": {}}
     for begin, end in ((0x2C0C56, 0x2C0D72), (0x32B788, 0x32B7DA),
-                       (0x0837F4, 0x083820), (0x08385C, 0x0838A4)):
+                       (0x0837F4, 0x083820), (0x08385C, 0x0838A4),
+                       (0x08372A, 0x08378A), (0x083536, 0x0835AC),
+                       (0x2C0E1E, 0x2C0E5E),
+                       (0x3357E6, 0x3357F6)):
         report["original_ranges"][f"{begin:06X}:{end:06X}"] = hashlib.sha256(
             original[begin-0x30000:end-0x30000]).hexdigest()
     try:
         for icount in (None, 5):
+            for current, target, count in ((7, 0, 2), (0, 7, 2), (0, 0, 2),
+                                            (7, 7, 2), (7, 0, 0)):
+                report["cases"].append(gain_pcm(args.qemu, args.output, original,
+                                                 current, target, count, icount))
+            for count, repeat in ((2, 4), (0, 4), (2, 0)):
+                report["cases"].append(repeat_pcm(args.qemu, args.output, original,
+                                                   count, repeat, icount))
+            for count in (0, 2):
+                report["cases"].append(swap_audio_words(
+                    args.qemu, args.output, original, count, icount))
             for lookahead in ("f16b", "0000"):
                 report["cases"].append(header(args.qemu, args.output, original, lookahead, icount))
             for rate, count, increment in ((8000, 160, 20 << 16),

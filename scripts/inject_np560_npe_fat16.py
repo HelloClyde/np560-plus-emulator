@@ -56,7 +56,18 @@ FTL_LANES = (0xC00, 0x800, 0x400, 0x000)
 FAT16_EOC = 0xFFFF
 
 DEFAULT_DIRECTORY = "应用程序"
-DEFAULT_NPE = Path(r"D:\Downloads\NP560plus游戏全集\英雄传奇.npe")
+DEFAULT_NPE = Path(r"D:\Downloads\NP560plus游戏全集\天降风云V1.3.npe")
+# FAT16 short names allow only eight GB18030 bytes; the source file's
+# version suffix cannot fit.  Keep this name only for the default fixture.
+DEFAULT_GAME_STEM = "天降风云"
+
+
+def game_stem_for_import(npe_path: Path, explicit_name: str | None) -> str:
+    if explicit_name is not None:
+        return explicit_name
+    if npe_path.resolve() == DEFAULT_NPE.resolve():
+        return DEFAULT_GAME_STEM
+    return npe_path.stem
 
 
 def pair_swap(data: bytes) -> bytes:
@@ -549,7 +560,10 @@ def main() -> int:
     parser.add_argument("destination_checkpoint", type=Path)
     parser.add_argument("--npe", type=Path, default=DEFAULT_NPE)
     parser.add_argument("--directory", default=DEFAULT_DIRECTORY)
-    parser.add_argument("--game-name", help="8-byte GB18030 FAT stem; defaults to file stem")
+    parser.add_argument(
+        "--game-name",
+        help="8-byte GB18030 FAT stem; default fixture uses 天降风云, others use file stem",
+    )
     parser.add_argument(
         "--omit-dot-entries",
         action="store_true",
@@ -571,6 +585,7 @@ def main() -> int:
         raise FileExistsError(destination)
     npe_blob = args.npe.read_bytes()
     npe_report = analyse_blob(npe_blob, name=args.npe.name)
+    game_stem = game_stem_for_import(args.npe, args.game_name)
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source, destination)
@@ -583,13 +598,13 @@ def main() -> int:
                     volume,
                     npe_blob,
                     directory=args.directory,
-                    game_stem=args.game_name or args.npe.stem,
+                    game_stem=game_stem,
                     include_dot_entries=not args.omit_dot_entries,
                 )
                 report["readback"] = verify_game(
                     volume,
                     directory=args.directory,
-                    game_stem=args.game_name or args.npe.stem,
+                    game_stem=game_stem,
                     expected_blob=npe_blob,
                 )
                 image[48:56] = b"\0" * 8

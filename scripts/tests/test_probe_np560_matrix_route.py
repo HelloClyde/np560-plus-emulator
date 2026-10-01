@@ -11,6 +11,7 @@ _test_sys.path.insert(0, str(_TestPath(__file__).resolve().parent))
 import argparse
 import base64
 import json
+import itertools
 import tempfile
 import unittest
 from pathlib import Path
@@ -42,6 +43,106 @@ from scripts.probe_np560_matrix_route import (
 
 
 class MatrixRouteProbeTests(unittest.TestCase):
+    def test_contact_bounds_are_optional_and_do_not_invent_missing_clock(self):
+        for times, expected in (([100, 120, 210, 230], (90, 130)),
+                                ([100, 120, 110, 230], None),
+                                ([None] * 4, None)):
+            class FakeWeb:
+                def __init__(self): self.inputs = []; self.calls = 0
+                def set_matrix(self, index): self.inputs.append(index)
+                def get_json(self, path):
+                    stamp = times[min(self.calls, 3)]
+                    self.calls += 1
+                    state = dict(matrix_reads=self.calls, candidates=0, maps=0)
+                    if stamp is not None: state['virtual_time_ns'] = stamp
+                    return state
+            web = FakeWeb()
+            ticks = itertools.count(0, .001)
+            with patch.object(route_module.time, 'monotonic', side_effect=lambda: next(ticks)), \
+                    patch.object(route_module.time, 'sleep'), \
+                    self.assertRaises(route_module.KeyObservationTimeout) as caught:
+                route_module.replay_step(web, parse_step('up:61:0x82'),
+                    press_timeout=.03, release_timeout=.01, poll_interval=.001,
+                    settle=0, pulse_duration=.01, observe_contact_bounds=True)
+            bounds = caught.exception.input_evidence['contact_bounds']
+            self.assertEqual(web.inputs, [61, None])
+            if expected is None:
+                self.assertNotIn('guest_contact_lower_ns', bounds)
+            else:
+                self.assertEqual((bounds['guest_contact_lower_ns'],
+                                  bounds['guest_contact_upper_ns']), expected)
+
+    def test_candidate_timeline_keeps_virtual_time_separate_from_host(self):
+        point = key_counter_timeline_point(
+            dict(virtual_time_ns=1000), dict(virtual_time_ns=9000), .2)
+        self.assertEqual(point['elapsed_seconds'], .2)
+        self.assertEqual(point['virtual_time_ns'], 9000)
+        self.assertEqual(point['virtual_elapsed_ns'], 8000)
+
+    def test_success_records_contact_not_just_post_candidate_hold(self):
+        baseline = dict(matrix_reads=10, candidates=0, maps=0,
+                        acknowledgements=0, modal_acknowledgements=0,
+                        virtual_time_ns=1000)
+        observed = dict(baseline, candidates=2, candidate=0x83, maps=2,
+                        event=0x83, modal_acknowledgements=2,
+                        modal_acknowledgement=0x83, virtual_time_ns=9000)
+        class FakeWeb:
+            def __init__(self): self.inputs = []; self.reads = 0
+            def set_matrix(self, index): self.inputs.append(index)
+            def get_json(self, path):
+                self.reads += 1
+                return baseline if self.reads == 1 else observed
+        web = FakeWeb()
+        delivered = dict(observed, acknowledgement=0, acknowledgement_path='modal')
+        ticks = itertools.count(0, .01)
+        with patch.object(route_module.time, 'monotonic', side_effect=lambda: next(ticks)), \
+                patch.object(route_module, 'wait_for_delivery_and_matrix_rearm',
+                             return_value=(20, delivered)):
+            result = route_module.replay_step(web, parse_step('down:37:0x83'),
+                press_timeout=1, release_timeout=1, poll_interval=.1, settle=0)
+        self.assertEqual(web.inputs, [37, None])
+        self.assertGreater(result['host_contact_request_interval_seconds'],
+                           result['hold_duration_observed_seconds'])
+        self.assertEqual(result['candidate_observation']['maps_delta'], 2)
+        self.assertEqual(result['candidate_observation']['virtual_elapsed_ns'], 8000)
+        self.assertEqual(result['matrix_make_requests'], 1)
+        self.assertEqual(result['modal_acknowledgements_total'], 2)
+
+    def test_rejected_make_is_not_misreported_as_guest_timeout(self):
+        web = WebBridge("http://unused", 1)
+        with patch.object(web, "post_json", return_value={"ok": True, "applied": False}):
+            with self.assertRaisesRegex(RuntimeError, "rejected physical"):
+                web.set_matrix(53)
+
+    def test_timeout_keeps_observed_counters_and_releases(self):
+        class FakeWeb:
+            def __init__(self):
+                self.calls = 0
+                self.inputs = []
+            def set_matrix(self, index):
+                self.inputs.append(index)
+            def get_json(self, path):
+                self.assert_path = path
+                self.calls += 1
+                return {"matrix_reads": 100 + self.calls,
+                        "candidates": 5, "candidate": 0x83,
+                        "maps": 4, "matrix_rearmed": True}
+        web = FakeWeb()
+        ticks = itertools.count(0, .001)
+        with patch.object(route_module.time, "monotonic", side_effect=lambda: next(ticks)), \
+                patch.object(route_module.time, "sleep"), \
+                self.assertRaises(route_module.KeyObservationTimeout) as caught:
+            route_module.replay_step(web, parse_step("confirm:53:0x86"),
+                press_timeout=.01, release_timeout=.01, poll_interval=.001,
+                settle=0, pulse_duration=.001)
+        evidence = caught.exception.input_evidence
+        self.assertEqual(web.inputs, [53, None])
+        self.assertTrue(evidence["released_before_timeout"])
+        self.assertGreater(evidence["last_observation"]["matrix_reads"],
+                           evidence["before"]["matrix_reads"])
+        self.assertEqual(evidence["last_observation"]["candidates"], 5)
+        self.assertGreaterEqual(evidence["contact_after_make_ack_upper_bound_seconds"], .001)
+
     def test_post_ack_rom_failure_still_records_failed_step(self) -> None:
         # Matches the native Hero failure: replay_step returns after ACK, but
         # the final full-state capture sees a newly reached ROM hole.

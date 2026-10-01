@@ -91,6 +91,8 @@ POSITION_STATE_FIELDS = (
 
 
 def movement_state(status: dict) -> dict | None:
+    if status.get("full_control_observers") is False:
+        return None
     if not all(field in status for field in MOVEMENT_STATE_FIELDS):
         return None
     return {field: int(status[field]) for field in MOVEMENT_STATE_FIELDS}
@@ -111,12 +113,16 @@ def wait_for_direction_path(
     poll_interval: float, helper_timeout: float | None = None,
 ) -> tuple[dict, int]:
     """Wait until the original game controller accepts one direction."""
+    if before.get("full_control_observers") is False:
+        raise RuntimeError("direction tracing requires --full-control-observers")
     field = DIRECTION_COUNTER_FIELDS[direction]
     deadline = time.monotonic() + timeout
     helper_wait_extended = False
     after = before
     while time.monotonic() < deadline:
         after = web.get_json("/api/key-status")
+        if after.get("full_control_observers") is False:
+            raise RuntimeError("direction tracing was disabled during observation")
         raise_if_key_status_faulted(web, after)
         delta = int(after[field]) - int(before[field])
         if delta == 1:

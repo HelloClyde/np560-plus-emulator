@@ -2,7 +2,6 @@
 #define HW_DMCU_NP560_AUDIO_H
 
 #include "qemu/timer.h"
-#include "hw/ptimer.h"
 #include "cpu.h"
 
 /* Host presentation rate, not the guest DAC clock. Register transitions are
@@ -18,19 +17,28 @@ typedef struct NP560AudioControlEvent {
     uint64_t frame, ticks, writes[2], empty[2], outside[2];
     uint32_t pc;
     uint16_t reg, old_value, value;
+    int64_t last_request_ns[2];
     bool enabled, running;
 } NP560AudioControlEvent;
 
 typedef struct NP560AudioState {
     DMCUCPU *cpu;
     QEMUTimer *timer;
-    ptimer_state *request_timer;
+    QEMUTimer *request_timer;
+    int64_t request_deadline_ns;
+    uint32_t request_fraction;
     uint32_t request_hz;
     uint64_t request_ticks;
+    uint64_t request_late_ticks;
+    int64_t request_last_deadline_ns;
+    int64_t request_last_lateness_ns;
+    int64_t request_max_lateness_ns;
     uint64_t request_writes[2];
     uint64_t request_without_write[2];
     uint64_t request_multiple_writes[2];
     uint64_t writes_outside_request[2];
+    int64_t current_request_ns;
+    int64_t last_request_ns[2];
     uint16_t pll;
     bool request_running;
     bool request_in_progress;

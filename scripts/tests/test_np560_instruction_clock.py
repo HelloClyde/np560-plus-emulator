@@ -94,7 +94,7 @@ def program(name):
 
 
 def fields(text):
-    return {k: int(v, 16 if k in ("FRACTION", "LAST_UNKNOWN") else 10)
+    return {k: int(v, 16 if k in ("FRACTION", "LAST_UNKNOWN", "CLKCON", "PLL", "AUDIO_PLL") else 10)
             for k,v in re.findall(r"\b([A-Z_]+):([0-9a-f]+)\b", text)}
 
 

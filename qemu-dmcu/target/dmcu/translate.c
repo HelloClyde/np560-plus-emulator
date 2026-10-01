@@ -253,9 +253,15 @@ static void dmcu_tr_translate_insn(DisasContextBase *db, CPUState *cs)
     } else {
         extension = tcg_constant_i32(word1);
     }
-    gen_helper_exec(exec_result, tcg_env, tcg_constant_i32(word0),
-                    extension,
-                    tcg_constant_i32(dmcu_exec_metadata(word0, ctx->pc)));
+    if (ctx->env->control_observers_minimal) {
+        gen_helper_exec_minimal(exec_result, tcg_env,
+                                tcg_constant_i32(word0), extension,
+                                tcg_constant_i32(dmcu_exec_metadata(word0,
+                                                                     ctx->pc)));
+    } else {
+        gen_helper_exec_full(exec_result, tcg_env,
+                             tcg_constant_i32(word0), extension);
+    }
     tcg_gen_brcondi_i32(TCG_COND_EQ, exec_result, DMCU_EXEC_NEXT, sequential);
     tcg_gen_brcondi_i32(TCG_COND_EQ, exec_result, DMCU_EXEC_LOOKUP, lookup);
     tcg_gen_exit_tb(NULL, 0);

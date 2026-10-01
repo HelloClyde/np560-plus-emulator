@@ -25,7 +25,7 @@ from test_np560_timers import check_original_transport
 from web.np560_web import Emulator
 
 
-def check_clock(qemu, pll, control, enabled):
+def check_clock(qemu, pll, control, enabled, expected_hz=44084):
     words = [0x6800, 2, 0x68ea, pll, 0x6872, control, 0xd0ff]
     with tempfile.TemporaryDirectory(prefix="np560-audio-clock-") as directory:
         firmware = Path(directory) / "clock.prg"
@@ -42,13 +42,20 @@ def check_clock(qemu, pll, control, enabled):
             assert "pc=20:000c" in state.lower(), state[:1000]
             time.sleep(.03)
             emu.qmp.execute("stop")
-            before = emu.audio()["request_clock"]
+            audio = emu.audio()
+            before = audio["request_clock"]
+            timing = audio['request_timing']
+            assert 0 <= timing['late_ticks'] <= before['ticks'], timing
+            assert timing['max_lateness_ns'] >= max(0, timing['last_lateness_ns']), timing
+            if enabled:
+                assert timing['last_deadline_ns'] > 0, timing
             assert before["running"] == enabled, before
             assert (before["ticks"] > 0) == enabled, before
             if enabled:
-                assert before["hz"] == 44084, before
+                assert before["hz"] == expected_hz, before
             time.sleep(.03)
             assert emu.audio()["request_clock"] == before, "paused virtual clock advanced"
+            assert emu.audio()['request_timing'] == timing, 'paused timing evidence advanced'
             emu.qmp.execute("cont")
             time.sleep(.03)
             emu.qmp.execute("stop")
@@ -57,8 +64,11 @@ def check_clock(qemu, pll, control, enabled):
             emu.qmp.execute("system_reset")
             reset = emu.audio()["request_clock"]
             assert reset == {"running": False, "hz": 0, "pll": 0, "ticks": 0}, reset
+            assert emu.audio()['request_timing'] == {
+                'late_ticks': 0, 'last_deadline_ns': 0,
+                'last_lateness_ns': 0, 'max_lateness_ns': 0}, 'reset retained timing evidence'
             return {"name": "clock lifecycle", "pll": pll, "control": control,
-                    "before": before, "resumed": resumed, "reset": reset}
+                    "before": before, "resumed": resumed, "reset": reset, 'timing': timing}
         finally:
             emu.close()
             assert emu.process.returncode == 0, emu.process.returncode
@@ -102,9 +112,13 @@ def main():
             result = execute(args.qemu, f"audio PLL aliases icount={icount}", words,
                              {2: 0x89c6, 3: 0x89c6, 4: 0x89ce, 5: 0x8fce, 15: 0x6000}, icount=icount)
             report["cases"].append({"name": "audio PLL aliases", "icount": icount, **result})
-        for pll, control, enabled in ((0x89c6, 9, True), (0x09c6, 9, False),
-                                       (0x89c6, 0x8009, False), (0x89c6, 5, False)):
-            report["cases"].append(check_clock(args.qemu, pll, control, enabled))
+        for pll, control, enabled, hz in ((0x89c6, 9, True, 44084),
+                                         (0x8fce, 11, True, 22048),
+                                         (0x900d, 11, True, 23995),
+                                         (0x09c6, 9, False, 0),
+                                         (0x89c6, 0x8009, False, 0),
+                                         (0x89c6, 5, False, 0)):
+            report["cases"].append(check_clock(args.qemu, pll, control, enabled, hz))
         report["passed"] = True
     except AssertionError as error:
         report["failure"] = str(error)

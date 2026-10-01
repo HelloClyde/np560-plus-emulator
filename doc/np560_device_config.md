@@ -1,5 +1,76 @@
 # 固定设备配置与日常持久化
 
+## 2026-10-01：NPE 自有后端绑定到 v3 设备
+
+新建配置为 `np560-device-v3`，在原有 ROM、NAND、MP3 地址及实时参数
+之外，固定保存布尔值 `rom_npe_codec_owned`。值为 true 时创建和每次
+重开都要求严格 SoC ROM skeleton 及六处已登记的 NPE gate 字节；
+拒绝再从命令行覆盖另一 NPE 后端。v1/v2 配置仍按原格式读取，不
+自动升级、覆盖其 NAND 日志或推断旧 ROM 已具备声音服务。
+
+隔离 `tmp/np560-player-device-v3-20261001-v1/device.json` 用新默认
+ROM 包 `18cca3e8…` 与《天降风云 V1.3》底图创建，配置中保存
+`rom_npe_codec_owned=true`。仅传 `-Device` 在 8922 重开，Web 生命周期
+记录自有解码服务及 QEMU 均启动，健康状态返回相同 ROM SHA、
+`qemu_alive=true` 和解码子进程 PID；随后经本实例 shutdown token
+正常退出，未触碰用户 8891 或 8920。此步骤验证配置/服务恢复，
+不单独证明有声输出；新游戏 DAC 证据见
+[播放器 ROM 包](np560_player_rom_build.md)。
+
+## Windows QMP 并发关闭停滞修复（2026-09-23）
+
+生命周期检查曾耗时 120.286 秒，关闭连接后读取线程仍以超时结束。重复运行真实
+`socketpair` 用例，第 16 次出现停滞；10 秒 watchdog 的栈显示关闭线程位于
+`stream.close()`，请求线程位于 `socket.readinto` → `_read_message`。
+单次运行可能正常，不能用一次通过排除该竞态。
+
+`QMPClient.close()` 现在先 shutdown，再 detach 并关闭底层 socket 句柄，最后关闭
+缓冲流。仅 `sock.close()` 不足：makefile 的引用会推迟实际句柄关闭，缓冲流自身
+又在等待读取锁。detach 使旧 socket 对象不再拥有数字句柄，避免后续流清理误关
+已经复用的句柄。本修改不重试 QMP 命令，不改变超时的“执行结果未知”语义。
+
+Windows 连续 200 次原始关闭用例通过；新增带 15 秒子进程上限的 200 次回归场景。
+Windows 全部 24 项生命周期测试通过（0.869 秒）；WSL 23 项通过、Windows 专用项
+跳过（0.256 秒）。验证使用本地测试连接，未连接或重启用户实例，也不代表已经验证
+Windows 原生 QEMU 的完整启动或所有网络传输。本轮未改 QEMU 二进制及固件。
+
+## 实验 EQ v8 固定配置重开（2026-09-22）
+
+### 原厂音效选择跨重开：回到正常，不认定日志故障
+
+同目录后续 eq-write/eq-read 两个独立进程均正常退出 0。在原始音效页从
+“正常”按一次 Down，圆点移到“重高音”（treble.png），确认后 F4 返回播放页、
+再 F4 最小化，正常关闭。冷启动再用 M04/M35/F3/Down/Down/Enter 进入音效页，
+圆点回到“正常”。modes-before.png 与 modes-after-reboot.png 的原始灰度画面
+SHA-256 同为 bbf6b02e564a364c4b0c18acf6efefdfb8603c6dc7d03660f71056fb680ba30d。
+路线与每步原始画面保存在 eq-select/eq-confirm/eq-reopen-menu，无客机内存注入。
+
+核对 PRG d555609e…：原厂 VMA03 `0D:3226..324E` 从 `50:7E06/7E08` 取
+播放器对象指针，对 `+087B` 写入字节 0；`0D:3250..329A` 随后读该字段，查
+`33:5A2E` 并调用 `33:4D82`。这条原厂初始化路径支持重开回正常的解释，而不是
+足以认定 NAND 持久化失败的证据。本轮没有记录该 PC 的实时命中，不扩大为所有
+最小化/退出/重入路径都必须清零；也未播放歌曲或证明 EQ 预置保存为产品要求。
+不要加宿主自动保存 EQ 来覆盖原厂行为。仍需验证实际有声会话的重入/恢复。
+
+现有 v2 配置已足够保存实验 v8 的 ROM 和运行参数，无需再增加配置格式。
+实际通过 Python Web CLI 的 `--create-device`、`--soc-rom-bundle`、
+`--experimental-eq` 创建 `tmp/np560-eq-device-20260922-v1/device.json`。
+首次创建显式允许实验算法；以后只用 `--device`，仍绑定原 ROM 哈希，不能静默升级。
+本次不是 Windows PowerShell 包装器验收。
+
+设备 ID `0538878b-6a74-419a-9164-5b7b756061de`；两次独立 Web/QEMU 启动并正常
+退出 0，日志分别在该目录 first/second。第二次 `REPLAYED=2985 TORN_BYTES=0`，
+ROM SHA-256 为 `5e4be1ecda33813c1c5da627523d510f98b1a7e9785a16d43f87513269aaa85f`。
+HLE base=97514、arena=93952、instruction_clock/realtime=true、icount_shift=0。
+只复用 LONG22 底图并创建独立增量日志，没有复制 NAND 或修改用户设备。
+
+第二次启动截图 reopened.png 为每日一句；随后真实矩阵 F4/M04、播放器/M35，
+候选分别 8E/97，各映射一次，正常松键。已目视 player.png 的完整播放器，显示
+“当前未选择歌曲”。ROM_MISSING/UNSUPPORTED 均 none。两个临时端口已关闭。
+
+范围：证明实验 ROM 与实时配置的跨进程恢复、日志重放和播放器入口；未在本次
+选择歌曲、保存 EQ 预置或验证有声重开，不能称作 EQ 设置持久化或音频全功能通过。
+
 日期：2026-09-06。设备配置已接入 Web 和 Windows 启动脚本，复用现有 NAND 增量保存后端。
 配置不复制底图，不修改 guest RAM、ROM 服务或原厂设置，也不把整机快照当成游戏存档。
 
@@ -110,3 +181,44 @@ writer 与 reader 之间增加了 Web 产物清单中的配置模块身份记录
 后续已实现独立的[资料备份/迁移入口](np560_device_backup.md)，保留本篇原始设备验证的版本边界。
 仍需完成：更多原生资料/游戏保存状态、图形设备管理、完整系统恢复；
 此处选择音效“关”只是在验证一项原厂设置持久化，绝不表示真实声音问题已经绕过或解决。
+
+## 2026-09-18：指令时钟配置提前校验
+
+已复现 v2 配置允许 `instruction_clock=true` 搭配空值/非零 icount_shift，
+创建时成功但实际启动被 QEMU 拒绝的问题。现创建和加载配置均提前要求 shift=0，
+即使 realtime=false 也适用；不会写出新坏配置或改写旧配置。
+16项设备配置检查通过，包括三个非法shift、新旧版本兼容及原有运行参数恢复。
+
+使用本轮从原包重建的ROM和NAND，经真实WSL CLI创建
+`tmp/np560-built-device-20260918-v1/device.json`，再仅用 --device 读取，
+HLE=138790、arena=93952、instruction_clock/realtime=true、icount_shift=0均保留。
+创建时仅验证配置读取；随后已完成下面的真实启动验证。
+
+## 2026-09-18：新构建介质的设备重开验证
+
+`tmp/np560-built-device-20260918-v1/boot-reopen/report.json` 记录两个顺序运行的
+独立 QEMU 进程：均通过 `parse_args(['--device', config])` 加载同一个配置，
+再经正式 `start_emulator` 启动。第一次创建 journal，第二次使用同一路径重开；
+两次关闭后的 returncode 均为 0，外层验证进程也退出 0。
+
+两次均无按键注入，矩阵有效读取数和映射事件数均为 0，application_state=255，
+faulted=false；连续三个采样的学习顶栏均与原始资源逐像素相同（0/5280差异）。
+最终截图为 `boot-0.png`、`boot-1.png`；已目视检查第二次截图，学习菜单、
+开始按钮与时间可见。配置恢复 HLE=138790、arena=93952、instruction_clock=true、
+realtime=true、icount_shift=0。
+
+这验证的是“原始 PRG/UPD 重建介质 → 固定设备配置 → 冷启动 → 关闭后重开”
+链路，不是新增游戏存档或设置的跨启动读回测试，也不等于所有像素、按键、应用
+和音频完成验收。未替换用户试玩实例。
+## 2026-09-23：NAND 导出保护启动输入与日志锁
+
+Web 桥在启动前及每次 `save_nand` 前检查导出目标，拒绝覆盖 QEMU、PRG、
+mask/SoC ROM、USB loader、烧录/驱动代码；启用 journal 时还保护 journal、
+其 `.lock` 和基础 NAND。比较解析路径及已存在文件的 samefile 身份，包含
+启动后新建的硬链接。不会把导出操作误当作更换固件或日志锁。
+
+旧实现只在启用 journal 的构造阶段保护 journal/base；临时文件反例确认其余
+目标此前能走到启动阶段。修复后 23 项生命周期、16 项配置检查通过，正常独立
+输出仍发送原 `nand-save` 请求。这是防误覆盖，不是对恶意并发路径替换的原子
+防护，也不新增整机快照。无 journal 模式的既有基础 NAND 导出语义未变。
+本轮没有启动或关闭用户实例、导出真实 NAND，亦没有修改任何用户输入文件。

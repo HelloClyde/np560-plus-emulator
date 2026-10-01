@@ -244,6 +244,7 @@ typedef enum DMCUExecResult {
 #define DMCU_NPE_FAR_COPY_TRACE_SLOTS 64
 #define DMCU_NPE_GAME_FRAME_STAGES 12
 #define DMCU_NPE_GAME_BRANCH_TRACE_SLOTS 16
+#define DMCU_NPE_LOAD_ROM_TRACE_SLOTS 32
 #define DMCU_NPE_GAME_DRAW_CHILD_SITES 7
 #define DMCU_NPE_GAME_DRAW_TRACE_SLOTS 128
 #define DMCU_NPE_GAME_DATA_TRACE_SLOTS 64
@@ -1551,6 +1552,23 @@ typedef struct CPUArchState {
     uint16_t npe_game_control_write_ds0[DMCU_NPE_GAME_CONTROL_WRITE_SLOTS];
     uint16_t npe_game_control_write_ds1[DMCU_NPE_GAME_CONTROL_WRITE_SLOTS];
     uint8_t npe_game_control_write_bits[DMCU_NPE_GAME_CONTROL_WRITE_SLOTS];
+    /* Exact first-slot load branch: observe resident 01/02 calls without
+     * changing the guest's control, stack or data paths. */
+    uint32_t npe_load_branch_entries;
+    uint32_t npe_load_branch_exits;
+    uint32_t npe_load_read_returns;
+    uint32_t npe_load_rom_call_count;
+    uint32_t npe_load_rom_unique_count;
+    uint32_t npe_load_rom_call_from[DMCU_NPE_LOAD_ROM_TRACE_SLOTS];
+    uint32_t npe_load_rom_call_target[DMCU_NPE_LOAD_ROM_TRACE_SLOTS];
+    uint32_t npe_load_rom_call_hits[DMCU_NPE_LOAD_ROM_TRACE_SLOTS];
+    uint16_t npe_load_slot_flags[3];
+    uint16_t npe_load_trigger_before;
+    uint16_t npe_load_trigger_after;
+    uint16_t npe_load_read_result;
+    uint8_t npe_load_slot;
+    uint8_t npe_load_rom_call_op[DMCU_NPE_LOAD_ROM_TRACE_SLOTS];
+    bool npe_load_branch_active;
     uint32_t npe_game_operation_one_dispatches;
     uint32_t npe_game_operation_one_entries;
     uint32_t npe_game_operation_one_fast_exits;
@@ -4625,6 +4643,7 @@ typedef struct CPUArchState {
     bool soc_rom_skeleton;
     bool hle_ui_enabled;
     bool control_observers_minimal; /* opt-in; strict faults/key ACK retained */
+    bool resource_trace_all; /* opt-in resource calls without root-frame baseline */
     bool instruction_clock_enabled;
     uint32_t instruction_clock_hz;
     uint32_t instruction_clock_cached_pll;
@@ -4640,6 +4659,11 @@ typedef struct CPUArchState {
     uint64_t instruction_clock_external_data;
     uint64_t instruction_clock_unknown_map;
     uint64_t instruction_clock_unknown;
+    uint64_t instruction_clock_unknown_sram;
+    bool instruction_clock_profile_enabled;
+    uint64_t instruction_clock_unknown_opcodes[256];
+    uint64_t instruction_clock_executed_opcodes[256];
+    uint64_t instruction_clock_executed_words[65536];
     uint16_t instruction_clock_last_unknown;
     bool hle_ui_active;
     bool native_ui_active;

@@ -34,6 +34,38 @@ EVENT_TABLE_COUNT = 3
 
 
 class WebKeyboardFrontendTests(unittest.TestCase):
+    def test_mp3_shortcut_reuses_original_matrix_contact(self) -> None:
+        self.assertRegex(self.html, r'<button[^>]*data-key="Matrix35"[^>]*>MP3 播放器（M35）</button>')
+        self.assertIn('不是网页强制跳转', self.html)
+        for table in range(3):
+            offset = EVENT_TABLE_OFFSET + (table * 64 + 35) * 2
+            self.assertEqual(self.firmware[offset:offset + 2], b'\x97\x00')
+
+    def test_mode_switch_uses_raw_matrix_and_factory_table_selection(self) -> None:
+        # Expose the existing contact, not a host-side Shift/character injector.
+        self.assertRegex(self.html, r'<button[^>]*data-key="Matrix26"[^>]*>大写／符号模式状态（M26）</button>')
+        self.assertIn('应用强制键表时不一定改变输出', self.html)
+        self.assertIn('它不是永久大写锁定', self.html)
+        for table in range(3):
+            offset = EVENT_TABLE_OFFSET + (table * 64 + 26) * 2
+            self.assertEqual(self.firmware[offset:offset + 2], b'\x8c\x00')
+        # Source worker 45:F4A4: bit 2 overrides bit 0; bit 0 selects
+        # 32:29B2. M26 clears/sets bit 0 in the ORIGINAL worker.
+        for offset, words in {
+            0x25F4EC: (0x6810, 0x00A2, 0x99F0, 0x28D3, 0x5404, 0x5600),
+            0x25F538: (0x6810, 0x00A2, 0x99F0, 0x28D3, 0x5401, 0x5600, 0xAC01, 0xF584),
+            0x25F55E: (0x68F3, 0x29B2, 0x68F2, 0x0032),
+            0x25F628: (0x6810, 0x00A2, 0x99F0, 0x28D3, 0x74F0, 0xFFFE),
+            0x25F65C: (0x6810, 0x00A2, 0x99F0, 0x28D3, 0x5501),
+        }.items():
+            expected = b''.join(word.to_bytes(2, 'little') for word in words)
+            self.assertEqual(self.firmware[offset:offset + len(expected)], expected)
+
+    def test_game_speech_key_is_available_without_expanding_keyboard(self) -> None:
+        common_panel = self.html.split('<details class="keyboard-panel">', 1)[0]
+        self.assertRegex(common_panel, r'<button[^>]*data-key=" "[^>]*>发音 / 交谈（空格）</button>')
+        self.assertIn('Enter 并非通用对白继续键', common_panel)
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.javascript = APP.read_text(encoding="utf-8")
@@ -153,8 +185,37 @@ class WebKeyboardFrontendTests(unittest.TestCase):
 
         self.assertEqual(tables[0][mapping[","]], ord(","))
         self.assertEqual(tables[0][mapping["."]], ord("."))
+        self.assertEqual(mapping["'"], mapping["Escape"])
+        self.assertEqual([table[mapping["'"]] for table in tables],
+                         [ord("'"), 0x84, 0x84])
         self.assertEqual(tables[1][mapping[" "]], ord(" "))
         self.assertEqual(tables[2][mapping[" "]], ord(" "))
+
+    def test_core_legacy_navigation_agrees_with_web_matrix(self) -> None:
+        from test_np560_system_boot import matrix_key
+
+        for raw, expected in {
+                0x102: (1 << 2, 45, 0x80),
+                0x103: (1 << 3, 29, 0x81),
+                0x104: (1 << 4, 53, 0x86),
+                0x105: (1 << 5, 28, 0x84),
+                0x106: (1 << 6, 28, 0x84)}.items():
+            self.assertEqual(matrix_key(raw), expected)
+        core = (ROOT / "qemu-dmcu/hw/dmcu/np560.c").read_text(encoding="utf-8")
+        table = re.search(r"legacy_matrix_indexes\[16\]\s*=\s*\{([^}]+)\}", core)
+        self.assertIsNotNone(table)
+        indexes = [int(value) for value in re.findall(r"\d+", table.group(1))]
+        names = ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Enter",
+                 "Escape", "Backspace", "Tab", "F1", "F2", "F3", "F4",
+                 "PageUp", "PageDown", " ", "StartMenu"]
+        block = re.search(r"const matrixIndexes = \{(.*?)\n\};",
+                          self.javascript, re.DOTALL).group(1)
+        block = re.sub(r"//[^\n]*", "", block)
+        for bit, name in enumerate(names):
+            with self.subTest(key=name, bit=bit):
+                pattern = (r'" "' if name == " " else rf"\b{re.escape(name)}")
+                index = int(re.search(pattern + r"\s*:\s*(\d+)", block).group(1))
+                self.assertEqual(indexes[bit], index)
 
     def test_strict_web_input_uses_only_physical_matrix_or_gpio_state(self) -> None:
         class FakeQMP:
@@ -204,6 +265,42 @@ class WebKeyboardFrontendTests(unittest.TestCase):
         self.assertEqual(written["key-state"], 1 << 1)
         self.assertEqual(written["key-matrix-low"], 0)
         self.assertEqual(written["key-matrix-high"], 0)
+
+    def test_atomic_key_snapshot_has_no_intermediate_matrix_or_error_fallback(self) -> None:
+        class FakeQMP:
+            def __init__(self):
+                self.writes = []
+                self.fail = False
+
+            def execute(self, command, arguments):
+                self.writes.append((command, arguments))
+                if self.fail:
+                    raise QMPError("transport lost")
+
+        emulator = Emulator.__new__(Emulator)
+        emulator.qmp = FakeQMP()
+        emulator.atomic_key_input = True
+        emulator.legacy_key_latch = False
+        for low, high in ((0x80000000, 0), (0, 0x80000000),
+                          (0xFFFFFFFF, 0xFFFFFFFF), (0, 0)):
+            emulator.set_key(0, 0x101, low, high)
+            self.assertEqual(emulator.qmp.writes[-1], ("qom-set", {
+                "path": "/machine", "property": "key-input-snapshot",
+                "value": f"00000000:00000000:{low:08x}:{high:08x}",
+            }))
+        self.assertEqual(len(emulator.qmp.writes), 4)
+        emulator.set_key(2, 0x101, 0, 1)
+        self.assertEqual(emulator.qmp.writes[-1][1]["value"],
+                         "00000000:00000000:00000000:00000001")
+        emulator.legacy_key_latch = True
+        emulator.set_key(2, 0x101, 0, 1)
+        self.assertEqual(emulator.qmp.writes[-1][1]["value"],
+                         "00000002:00000101:00000000:00000001")
+        emulator.qmp.fail = True
+        count = len(emulator.qmp.writes)
+        with self.assertRaises(QMPError):
+            emulator.set_key(0, 0)
+        self.assertEqual(len(emulator.qmp.writes), count + 1)
 
     def test_diagnostic_matrix_pulse_is_one_atomic_qom_write(self) -> None:
         class FakeQMP:
@@ -559,6 +656,18 @@ class WebKeyboardFrontendTests(unittest.TestCase):
             check=True, cwd=ROOT, capture_output=True, text=True,
         )
 
+    def test_optional_keyboard_contact(self) -> None:
+        subprocess.run(
+            ["node", str(ROOT / "scripts/tests/test_np560_keyboard_contact.js")],
+            check=True, capture_output=True, text=True,
+        )
+
+    def test_keyboard_event_filtering_and_release(self) -> None:
+        subprocess.run(
+            ["node", str(ROOT / "scripts" / "tests" / "test_np560_keyboard_events.js")],
+            check=True, cwd=ROOT, capture_output=True, text=True,
+        )
+
     def test_keyboard_controller_preserves_physical_hold_and_deduplicates_make(
             self) -> None:
         script = f"""
@@ -678,6 +787,75 @@ assert.strictEqual(normalizeKeyboardEvent({{ code: "Delete", key: "Delete" }}), 
             self.javascript,
         )
 
+    def test_raw_matrix_buttons_cover_all_switches_and_share_alias_levels(self) -> None:
+        script = r'''
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const app = fs.readFileSync(process.argv[1], 'utf8');
+const {KeyboardMatrixController} = require(process.argv[2]);
+const buttons = [];
+const document = {
+  getElementById(id) {
+    assert.equal(id, 'matrix-keyboard');
+    return {appendChild(button) {buttons.push(button);}};
+  },
+  createElement(tag) {
+    assert.equal(tag, 'button');
+    return {dataset: {}, attrs: {},
+      classList: {toggle(name, value) {this[name] = value;}},
+      setAttribute(name, value) {this.attrs[name] = value;}};
+  },
+  querySelectorAll() {return buttons;},
+};
+const context = vm.createContext({document});
+const mapping = app.slice(app.indexOf('const matrixIndexes ='),
+                          app.indexOf('// Original TBC='));
+function actualFunction(name) {
+  const match = app.match(new RegExp('^function ' + name + '\\([^]*?^}', 'm'));
+  assert.ok(match, name);
+  return match[0];
+}
+vm.runInContext(mapping + '\n' + actualFunction('buildRawMatrixKeyboard') +
+  '\n' + actualFunction('updatePressedButtons') +
+  '\nbuildRawMatrixKeyboard(); globalThis.mapping = matrixIndexes;', context);
+assert.equal(buttons.length, 64);
+assert.equal(new Set(buttons.map(button => button.dataset.key)).size, 64);
+const payloads = [];
+const controller = new KeyboardMatrixController({matrixIndexes: context.mapping,
+  keyBits: {}, sendPayload: payload => payloads.push(payload),
+  onHeldChange: held => context.updatePressedButtons(held)});
+for (let index = 0; index < 64; index++) {
+  const button = buttons[index];
+  assert.equal(button.textContent, `M${String(index).padStart(2, '0')}`);
+  assert.equal(button.type, 'button');
+  assert.equal(controller.press('raw', button.dataset.key), true);
+  assert.equal(payloads.at(-1).matrix_low, index < 32 ? (2 ** index) >>> 0 : 0);
+  assert.equal(payloads.at(-1).matrix_high, index >= 32 ? (2 ** (index-32)) >>> 0 : 0);
+  assert.equal(button.attrs['aria-pressed'], 'true');
+  assert.equal(buttons.filter(b => b.classList['is-pressed']).length, 1);
+  controller.release('raw');
+  assert.equal(payloads.at(-1).matrix_low, 0);
+  assert.equal(payloads.at(-1).matrix_high, 0);
+  assert.equal(button.attrs['aria-pressed'], 'false');
+}
+controller.press('pc', 'ArrowDown');
+assert.equal(buttons[37].attrs['aria-pressed'], 'true');
+const count = payloads.length;
+controller.press('touch', 'Matrix37');
+controller.release('pc');
+assert.equal(payloads.length, count); // no duplicate make or premature break
+assert.equal(buttons[37].attrs['aria-pressed'], 'true');
+controller.release('touch');
+assert.equal(payloads.length, count + 1);
+assert.equal(buttons[37].attrs['aria-pressed'], 'false');
+'''
+        result = subprocess.run(
+            ["node", "-e", script, str(APP), str(KEYBOARD_INPUT)],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_visible_keyboard_identifies_confirmed_and_unmapped_hardware(self) -> None:
         self.assertLess(
             self.html.index('src="keyboard_input.js"'),
@@ -685,6 +863,15 @@ assert.strictEqual(normalizeKeyboardEvent({{ code: "Delete", key: "Delete" }}), 
         )
         self.assertIn("实体按键（已恢复映射）", self.html)
         self.assertIn("其余侧键仍标记为未映射", self.html)
+        self.assertIn('data-key="Matrix15">帮助（M15）', self.html)
+        self.assertIn('上下翻页', self.html)
+        self.assertIn('B 是白屏模式，再按 B 恢复画面', self.html)
+        self.assertIn('不是所有游戏的通用键义', self.html)
+        self.assertIn("Esc（依程序定义）", self.html)
+        self.assertIn("Tab、PageDown 与下方向键同键", self.html)
+        self.assertIn('Tab: "Tab / 下同键"', self.javascript)
+        self.assertIn('PageUp: "PgUp / 上同键"', self.javascript)
+        self.assertNotIn('Tab: "切换"', self.javascript)
         self.assertIn("button.dataset.matrixIndex", self.javascript)
         self.assertIn('content: "M" attr(data-matrix-index)',
                       (ROOT / "scripts" / "web" / "styles.css").read_text(
@@ -866,6 +1053,47 @@ assert.strictEqual(normalizeKeyboardEvent({{ code: "Delete", key: "Delete" }}), 
                 }),
             ],
         )
+
+    def test_opcode_profile_is_opt_in_and_resumes_after_read_failure(self) -> None:
+        class FakeProcess:
+            @staticmethod
+            def poll():
+                return None
+
+        class FakeQMP:
+            def __init__(self):
+                self.calls = []
+                self.fail_read = False
+
+            def execute(self, command, arguments=None):
+                self.calls.append((command, arguments))
+                if command == "query-status":
+                    return {"running": True}
+                if command == "qom-get":
+                    if self.fail_read:
+                        raise QMPError("profile read failed")
+                    return '{"enabled":true,"executed":{"9a":3}}'
+                if command in ("stop", "cont"):
+                    return {}
+                raise AssertionError(command)
+
+        emulator = Emulator.__new__(Emulator)
+        emulator.process = FakeProcess()
+        emulator.qmp = FakeQMP()
+        emulator.opcode_profile_enabled = False
+        with self.assertRaises(ValueError):
+            emulator.opcode_profile()
+        self.assertEqual(emulator.qmp.calls, [])
+        emulator.opcode_profile_enabled = True
+        self.assertEqual(emulator.opcode_profile()["executed"], {"9a": 3})
+        self.assertEqual([call[0] for call in emulator.qmp.calls],
+                         ["query-status", "stop", "qom-get", "cont"])
+        emulator.qmp.calls.clear()
+        emulator.qmp.fail_read = True
+        with self.assertRaises(QMPError):
+            emulator.opcode_profile()
+        self.assertEqual([call[0] for call in emulator.qmp.calls],
+                         ["query-status", "stop", "qom-get", "cont"])
 
     def test_audio_snapshot_is_read_only_and_validated(self) -> None:
         class FakeProcess:

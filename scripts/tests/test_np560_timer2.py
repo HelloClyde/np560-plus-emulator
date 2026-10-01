@@ -110,6 +110,11 @@ def main() -> int:
     check_timer(args.qemu, icount=5)
     check_timer(args.qemu, pause=True)
     run_original_waiter(args.qemu, args.original_prg)
+    # Actual factory DAC stop/start delays, not only a short three-IRQ smoke
+    # check. The waiter must consume guest time instead of returning early.
+    for count in (50, 200):
+        run_original_waiter(args.qemu, args.original_prg, count=count,
+                            instruction_clock=True)
     return 0
 
 

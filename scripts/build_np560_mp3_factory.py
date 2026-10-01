@@ -77,7 +77,7 @@ def root_reference_guard(original,resident,cores):
             "ownership_basis":"inferred codec-private words between writer3340 and error3346; NEW layout"}
 
 
-def build(address, core):
+def build(address, core, *, channel_publication=True):
     a=_DMCUAssembler(address)
     saved=(1,*range(3,15))
     def imm(r,v): a.emit(0x68f0|r,v&65535)
@@ -119,7 +119,9 @@ def build(address, core):
     # Reconstructed publication of the original priming gate. This is a
     # software DPRAM bit, not hardware forced-ready: it is clear until real
     # PCM has completed, and reset/close invalidate it.
-    a.emit(0xff83);clear_error();a.ajmp("return")
+    a.emit(0xff83)
+    if channel_publication: a.emit(0xfb83)
+    clear_error();a.ajmp("return")
     a.label("bad_new_geometry")
     native(lease.FREE,14);native(lease.UNLOCK,14);imm(12,0);imm(13,0)
     imm(2,2);a.ajmp("failed")
@@ -132,7 +134,9 @@ def build(address, core):
 
     a.label("reset");enter();require_owner();invoke("reset");failure_if_needed()
     imm(0,0);put(0,FIRST_FORMAT_SEEN)
-    a.emit(0xff83);clear_error();a.ajmp("return")
+    a.emit(0xff83)
+    if channel_publication: a.emit(0xfb83)
+    clear_error();a.ajmp("return")
     a.label("free_words");enter();require_owner();invoke("free_words")
     failure_if_needed();a.ajmp("return")
     a.label("output");enter();require_owner()
@@ -147,6 +151,17 @@ def build(address, core):
 
     a.label("step");enter();require_owner();invoke("player_step")
     cmpi(0,1);a.ajmp("step_no_pcm",2)
+    # Reconstructed channel-valid publication, not recovered mask ROM.
+    # Original 16:EA20 ANDs F006.11 with the application's F002.15 before
+    # choosing distinct PCM pointers. Publish only after a real PCM result,
+    # from the original parser's channel-mode field (3=mono, 0..2=stereo).
+    # Do not override the application's preference or its F018 mute gates.
+    if channel_publication:
+        a.emit(0x1f11,0x6811,0xa2,0x99f0,0xa5cb,0x1f91)
+        cmpi(0,3);a.ajmp("mono_pcm",1)
+        a.emit(0xeb83);a.ajmp("channel_published")
+        a.label("mono_pcm");a.emit(0xfb83)
+        a.label("channel_published")
     get(0,session.FORMAT_CHANGE);cmpi(0,0);a.ajmp("frame_callback",1)
     get(6,FORMAT_CALLBACK);get(7,FORMAT_CALLBACK+2)
     mov(0,6);a.emit(0x1507);a.ajmp("frame_callback",1)
@@ -183,6 +198,7 @@ def build(address, core):
     a.acall("locate");cmpi(2,0);a.ajmp("drop_return",2)
     get(14,SELF_HANDLE);invoke("release");cmpi(2,0);a.ajmp("drop_return",2)
     native(lease.FREE,14);native(lease.UNLOCK,14);imm(12,0);imm(13,0);a.emit(0xff83)
+    if channel_publication: a.emit(0xfb83)
     a.label("dropped");imm(0,0);imm(2,0)
     a.label("drop_return");a.emit(0xc600)
 
