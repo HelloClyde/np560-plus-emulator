@@ -2,8 +2,13 @@ name: Tagged release
 
 on:
   push:
+    branches:
+      - master
     tags:
       - 'v*'
+  pull_request:
+    branches:
+      - master
 
 permissions:
   contents: read
@@ -16,7 +21,7 @@ jobs:
   source-smoke:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # These tests need only tracked source. Proprietary firmware, NAND and
       # locally reconstructed ROM binaries are deliberately not in Git.
       - name: Python source tests
@@ -26,11 +31,12 @@ jobs:
 
   publish:
     needs: source-smoke
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Create GitHub Release for the tag
         env:
           GH_TOKEN: ${{ github.token }}

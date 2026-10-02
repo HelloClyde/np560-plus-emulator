@@ -1,7 +1,8 @@
 # NP560+ 发布流程
 
-根目录 `.github/workflows/release.yml` 在推送 `v*` tag 时运行两组不依赖
-私有固件的源码测试；成功后自动创建 GitHub Release。已有同名 Release
+根目录 `.github/workflows/release.yml` 在 `master` 推送和 PR 时运行两组
+不依赖私有固件的源码测试；推送 `v*` tag 时先运行同样测试，成功后自动
+创建 GitHub Release。已有同名 Release
 时不覆盖它的描述和资产。`v0.*` 标为预发布。
 
 这一步**不会自动生成或上传 NAND、原厂 PRG 或重建 ROM 二进制**：它们不在
@@ -15,3 +16,7 @@ Git 仓库，CI 没有这些输入。发布前应分别校验本地资产身份�
 字节。`scripts/build_np560_player_rom.py` 仍需合法取得的原厂
 `NP560.PRG` 作为输入，输出当前 HLE ROM 包。单独下载 NAND 和源码
 并不等于已经拿到全部运行输入或完成原厂升级/恢复功能。
+
+2026-10-02 从该本地 V3.80 PRG 独立重建一次，输出 `resident.bin` 的
+SHA-256 为 `18cca3e8bc6f9512ae017935c37d5241b268a83a45920255f8054228bfcb260a`，
+与当前试玩设备所用包逐字节一致；这验证可重建性，不改变上述来源限制。
