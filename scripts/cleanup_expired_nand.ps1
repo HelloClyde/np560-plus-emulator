@@ -29,7 +29,14 @@ $keepNames = @(
 # independently reproduced route.  Keep this explicit: never classify a new
 # same-day NAND as disposable merely from its timestamp.
 $knownExpiredNames = @(
-    'np560-v833-root-ready-pre-copy-protected.nand'
+    'np560-v833-root-ready-pre-copy-protected.nand',
+    # Superseded September 5 scratch checkpoints. The documented v6 baseline
+    # and the older page-lane/guest-dots evidence remain protected above.
+    'np560-v735-hero-fat16-ab-userinfo.nand',
+    'np560-vma03-native-pim.nand',
+    'np560-vma03-native-pim-v2.nand',
+    'np560-vma03-native-pim-v3.nand',
+    'np560-vma03-native-pim-v4.nand'
 )
 
 # Freeze the cleanup set at the date this script was prepared. NAND images made

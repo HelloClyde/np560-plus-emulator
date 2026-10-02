@@ -1,0 +1,49 @@
+name: Tagged release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  source-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # These tests need only tracked source. Proprietary firmware, NAND and
+      # locally reconstructed ROM binaries are deliberately not in Git.
+      - name: Python source tests
+        run: python3 -m unittest scripts.tests.test_np560_system_nand_build scripts.tests.test_np560_owned_npe_codec
+      - name: Browser input test
+        run: node scripts/tests/test_np560_pointer_input.js
+
+  publish:
+    needs: source-smoke
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create GitHub Release for the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $tag already exists; keeping its notes and assets."
+            exit 0
+          fi
+          options=()
+          case "$tag" in
+            v0.*|*-rc*|*-beta*) options+=(--prerelease) ;;
+          esac
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --title "$tag" --generate-notes "${options[@]}"

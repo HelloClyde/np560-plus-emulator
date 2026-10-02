@@ -160,3 +160,6 @@ node scripts/tests/test_np560_pointer_input.js
 无需更新子模块指针，也无需同步历史补丁。详见 [仓库恢复说明](doc/github_restore.md)。
 
 QEMU 及第三方组件保留各自的许可证和来源说明，参见 `qemu-dmcu/COPYING` 等文件。
+
+`v*` tag 的自动 Release 与非 Git NAND 资产的上传边界见
+[发布流程](doc/release_process.md)。
