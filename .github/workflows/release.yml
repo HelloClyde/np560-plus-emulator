@@ -37,19 +37,44 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v5
+      # The private v0.1.0 release holds the reviewed vendor PRG. It is not
+      # checked into Git; resident.bin cannot be rebuilt from source alone.
+      - name: Fetch and verify V3.80 program image
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/np560-firmware"
+          gh release download v0.1.0 --repo "$GITHUB_REPOSITORY" \
+            --pattern NP560.PRG --dir "$RUNNER_TEMP/np560-firmware"
+          printf '%s  %s\n' \
+            'd555609e03ece17f42c1881beeb88361572f18621161de67bc9dc765857089f5' \
+            "$RUNNER_TEMP/np560-firmware/NP560.PRG" | sha256sum --check --status
+      - name: Rebuild checked resident ROM/HLE bundle
+        shell: bash
+        run: |
+          python3 scripts/build_np560_player_rom.py \
+            --firmware "$RUNNER_TEMP/np560-firmware/NP560.PRG" \
+            --output "$RUNNER_TEMP/np560-resident"
+          printf '%s  %s\n' \
+            '18cca3e8bc6f9512ae017935c37d5241b268a83a45920255f8054228bfcb260a' \
+            "$RUNNER_TEMP/np560-resident/resident.bin" | sha256sum --check --status
       - name: Create GitHub Release for the tag
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           tag="${GITHUB_REF_NAME}"
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release $tag already exists; keeping its notes and assets."
-            exit 0
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            options=()
+            case "$tag" in
+              v0.*|*-rc*|*-beta*) options+=(--prerelease) ;;
+            esac
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --title "$tag" --generate-notes "${options[@]}"
           fi
-          options=()
-          case "$tag" in
-            v0.*|*-rc*|*-beta*) options+=(--prerelease) ;;
-          esac
-          gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
-            --verify-tag --title "$tag" --generate-notes "${options[@]}"
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" \
+            "$RUNNER_TEMP/np560-firmware/NP560.PRG" \
+            "$RUNNER_TEMP/np560-resident/resident.bin" \
+            "$RUNNER_TEMP/np560-resident/manifest.json" \
+            --clobber
