@@ -79,6 +79,26 @@ Copy-Item -LiteralPath (Join-Path $project 'scripts\portable\Start-NP560.cmd') -
 Copy-Item -LiteralPath (Join-Path $project 'scripts\portable\Start-NP560.ps1') -Destination $package
 Copy-Item -LiteralPath (Join-Path $project 'qemu-dmcu\COPYING') -Destination $package
 
+# Start-NP560.cmd invokes Windows PowerShell 5.1, which reads a BOM-less .ps1
+# using the local ANSI code page. Chinese diagnostics would then break parsing.
+$launcher = Join-Path $package 'Start-NP560.ps1'
+$launcherBytes = [System.IO.File]::ReadAllBytes($launcher)
+if ($launcherBytes.Length -lt 3 -or $launcherBytes[0] -ne 0xef -or
+    $launcherBytes[1] -ne 0xbb -or $launcherBytes[2] -ne 0xbf) {
+    throw 'Portable launcher must start with a UTF-8 BOM for Windows PowerShell 5.1'
+}
+$escapedLauncher = $launcher.Replace("'", "''")
+$parseCheck = @"
+`$tokens = `$null
+`$errors = `$null
+[System.Management.Automation.Language.Parser]::ParseFile('$escapedLauncher', [ref]`$tokens, [ref]`$errors) | Out-Null
+`$errors | ForEach-Object { Write-Error `$_.Message }
+if (`$errors.Count -ne 0) { exit 1 }
+"@
+$encodedCheck = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($parseCheck))
+& powershell.exe -NoProfile -NonInteractive -EncodedCommand $encodedCheck
+if ($LASTEXITCODE -ne 0) { throw 'Portable launcher failed Windows PowerShell syntax check' }
+
 # Smoke-test the exact self-contained Python executable without installed Python.
 & (Join-Path $runtime 'python.exe') -c 'import np560_web, nand_files, device_config; from serve_np560_npe_codec import OwnedMode5Codec; print("portable Python OK")'
 if ($LASTEXITCODE -ne 0) { throw 'Portable Python smoke test failed' }

@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 $python = Join-Path $root 'runtime\python\python.exe'
 $web = Join-Path $root 'scripts\web\np560_web.py'
