@@ -5,13 +5,13 @@
 
 ![模拟器 Web 界面](doc/images/np560-web.png)
 
-![LCD 屏幕截图](doc/images/np560-screen.png)
-
 画面示例：
 
-| MP3 播放器 | 主界面 | NPE 游戏 |
-| --- | --- | --- |
-| ![NP560+ MP3 播放器](doc/images/np560-mp3.png) | ![NP560+ 主界面](doc/images/np560-menu.png) | ![NP560+ NPE 游戏画面](doc/images/np560-game.png) |
+| 系统画面 | MP3 播放器 |
+| :---: | :---: |
+| <img src="doc/images/np560-screen.png" alt="NP560+ 系统画面" width="240"> | <img src="doc/images/np560-mp3.png" alt="NP560+ MP3 播放器" width="240"> |
+| 主界面 | NPE 游戏 |
+| <img src="doc/images/np560-menu.png" alt="NP560+ 主界面" width="240"> | <img src="doc/images/np560-game.png" alt="NP560+ NPE 游戏画面" width="240"> |
 
 ## 快速开始（Windows x64）
 
