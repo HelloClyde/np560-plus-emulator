@@ -42,6 +42,7 @@ jobs:
           update: true
           install: >-
             git
+            diffutils
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-glib2
             mingw-w64-ucrt-x86_64-pixman
