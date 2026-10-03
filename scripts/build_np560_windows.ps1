@@ -29,6 +29,11 @@ export PATH="/ucrt64/bin:/usr/bin:$PATH"
 source_dir="$(cygpath -u "$NP560_SOURCE_PATH")"
 build_dir="$(cygpath -u "$NP560_BUILD_PATH")"
 cd "$build_dir"
+trap 'if [ -f config.log ]; then tail -120 config.log; fi' ERR
+command -v cc
+cc --version | head -1
+printf 'int main(void) { return 0; }\n' | cc -x c - -o cc-smoke.exe
+./cc-smoke.exe
 if [ ! -f build.ninja ]; then
     "$source_dir/configure" \
       --target-list=dmcu-softmmu --with-pkgversion=np560-windows \
