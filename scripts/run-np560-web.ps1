@@ -305,7 +305,7 @@ $url = "http://127.0.0.1:$Port"
 if (-not $NoBrowser) {
     Start-Process $url
 }
-Write-Host "Starting NP560+ QEMU Web frontend at $url"
+Write-Host "Starting NP560+ Emulator Web frontend at $url"
 Write-Host 'Press Ctrl+C to stop QEMU and the Web server.'
 & wsl.exe -d $distro -- python3 @pythonArguments
 exit $LASTEXITCODE

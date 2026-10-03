@@ -1,11 +1,12 @@
 # 仓库结构整理记录（2026-09-16）
 
-后续决策：已改为 `HelloClyde/np560-qemu` 单仓库，QEMU 直接纳入目录。
+后续决策：曾改为 `HelloClyde/np560-qemu` 单仓库，QEMU 直接纳入目录；
+2026-10-03 更名为 `HelloClyde/np560-plus-emulator`。
 下面的 submodule 方案仅为合并前历史记录，当前恢复方式见 [github_restore.md](../guides/github_restore.md)。
 
 - 主仓库添加根 README；QEMU 改为正式 `qemu-dmcu` submodule，固定
   `0fa30bd31b032cbd07d8a85719734c1bd4c57cc2`。
-- 核心私有远程：`HelloClyde/np560-qemu`，保留完整上游与定制提交历史，
+- 核心私有远程：原 `HelloClyde/np560-qemu`（现 `HelloClyde/np560-plus-emulator`），保留完整上游与定制提交历史，
   未改写现有提交。官方 GitLab 远程保留为 upstream。
 - 219 个 Python、2 个 JS 测试从 scripts 根迁到 `scripts/tests/`，调整
   导入路径、项目根定位、源文件定位及 PS1/doc 调用路径。

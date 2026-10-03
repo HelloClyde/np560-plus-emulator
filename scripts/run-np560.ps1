@@ -133,6 +133,6 @@ if ($QemuArguments) {
     $arguments += $QemuArguments
 }
 
-Write-Host 'Starting NP560+ QEMU. Press Ctrl+C to stop.'
+Write-Host 'Starting NP560+ Emulator. Press Ctrl+C to stop.'
 & wsl.exe -d $distro -- $qemu @arguments
 exit $LASTEXITCODE

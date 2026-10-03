@@ -1,11 +1,11 @@
 # 单仓库恢复与维护
 
-统一远程：`https://github.com/HelloClyde/np560-qemu`（私有），默认分支 `master`。
+统一远程：`https://github.com/HelloClyde/np560-plus-emulator`（私有），默认分支 `master`。
 QEMU 核心、Web 前端、脚本和文档均在同一仓库，`qemu-dmcu/` 不再是 submodule。
 
 ```bash
-git clone https://github.com/HelloClyde/np560-qemu.git
-cd np560-qemu
+git clone https://github.com/HelloClyde/np560-plus-emulator.git
+cd np560-plus-emulator
 ```
 
 之后在项目内统一 commit、push 即可。无需 `git submodule update`，也无需套用

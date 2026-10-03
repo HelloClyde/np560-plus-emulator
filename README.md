@@ -1,4 +1,4 @@
-# NP560+ 模拟器
+# NP560+ Emulator
 
 基于 QEMU 的诺亚舟 NP560+ 模拟器。浏览器显示真机 LCD 和可点击的键盘，
 支持 NPE 游戏、MP3 与 NAND 文件管理。
@@ -15,7 +15,7 @@
 
 ## 快速开始（Windows x64）
 
-1. 从 [Releases 页面](https://github.com/HelloClyde/np560-qemu/releases) 的最新版本下载四个文件：
+1. 从 [Releases 页面](https://github.com/HelloClyde/np560-plus-emulator/releases) 的最新版本下载四个文件：
    `np560-windows-x64.zip`（模拟器）、`NP560.PRG`、`resident.bin`、`system.nand.gz`。
 2. 解压模拟器；把后三个文件放进解压后的 `np560-windows-x64/images/` 文件夹，
    文件名保持不变。它们是三个不同用途的镜像，只有 `system.nand.gz` 是 NAND 镜像。
