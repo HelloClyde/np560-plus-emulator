@@ -25,6 +25,7 @@ $env:NP560_BUILD_JOBS = [string]$Jobs
 
 $command = @'
 set -e
+export PATH="/ucrt64/bin:/usr/bin:$PATH"
 source_dir="$(cygpath -u "$NP560_SOURCE_PATH")"
 build_dir="$(cygpath -u "$NP560_BUILD_PATH")"
 cd "$build_dir"
