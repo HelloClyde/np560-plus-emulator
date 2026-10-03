@@ -90,6 +90,10 @@ jobs:
           printf '%s  %s\n' \
             'd555609e03ece17f42c1881beeb88361572f18621161de67bc9dc765857089f5' \
             "$RUNNER_TEMP/np560-firmware/NP560.PRG" | sha256sum --check --status
+          # Legacy ROM modules read this path while importing, before the
+          # builder processes --firmware. Use the verified downloaded bytes.
+          mkdir -p 'NP560+V3.80版系统升级程序'
+          cp "$RUNNER_TEMP/np560-firmware/NP560.PRG" 'NP560+V3.80版系统升级程序/NP560.PRG'
       - name: Rebuild checked resident ROM/HLE bundle
         shell: bash
         run: |
