@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -23,13 +24,17 @@ import uuid
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 if __package__:
-    from .device_config import BOUND_FLAGS, RUNTIME_FLAGS, create_device, load_device
+    from .device_config import (BOUND_FLAGS, RUNTIME_FLAGS, create_device,
+                                file_identity, load_device, stored_path)
+    from .nand_files import MAX_IMPORT_BYTES, rehash_checkpoint, with_volume
     from .rom_bundle import player_bundle_settings
 else:
-    from device_config import BOUND_FLAGS, RUNTIME_FLAGS, create_device, load_device
+    from device_config import (BOUND_FLAGS, RUNTIME_FLAGS, create_device,
+                               file_identity, load_device, stored_path)
+    from nand_files import MAX_IMPORT_BYTES, rehash_checkpoint, with_volume
     from rom_bundle import player_bundle_settings
 
 
@@ -132,8 +137,8 @@ class RunJournal:
 
 
 class QMPClient:
-    def __init__(self, socket_path: Path):
-        self.socket_path = socket_path
+    def __init__(self, endpoint: Path | tuple[str, int]):
+        self.endpoint = endpoint
         self.sock: socket.socket | None = None
         self.stream = None
         self.lock = threading.Lock()
@@ -146,10 +151,12 @@ class QMPClient:
         # their own timeout behavior.
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            family = socket.AF_INET if isinstance(self.endpoint, tuple) else socket.AF_UNIX
+            sock = socket.socket(family, socket.SOCK_STREAM)
             try:
                 sock.settimeout(max(0.001, deadline - time.monotonic()))
-                sock.connect(str(self.socket_path))
+                sock.connect(self.endpoint if isinstance(self.endpoint, tuple)
+                             else str(self.endpoint))
                 self.sock = sock
                 # QMP audio replies contain tens of KiB of base64 PCM. Raw
                 # SocketIO.readline reads one byte at a time; buffer reads
@@ -322,6 +329,13 @@ class Emulator:
         tag = f"np560-{os.getpid()}-{uuid.uuid4().hex[:12]}"
         self.audio_stream_id = tag
         self.qmp_path = Path(tempfile.gettempdir()) / f"{tag}.qmp"
+        self.qmp_port = None
+        if os.name == "nt":
+            # QEMU's Windows build has no Unix-domain QMP listener. Keep the
+            # control channel loopback-only; the HTTP bind is independent.
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind(("127.0.0.1", 0))
+                self.qmp_port = probe.getsockname()[1]
         self.frame_path = Path(tempfile.gettempdir()) / f"{tag}.frame"
         # Multiple independent Web instances must not truncate or contend for
         # one shared log.  This is especially important while an interactive
@@ -335,7 +349,8 @@ class Emulator:
         self._exit_watcher = None
         self.process = None
         self.codec_process: subprocess.Popen | None = None
-        self.qmp = QMPClient(self.qmp_path)
+        self.qmp = QMPClient(("127.0.0.1", self.qmp_port) if self.qmp_port
+                             else self.qmp_path)
         self.legacy_key_latch = rom_hle
         self.nand_save_on_exit = nand_save_on_exit
         self.nand_journal = nand_journal
@@ -379,7 +394,9 @@ class Emulator:
         command = [
             str(qemu), "-M", machine, "-bios", str(firmware),
             "-nographic", "-monitor", "none",
-            "-qmp", f"unix:{self.qmp_path},server=on,wait=off",
+            "-qmp", (f"tcp:127.0.0.1:{self.qmp_port},server=on,wait=off"
+                     if self.qmp_port else
+                     f"unix:{self.qmp_path},server=on,wait=off"),
         ]
         if start_paused:
             command.append("-S")
@@ -1050,6 +1067,184 @@ class KeyInputLease:
             self.lease_seconds = 0.0
 
 
+class OfflineFileSession:
+    """Serialize the guest-to-offline transition and staged FAT16 operations."""
+
+    def __init__(self, server, args: argparse.Namespace, journal: RunJournal,
+                 codec_process: subprocess.Popen | None):
+        self.server = server
+        self.args = args
+        self.journal = journal
+        self.codec_process = codec_process
+        self.lock = threading.RLock()
+        self.mode = "online"
+        self.dirty = False
+        self.checkpoint: Path | None = None
+        self.directory: Path | None = None
+
+    def status(self) -> dict:
+        with self.lock:
+            return {"mode": self.mode, "dirty": self.dirty,
+                    "available": bool(self.args.device),
+                    "checkpoint": str(self.checkpoint) if self.checkpoint else None}
+
+    def open(self) -> dict:
+        with self.lock:
+            if not self.args.device:
+                raise ValueError("文件管理需要以 --device 启动的持久化设备")
+            if self.mode == "offline":
+                return self.status()
+            if self.mode != "online":
+                raise ValueError("设备正处于切换过程中")
+            self.mode = "transition"
+            emulator = self.server.emulator
+            if emulator is None:
+                self.mode = "offline"
+                raise ValueError("模拟器未运行，不能导出完整 NAND")
+            self.directory = (self.args.device.resolve().parent /
+                              "file-sessions" / uuid.uuid4().hex)
+            self.directory.mkdir(parents=True, exist_ok=False)
+            self.checkpoint = self.directory / "system.nand"
+            stopped = False
+            try:
+                emulator.qmp.execute("stop")
+                stopped = True
+                emulator.save_nand(self.checkpoint, timeout=120.0)
+                self.server.key_lease.close()
+                emulator.close()
+                self.server.emulator = None
+                self.server.key_lease = None
+                self.mode = "offline"
+                self.journal.record("file_session_opened", checkpoint=str(self.checkpoint))
+                return self.status()
+            except BaseException:
+                if stopped and emulator.process.poll() is None:
+                    try:
+                        emulator.qmp.execute("cont")
+                    except (OSError, QMPError):
+                        pass
+                self.mode = "online" if emulator.process.poll() is None else "failed"
+                raise
+
+    def _require_offline(self) -> Path:
+        if self.mode != "offline" or self.checkpoint is None:
+            raise ValueError("请先确认关机并进入 NAND 文件标签")
+        return self.checkpoint
+
+    def list_dir(self, path: str) -> dict:
+        with self.lock:
+            checkpoint = self._require_offline()
+            return {"path": path, "entries": with_volume(
+                checkpoint, False, lambda files: files.list_dir(path))}
+
+    def download(self, path: str) -> bytes:
+        with self.lock:
+            checkpoint = self._require_offline()
+            return with_volume(checkpoint, False, lambda files: files.read_file(path))
+
+    def import_file(self, directory: str, filename: str, payload: bytes) -> dict:
+        with self.lock:
+            checkpoint = self._require_offline()
+            if len(payload) > MAX_IMPORT_BYTES:
+                raise ValueError("导入文件超过 64 MiB")
+            candidate = self.directory / "import-next.nand"
+            if candidate.exists():
+                raise ValueError("上次导入的暂存文件尚未清理，请检查磁盘")
+            try:
+                shutil.copyfile(checkpoint, candidate)
+                report = with_volume(candidate, True,
+                    lambda files: files.import_file(directory, filename, payload))
+                rehash_checkpoint(candidate)
+                # Never overwrite a configured or previously exported checkpoint.
+                current = self.directory / f"system-{uuid.uuid4().hex[:12]}.nand"
+                candidate.replace(current)
+                self.checkpoint = current
+                self.dirty = True
+                self.journal.record("file_import_staged", **report,
+                                    checkpoint=str(current))
+                return report
+            except BaseException:
+                candidate.unlink(missing_ok=True)
+                raise
+
+    def resume(self) -> dict:
+        with self.lock:
+            checkpoint = self._require_offline()
+            self.mode = "transition"
+            old_checkpoint = self.args.nand_checkpoint
+            old_journal = self.args.nand_journal
+            old_identity = self.args.device_identity
+            config_path = self.args.device.resolve()
+            backup = None
+            new_emulator = None
+            try:
+                if self.dirty:
+                    config = json.loads(config_path.read_text(encoding="utf-8-sig"))
+                    config["inputs"]["nand_checkpoint"] = {
+                        "path": stored_path(config_path.parent, checkpoint),
+                        **file_identity(checkpoint),
+                    }
+                    new_journal = self.directory / "device.npj"
+                    config["journal"] = stored_path(config_path.parent, new_journal)
+                    backup = config_path.with_name(config_path.name +
+                                                   f".before-files-{uuid.uuid4().hex[:8]}.bak")
+                    shutil.copy2(config_path, backup)
+                    temporary = config_path.with_name(config_path.name + ".file-update.tmp")
+                    try:
+                        with temporary.open("x", encoding="utf-8") as stream:
+                            json.dump(config, stream, ensure_ascii=False, indent=2)
+                            stream.write("\n")
+                            stream.flush()
+                            os.fsync(stream.fileno())
+                        temporary.replace(config_path)
+                    finally:
+                        temporary.unlink(missing_ok=True)
+                    self.args.nand_checkpoint = checkpoint
+                    self.args.nand_journal = new_journal
+                    self.args.device_identity = {
+                        **old_identity, "nand_checkpoint": str(checkpoint),
+                        "journal": str(new_journal),
+                    }
+                run = RunJournal(self.args.run_log_dir, kind="file-session-resume",
+                                 device=self.args.device_identity)
+                new_emulator = start_emulator(self.args, run)
+                new_emulator.codec_process = self.codec_process
+                new_emulator.device_identity = self.args.device_identity
+                lease = KeyInputLease(new_emulator)
+                self.server.emulator = new_emulator
+                self.server.key_lease = lease
+                self.mode = "online"
+                self.dirty = False
+                # Reclaim only checkpoints created by this file session.
+                for obsolete in self.directory.glob("*.nand"):
+                    if obsolete.resolve().parent == self.directory.resolve() and (
+                            not backup or obsolete != checkpoint):
+                        try:
+                            obsolete.unlink()
+                        except OSError as cleanup_error:
+                            self.journal.record("file_snapshot_cleanup_failed",
+                                                path=str(obsolete), error=str(cleanup_error))
+                self.journal.record("file_session_resumed", checkpoint=str(checkpoint))
+                return self.status()
+            except BaseException:
+                if new_emulator is not None:
+                    try:
+                        new_emulator.close()
+                    except (OSError, QMPError):
+                        pass
+                    self.server.emulator = None
+                    self.server.key_lease = None
+                if backup is not None:
+                    rollback = config_path.with_name(config_path.name + ".file-rollback.tmp")
+                    shutil.copy2(backup, rollback)
+                    rollback.replace(config_path)
+                    self.args.nand_checkpoint = old_checkpoint
+                    self.args.nand_journal = old_journal
+                    self.args.device_identity = old_identity
+                self.mode = "offline"
+                raise
+
+
 class RequestHandler(SimpleHTTPRequestHandler):
     server_version = "NP560Web/0.1"
 
@@ -1058,7 +1253,10 @@ class RequestHandler(SimpleHTTPRequestHandler):
 
     @property
     def emulator(self) -> Emulator:
-        return self.server.emulator  # type: ignore[attr-defined]
+        emulator = self.server.emulator  # type: ignore[attr-defined]
+        if emulator is None:
+            raise ValueError("模拟器已关机，当前正在管理 NAND 文件")
+        return emulator
 
     @property
     def key_lease(self) -> KeyInputLease:
@@ -1085,8 +1283,46 @@ class RequestHandler(SimpleHTTPRequestHandler):
     def _error(self, exc: Exception) -> None:
         self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
 
+    def _local_files_only(self) -> None:
+        if self.client_address[0] not in ("127.0.0.1", "::1"):
+            raise ValueError("NAND 文件操作仅允许从本机浏览器访问")
+        host = self.headers.get("Host", "")
+        if urlparse("http://" + host).hostname not in ("127.0.0.1", "localhost", "::1"):
+            raise ValueError("NAND 文件操作要求本机地址，不接受其他 Host")
+        origin = self.headers.get("Origin")
+        if origin and (urlparse(origin).scheme != "http" or
+                       urlparse(origin).netloc != host):
+            raise ValueError("NAND 文件请求来源不匹配")
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path.startswith("/api/files/"):
+            try:
+                self._local_files_only()
+                session = self.server.file_session
+                if parsed.path == "/api/files/status":
+                    self._json(session.status())
+                elif parsed.path == "/api/files/list":
+                    path = parse_qs(parsed.query).get("path", ["/"])[0]
+                    self._json(session.list_dir(path))
+                elif parsed.path == "/api/files/download":
+                    path = parse_qs(parsed.query).get("path", [""])[0]
+                    name = path.rsplit("/", 1)[-1]
+                    payload = session.download(path)
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + quote(name))
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                else:
+                    self.send_error(HTTPStatus.NOT_FOUND)
+            except (ValueError, OSError, QMPError) as exc:
+                self._error(exc)
+            return
+        if parsed.path.startswith("/api/") and self.server.emulator is None:
+            self._json({"error": "模拟器已关机，当前正在管理 NAND 文件"}, HTTPStatus.CONFLICT)
+            return
         if parsed.path == "/api/key-status":
             try:
                 self._json(self.emulator.key_status())
@@ -1153,6 +1389,26 @@ class RequestHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self) -> None:
         try:
+            parsed = urlparse(self.path)
+            if parsed.path.startswith("/api/files/"):
+                self._local_files_only()
+                session = self.server.file_session
+                if parsed.path == "/api/files/open":
+                    self._json(session.open())
+                elif parsed.path == "/api/files/resume":
+                    self._json(session.resume())
+                elif parsed.path == "/api/files/import":
+                    length = int(self.headers.get("Content-Length", "-1"))
+                    if length < 0 or length > MAX_IMPORT_BYTES:
+                        raise ValueError("导入文件大小无效或超过 64 MiB")
+                    query = parse_qs(parsed.query)
+                    directory = query.get("path", ["/"])[0]
+                    filename = query.get("name", [""])[0]
+                    self._json(session.import_file(directory, filename,
+                                                  self.rfile.read(length)))
+                else:
+                    self.send_error(HTTPStatus.NOT_FOUND)
+                return
             length = int(self.headers.get("Content-Length", "0"))
             if length > 4096:
                 raise ValueError("request is too large")
@@ -1172,7 +1428,13 @@ class RequestHandler(SimpleHTTPRequestHandler):
                         target=self.server.shutdown, daemon=True
                     ).start()
                     return
+                if self.server.emulator is None:
+                    self._json({"error": "模拟器已关机，当前正在管理 NAND 文件"}, HTTPStatus.CONFLICT)
+                    return
                 self.emulator.control(action)
+            elif self.server.emulator is None:
+                self._json({"error": "模拟器已关机，当前正在管理 NAND 文件"}, HTTPStatus.CONFLICT)
+                return
             elif self.path == "/api/key":
                 state = int(payload.get("state", 0)) & 0xFFFFFFFF
                 code = int(payload.get("code", 0)) & 0xFFFFFFFF
@@ -1436,9 +1698,16 @@ def main() -> int:
 def start_owned_npe_codec(args: argparse.Namespace, journal: RunJournal,
                           cleanup: ExitStack) -> subprocess.Popen:
     """Own the selected local decoder for exactly this Web/QEMU lifetime."""
-    socket_dir = Path(cleanup.enter_context(
-        tempfile.TemporaryDirectory(prefix="np560-npe-codec-")))
-    socket_path = socket_dir / "codec.sock"
+    socket_path = None
+    codec_port = None
+    if os.name == "nt":
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            codec_port = probe.getsockname()[1]
+    else:
+        socket_dir = Path(cleanup.enter_context(
+            tempfile.TemporaryDirectory(prefix="np560-npe-codec-")))
+        socket_path = socket_dir / "codec.sock"
     log_path = journal.directory / "npe-codec.log"
     log = log_path.open("wb")
     cleanup.callback(log.close)
@@ -1447,8 +1716,9 @@ def start_owned_npe_codec(args: argparse.Namespace, journal: RunJournal,
         extra = str(args.rom_npe_codec_pythonpath.resolve())
         env["PYTHONPATH"] = extra + (os.pathsep + env["PYTHONPATH"]
                                       if env.get("PYTHONPATH") else "")
-    command = [sys.executable, str(PROJECT / "scripts" / "serve_np560_npe_codec.py"),
-               "--socket", str(socket_path)]
+    command = [sys.executable, str(PROJECT / "scripts" / "serve_np560_npe_codec.py")]
+    command += (["--tcp", f"127.0.0.1:{codec_port}"] if codec_port else
+                ["--socket", str(socket_path)])
     if args.rom_npe_codec_owned:
         command += ["--backend", "owned"]
     else:
@@ -1472,7 +1742,15 @@ def start_owned_npe_codec(args: argparse.Namespace, journal: RunJournal,
 
     cleanup.callback(stop_codec)
     deadline = time.monotonic() + 10
-    while not socket_path.is_socket():
+    while True:
+        if codec_port:
+            try:
+                with socket.create_connection(("127.0.0.1", codec_port), timeout=0.1):
+                    break
+            except (ConnectionRefusedError, TimeoutError, OSError):
+                pass
+        elif socket_path.is_socket():
+            break
         if process.poll() is not None:
             raise RuntimeError(
                 f"NPE codec exited before listening (code {process.returncode}); "
@@ -1480,9 +1758,10 @@ def start_owned_npe_codec(args: argparse.Namespace, journal: RunJournal,
         if time.monotonic() >= deadline:
             raise RuntimeError(f"NPE codec did not listen within 10 seconds; see {log_path}")
         time.sleep(0.02)
-    args.rom_npe_codec_socket = str(socket_path)
+    args.rom_npe_codec_socket = (f"tcp:127.0.0.1:{codec_port}" if codec_port
+                                 else str(socket_path))
     journal.record("npe_codec_listening", codec_pid=process.pid,
-                   socket=str(socket_path), log=str(log_path))
+                   socket=args.rom_npe_codec_socket, log=str(log_path))
     return process
 
 
@@ -1491,12 +1770,13 @@ def run_server(args: argparse.Namespace) -> int:
                          boot_mode=args.boot_mode,
                          device=getattr(args, "device_identity", None))
     print(f"Lifecycle records: {journal.directory}", flush=True)
-    lease = None
-
     def close_runtime():
+        emulator = getattr(server, "emulator", None)
+        lease = getattr(server, "key_lease", None)
         try:
-            # QMP shutdown releases any request holding the input-lease lock.
-            emulator.close()
+            if emulator is not None:
+                # QMP shutdown releases any request holding the input-lease lock.
+                emulator.close()
         finally:
             if lease is not None:
                 lease.close()
@@ -1529,6 +1809,8 @@ def run_server(args: argparse.Namespace) -> int:
                 codec_process = start_owned_npe_codec(args, journal, cleanup)
             emulator = start_emulator(args, journal)
             emulator.codec_process = codec_process
+            server.emulator = emulator
+            server.key_lease = None
             cleanup.callback(close_runtime)
             emulator.device_identity = getattr(args, "device_identity", None)
             for address, path in args.debug_program_load:
@@ -1544,6 +1826,8 @@ def run_server(args: argparse.Namespace) -> int:
             lease = KeyInputLease(emulator)
             server.emulator = emulator
             server.key_lease = lease
+            server.file_session = OfflineFileSession(server, args, journal,
+                                                      codec_process)
             server.shutdown_token = args.shutdown_token
             server.journal = journal
             stopping = threading.Event()
@@ -1566,7 +1850,8 @@ def run_server(args: argparse.Namespace) -> int:
             print(f"NP560+ Web frontend: http://{args.host}:{server.server_port}", flush=True)
             print(f"QEMU log: {emulator.log_path}", flush=True)
             server.serve_forever()
-            returncode = 0 if emulator.process.poll() is None else 1
+            active = server.emulator
+            returncode = 0 if active is None or active.process.poll() is None else 1
         journal.record("bridge_stopped", phase="stopped", bridge_returncode=returncode)
         return returncode
     except BaseException as error:

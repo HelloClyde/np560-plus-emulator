@@ -4,9 +4,16 @@
  * The resident ROM service contract is implemented separately. */
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
+#include "qemu/sockets.h"
 #include "np560_npe_codec.h"
 
+#ifndef _WIN32
 #include <sys/un.h>
+#endif
+
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
 
 #define CODEC_PCM_SAMPLES 160
 #define CODEC_PCM_BYTES (CODEC_PCM_SAMPLES * 2)
@@ -78,17 +85,39 @@ static bool codec_reply(NP560NPECodec *codec, uint8_t expected,
 
 NP560NPECodec *np560_npe_codec_new(const char *socket_path, Error **errp)
 {
+#ifdef _WIN32
+    struct sockaddr_in address = {.sin_family = AF_INET};
+    unsigned long port;
+    char *end;
+    DWORD timeout = 3000;
+#else
     struct sockaddr_un address = {.sun_family = AF_UNIX};
     struct timeval timeout = {.tv_sec = 3};
+#endif
     NP560NPECodec *codec;
     int fd;
 
+#ifdef _WIN32
+    if (!socket_path || !g_str_has_prefix(socket_path, "tcp:127.0.0.1:")) {
+        error_setg(errp, "Windows NPE codec requires a loopback TCP endpoint");
+        return NULL;
+    }
+    port = strtoul(socket_path + strlen("tcp:127.0.0.1:"), &end, 10);
+    if (!port || port > 65535 || *end) {
+        error_setg(errp, "invalid NPE codec loopback TCP port");
+        return NULL;
+    }
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(port);
+    fd = qemu_socket(AF_INET, SOCK_STREAM, 0);
+#else
     if (!socket_path || !*socket_path ||
         strlen(socket_path) >= sizeof(address.sun_path)) {
         error_setg(errp, "NPE codec Unix-socket path is empty or too long");
         return NULL;
     }
-    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    fd = qemu_socket(AF_UNIX, SOCK_STREAM, 0);
+#endif
     if (fd < 0) {
         error_setg_errno(errp, errno, "cannot create NPE codec socket");
         return NULL;
@@ -96,14 +125,16 @@ NP560NPECodec *np560_npe_codec_new(const char *socket_path, Error **errp)
     if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0 ||
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0) {
         error_setg_errno(errp, errno, "cannot set NPE codec socket timeout");
-        close(fd);
+        qemu_close(fd);
         return NULL;
     }
+#ifndef _WIN32
     g_strlcpy(address.sun_path, socket_path, sizeof(address.sun_path));
+#endif
     if (connect(fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
         error_setg_errno(errp, errno, "cannot connect to NPE codec socket %s",
                          socket_path);
-        close(fd);
+        qemu_close(fd);
         return NULL;
     }
     codec = g_new0(NP560NPECodec, 1);
@@ -114,7 +145,7 @@ NP560NPECodec *np560_npe_codec_new(const char *socket_path, Error **errp)
 void np560_npe_codec_free(NP560NPECodec *codec)
 {
     if (codec) {
-        close(codec->fd);
+        qemu_close(codec->fd);
         g_free(codec);
     }
 }

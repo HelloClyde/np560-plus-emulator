@@ -10885,6 +10885,22 @@ static void np560_set_nand_checkpoint(Object *obj, const char *value,
     s->nand_checkpoint = g_strdup(value);
 }
 
+static bool np560_write_nand_plane(int fd, const uint8_t *data, size_t size)
+{
+    /* Windows CRT write() rejects very large requests even when the complete
+     * NAND plane fits in size_t. Keep every host write bounded. */
+    while (size) {
+        size_t chunk = MIN(size, (size_t)(1024 * 1024));
+
+        if (qemu_write_full(fd, data, chunk) != chunk) {
+            return false;
+        }
+        data += chunk;
+        size -= chunk;
+    }
+    return true;
+}
+
 static void np560_save_nand_checkpoint(NP560MachineState *s,
                                        const char *path, Error **errp)
 {
@@ -10893,6 +10909,12 @@ static void np560_save_nand_checkpoint(NP560MachineState *s,
     uint8_t checkpoint[NP560_NAND_CHECKPOINT_HEADER_SIZE] = { 0 };
     g_autofree char *temporary = NULL;
     int fd, saved_errno;
+    const char *failed_step = "header write";
+    int open_flags = O_WRONLY | O_BINARY;
+
+#ifdef O_CLOEXEC
+    open_flags |= O_CLOEXEC;
+#endif
 
     if (!path || !*path) {
         error_setg(errp, "NP560+ NAND checkpoint output path is empty");
@@ -10954,24 +10976,44 @@ static void np560_save_nand_checkpoint(NP560MachineState *s,
     /* The QOM setter runs under BQL, so the two NAND planes stay stable.
      * Stream them without another 528-MiB allocation. Publish only after
      * all writes/sync/close succeed; a failed export preserves the old file. */
-    temporary = g_strdup_printf("%s.export.XXXXXX", path);
-    fd = g_mkstemp_full(temporary, O_WRONLY | O_BINARY | O_CLOEXEC, 0600);
+    /* GLib's Windows temp-file fd can belong to a different CRT than the
+     * QEMU write/close wrappers. Create it through QEMU's fd layer instead. */
+    temporary = g_strdup_printf("%s.export.%08x%08x", path,
+                                g_random_int(), g_random_int());
+    fd = qemu_create(temporary, open_flags | O_EXCL, 0600, NULL);
     if (fd < 0) {
         error_setg_errno(errp, errno, "Unable to create NAND export for '%s'", path);
         return;
     }
-    if (qemu_write_full(fd, checkpoint, sizeof(checkpoint)) != sizeof(checkpoint) ||
-        qemu_write_full(fd, nand->data, NP560_NAND_DATA_SIZE) != NP560_NAND_DATA_SIZE ||
-        qemu_write_full(fd, nand->oob, NP560_NAND_OOB_SIZE) != NP560_NAND_OOB_SIZE ||
-        qemu_fdatasync(fd) < 0) {
+    if (qemu_write_full(fd, checkpoint, sizeof(checkpoint)) != sizeof(checkpoint)) {
         saved_errno = errno ? errno : EIO;
         qemu_close(fd);
         goto export_failed;
     }
+    failed_step = "data write";
+    if (!np560_write_nand_plane(fd, nand->data, NP560_NAND_DATA_SIZE)) {
+        saved_errno = errno ? errno : EIO;
+        qemu_close(fd);
+        goto export_failed;
+    }
+    failed_step = "OOB write";
+    if (!np560_write_nand_plane(fd, nand->oob, NP560_NAND_OOB_SIZE)) {
+        saved_errno = errno ? errno : EIO;
+        qemu_close(fd);
+        goto export_failed;
+    }
+    failed_step = "sync";
+    if (qemu_fdatasync(fd) < 0) {
+        saved_errno = errno ? errno : EIO;
+        qemu_close(fd);
+        goto export_failed;
+    }
+    failed_step = "close";
     if (qemu_close(fd) < 0) {
         saved_errno = errno ? errno : EIO;
         goto export_failed;
     }
+    failed_step = "rename";
     if (g_rename(temporary, path) < 0) {
         saved_errno = errno ? errno : EIO;
         goto export_failed;
@@ -10981,8 +11023,9 @@ static void np560_save_nand_checkpoint(NP560MachineState *s,
 export_failed:
     /* Only remove this call's exclusively created temporary, never path. */
     g_unlink(temporary);
-    error_setg_errno(errp, saved_errno, "Unable to save NP560+ NAND checkpoint '%s'",
-                    path);
+    error_setg_errno(errp, saved_errno,
+                     "Unable to save NP560+ NAND checkpoint '%s' during %s",
+                     path, failed_step);
 }
 
 static char *np560_get_nand_save(Object *obj, Error **errp)

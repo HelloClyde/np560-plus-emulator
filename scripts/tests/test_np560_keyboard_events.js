@@ -15,6 +15,7 @@ const emergencyBodies = [];
 const timers = new Map(), toggleHandlers = new Map();
 const toggle = { checked: false,
   addEventListener: (name, handler) => toggleHandlers.set(name, handler) };
+const filesConfirmDialog = { open: false };
 class Element {
   constructor(editable = false, control = false) {
     this.isContentEditable = editable;
@@ -34,6 +35,7 @@ const document = {
 };
 const sandbox = vm.createContext({
   Element, keyboardInput: input, normalizeKeyboardEvent, document,
+  filesConfirmDialog,
   keyRequestQueue: Promise.resolve(), performance: { now: () => now },
   setTimeout(fn, delay) {
     assert.ok(this === undefined || this === sandbox, 'timer called with foreign receiver');
@@ -80,6 +82,11 @@ for (const overrides of [
   assert.equal(fire("keydown", overrides).prevented, false);
   assert.equal(packets.length, before, "text entry/shortcut leaked into guest");
 }
+filesConfirmDialog.open = true;
+const beforeDialogKey = packets.length;
+fire("keydown", { code: "Enter", key: "Enter" });
+assert.equal(packets.length, beforeDialogKey, "dialog confirmation leaked into guest");
+filesConfirmDialog.open = false;
 assert.equal(fire("keydown").prevented, true);
 assert.equal(packets.at(-1).matrix_low, 2);
 const count = packets.length;

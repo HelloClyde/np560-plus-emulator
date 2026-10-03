@@ -413,7 +413,7 @@
 | [scan_np560_mpeg_tables.py](scan_np560_mpeg_tables.py) | Read-only, representation-bounded MPEG table search in original NP560 files. |
 | [unpack_np560_aspack.c](unpack_np560_aspack.c) | 用途与参数见源文件。 |
 
-## 运行时调试、采样、交互探针与性能测量（88）
+## 运行时调试、采样、交互探针与性能测量（89）
 
 | 文件 | 用途 |
 | --- | --- |
@@ -458,6 +458,7 @@
 | [probe_np560_eq_web_bundle.py](probe_np560_eq_web_bundle.py) | Owned real Web launch for a selected default-v6 or experimental-v8 ROM bundle. |
 | [probe_np560_hero_equipment.py](probe_np560_hero_equipment.py) | Inspect Hero's equipment through native slot-three load on an owned instance. |
 | [probe_np560_key_duration.py](probe_np560_key_duration.py) | Bounded physical-contact experiment on an owned emulator's desktop. |
+| [probe_np560_live_perf.py](probe_np560_live_perf.py) | Sample the vCPU of an explicitly owned, live NP560 Web run. |
 | [probe_np560_matrix_route.py](probe_np560_matrix_route.py) | Replay a bounded NP560+ physical-matrix route through the Web bridge. |
 | [probe_np560_menu_short_press.py](probe_np560_menu_short_press.py) | Reproduce native menu input with wall-clock physical holds in an owned QEMU. |
 | [probe_np560_mobivoice_corpus.py](probe_np560_mobivoice_corpus.py) | Differentially check each distinct local NPE sound section once. |
@@ -485,7 +486,6 @@
 | [probe_np560_npe_stream_window.py](probe_np560_npe_stream_window.py) | Read-only compare a stopped NPE audio RAM window with its original section. |
 | [probe_np560_npe_unbanked_sfr.py](probe_np560_npe_unbanked_sfr.py) | Diff hardware-register writes while a real NPE game receives input. |
 | [probe_np560_perf_samples.py](probe_np560_perf_samples.py) | Bounded Linux perf user-IP sampling of an owned QEMU CPU thread, without ptrace. |
-| [probe_np560_live_perf.py](probe_np560_live_perf.py) | Read-only perf sampling of the unambiguous vCPU in an explicitly owned isolated Web run. |
 | [probe_np560_runtime.py](probe_np560_runtime.py) | Take low-overhead NP560 Web/QEMU runtime snapshots. |
 | [probe_np560_state.py](probe_np560_state.py) | Run an NP560 guest briefly and print CPU/NAND state for RE probes. |
 | [probe_np560_tjfy_encounter.py](probe_np560_tjfy_encounter.py) | Walk the original Tianjiang map until its guest enters a random battle. |
@@ -507,7 +507,7 @@
 | [watch-np560-web.ps1](watch-np560-web.ps1) | 用途与参数见源文件。 |
 | [watch_np560_code_sources.py](watch_np560_code_sources.py) | Pause an NP560 Web/QEMU run on the first recovered-code mismatch. |
 
-## ROM/HLE 构建、补丁与 NAND 内容加工（84）
+## ROM/HLE 构建、补丁与 NAND 内容加工（85）
 
 | 文件 | 用途 |
 | --- | --- |
@@ -546,6 +546,7 @@
 | [build_np560_stream_burn_harness.py](build_np560_stream_burn_harness.py) | Build a guest harness for UpdateAll.exe's official NAND stream protocol. |
 | [build_np560_system_nand.py](build_np560_system_nand.py) | Create a fresh system NAND via the vendor burner, then verify payload/ECC/boot. |
 | [build_np560_vma03_soc_rom.py](build_np560_vma03_soc_rom.py) | Build a narrow SoC-ROM variant for the NP560 PRG-at-03 experiment. |
+| [build_np560_windows.ps1](build_np560_windows.ps1) | 用途与参数见源文件。 |
 | [burn_np560_stream.py](burn_np560_stream.py) | Stream a package NAND image through the unmodified NP560 burner in QEMU. |
 | [ensure_np560_fat16_directories.py](ensure_np560_fat16_directories.py) | Add missing diagnostic FAT16 directories to an NP560 NAND checkpoint. |
 | [finalize_np560_runtime_firmware.py](finalize_np560_runtime_firmware.py) | Remove one-shot NAND provisioning triggers from NP560 runtime firmware. |
@@ -596,7 +597,7 @@
 | [seed_np560_factory_selector.py](seed_np560_factory_selector.py) | Seed the NP560+ factory selector byte in a NAND checkpoint. |
 | [seed_np560_factory_userinfo.py](seed_np560_factory_userinfo.py) | Seed a complete factory-compatible USERINFO.SYS in an NP560 checkpoint. |
 
-## 共享模块与早期实验模型（28）
+## 共享模块与早期实验模型（29）
 
 | 文件 | 用途 |
 | --- | --- |
@@ -628,6 +629,7 @@
 | [np560_rom_api.py](np560_rom_api.py) | Inventory calls from an NP560+ auxiliary listing into resident SoC ROM. |
 | [np560_usb_transport.py](np560_usb_transport.py) | Serialize USB wire bytes as the original loader's data-RAM stores do. |
 | [observe_np560_seek_reload.py](observe_np560_seek_reload.py) | Read-only host hardware watches for the original MP3 reload path. |
+| [start_np560_windows.ps1](start_np560_windows.ps1) | 用途与参数见源文件。 |
 
 ## 仓库维护与整理（3）
 

@@ -62,7 +62,9 @@ const matrixIndexes = {
   // These keys are NOT the 8B..8E group:
   // M26/8C is consumed by the keyboard worker as an annunciator toggle.
   F1: 60, F2: 52, F3: 44, F4: 4,
-  // All three vendor tables return 0xB0 at matrix index 55. The original
+  // The NP560+ manual names the lower-right slide-out key "目录" and says it
+  // returns to the root directory. All three vendor tables return 0xB0 at
+  // matrix index 55. The original
   // 20:3102 dispatcher requests application FF; 22:52DC then switches menu
   // category 1 to 0, or any other category to 1. This is not a host command
   // to open Start unconditionally. Keep one physical key per user action.
@@ -105,6 +107,9 @@ const pointerPressReady = new Map();
 const pointerReleasePending = new Set();
 let pointerButtonSequence = 0;
 let polling = false;
+let filesOffline = false;
+let filesBusy = false;
+let filesPath = "/";
 let lastFrameAt = performance.now();
 let frames = 0;
 let settings = { source: "lcd", base: 0xef0000, bpp: 1, stride: 30, invert: false };
@@ -175,22 +180,26 @@ function annunciatorActive(bytes, plane, bit) {
   return (byte & (1 << (bit & 7))) !== 0;
 }
 
-function annunciatorGroupActive(bytes, first, last) {
-  for (let bit = first; bit <= last; bit += 1) {
-    if (annunciatorActive(bytes, 1, bit)) return true;
-  }
-  return false;
-}
+// The six separately driven glass electrodes are one-bit states, not two
+// ranges of interchangeable marks. Their left-to-right silhouettes follow
+// the supplied NP560+ photograph. The shape/position pairing is photographic
+// reconstruction; the bit values remain the guest's raw LCD output.
+const statusArtwork = [
+  { bit: 133, x: 92, pixels: ["000010000", "000111000", "001111100", "011111110", "000111000", "000111000", "000111000", "000111000"] },
+  { bit: 150, x: 110, pixels: ["000100000", "001100000", "011111110", "111111110", "011111110", "001100000", "000100000", "000000000"] },
+  { bit: 163, x: 128, pixels: ["000001000", "000001100", "011111110", "011111111", "011111110", "000001100", "000001000", "000000000"] },
+  { bit: 179, x: 146, pixels: ["000111000", "000111000", "000111000", "000111000", "011111110", "001111100", "000111000", "000010000"] },
+  { bit: 196, x: 164, pixels: ["000000000", "000000000", "000010000", "000111000", "001111100", "011111110", "000000000", "000000000"] },
+  { bit: 211, x: 182, pixels: ["000000000", "000000000", "011111110", "001111100", "000111000", "000010000", "000000000", "000000000"] },
+];
 
-function drawPhotographicStatusMark(x, active, color) {
-  if (!active) return;
-  // The two centre electrodes are visible in the supplied real-device photo,
-  // but their user-facing names are not documented.  Preserve that neutral
-  // status-mark silhouette instead of assigning invented firmware semantics.
+function drawStatusArtwork(pixels, x, color) {
   context.fillStyle = color;
-  context.fillRect(x, 3, 2, 6);
-  context.fillRect(x + 2, 4, 2, 4);
-  context.fillRect(x + 4, 5, 2, 2);
+  pixels.forEach((row, y) => {
+    for (let column = 0; column < row.length; column += 1) {
+      if (row[column] === "1") context.fillRect(x + column, y + 2, 1, 1);
+    }
+  });
 }
 
 function drawBatteryAnnunciator(bytes, color) {
@@ -219,18 +228,19 @@ function drawBatteryAnnunciator(bytes, color) {
   });
 }
 
-function drawAnnunciators(encoded, on) {
+function drawAnnunciators(encoded, on, off) {
   if (!encoded) return;
   const raw = atob(encoded);
   const bytes = Uint8Array.from(raw, character => character.charCodeAt(0));
   if (bytes.length !== 60) return;
   const color = `rgb(${on[0]}, ${on[1]}, ${on[2]})`;
-  drawPhotographicStatusMark(
-    130, annunciatorGroupActive(bytes, 129, 161), color
-  );
-  drawPhotographicStatusMark(
-    170, annunciatorGroupActive(bytes, 166, 188), color
-  );
+  // Unselected glass silhouettes remain faintly visible in the real-device
+  // photograph. They are artwork only, never synthesized active status bits.
+  const ghost = `rgb(${off.map((value, index) => Math.round(value * 0.86 + on[index] * 0.14)).join(",")})`;
+  for (const artwork of statusArtwork) {
+    drawStatusArtwork(artwork.pixels, artwork.x,
+      annunciatorActive(bytes, 1, artwork.bit) ? color : ghost);
+  }
   drawBatteryAnnunciator(bytes, color);
 }
 
@@ -268,7 +278,7 @@ function drawFrame(bytes, state) {
     }
   }
   context.putImageData(image, 0, 0);
-  drawAnnunciators(state.lcd_annunciators, on);
+  drawAnnunciators(state.lcd_annunciators, on, off);
   frames += 1;
   const now = performance.now();
   if (now - lastFrameAt >= 1000) {
@@ -355,6 +365,7 @@ function updatePressedButtons(heldCodes) {
 }
 
 function queueKeyPayload(payload, keepalive = false) {
+  if (filesOffline) return Promise.resolve({ ok: false, applied: false });
   const generation = ++keyPayloadGeneration;
   const trace = {
     generation, queued_at_ms: Date.now(), sent_at_ms: null,
@@ -431,6 +442,7 @@ function releaseAllKeys(force = false) {
 }
 
 function sendEmergencyRelease() {
+  if (typeof filesOffline !== "undefined" && filesOffline) return;
   releaseAllKeys(false);
   const payload = {
     state: 0, code: 0, matrix_low: 0, matrix_high: 0,
@@ -461,6 +473,7 @@ function synchronizeReleasedBackend() {
 }
 
 async function maintainKeyLease() {
+  if (filesOffline) return;
   if (!keyboardInput.hasHeldKeys() || keyHeartbeatInFlight) return;
   keyHeartbeatInFlight = true;
   try {
@@ -491,7 +504,7 @@ let lastDiagnosticsPoll = -Infinity;
 let latestRegisters = "";
 let fastDisplayAvailable = true;
 async function poll() {
-  if (polling) return;
+  if (polling || filesOffline) return;
   polling = true;
   try {
     const size = settings.stride * 120;
@@ -544,36 +557,12 @@ async function poll() {
     statusText.textContent = state.running ? (hle ? "运行中 · ROM 兼容界面" : "运行中") : state.status;
     statusDot.classList.add("online");
   } catch (error) {
+    if (filesOffline) return;
     if (keyboardInput.hasHeldKeys()) releaseAllKeys(true);
     statusText.textContent = error.message;
     statusDot.classList.remove("online");
   } finally {
     polling = false;
-  }
-}
-
-function buildKeyboard() {
-  const rows = [
-    ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"],
-    ["Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"],
-    ["A", "S", "D", "F", "G", "H", "J", "K", "L", "Backspace"],
-    ["Z", "X", "C", "V", "B", "N", "M", ",", ".", "Escape"],
-    ["Tab", "PageUp", " ", "PageDown", "Enter"]
-  ];
-  // Host shortcuts can share one matrix switch; do not advertise them as
-  // independent guest functions. The firmware/game decides the action.
-  const labels = { Backspace: "退格 / Esc 同键", Escape: "Esc", Tab: "Tab / 下同键", PageUp: "PgUp / 上同键", PageDown: "PgDn / 下同键", " ": "空格 / 点号同键", Enter: "确认" };
-  const keyboard = document.getElementById("keyboard");
-  for (const key of rows.flat()) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.dataset.key = key;
-    button.dataset.matrixIndex = String(matrixIndexes[key]).padStart(2, "0");
-    button.textContent = labels[key] || key;
-    button.title = `${button.textContent} · 实体矩阵 M${button.dataset.matrixIndex}`;
-    button.setAttribute("aria-pressed", "false");
-    if (["Backspace", "Escape", "Tab", "PageUp", "PageDown", " ", "Enter"].includes(key)) button.classList.add("wide");
-    keyboard.appendChild(button);
   }
 }
 
@@ -587,6 +576,103 @@ function buildRawMatrixKeyboard() {
     button.textContent = `M${number}`;
     keyboard.appendChild(button);
   }
+}
+
+function buildSkinKeyboard() {
+  const skin = document.getElementById("skin-keys");
+  const size = 1254; // Generated cutout's square coordinate system.
+  const add = (code, label, x, y, width, height) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "skin-key";
+    button.dataset.key = code;
+    button.textContent = label;
+    button.setAttribute("aria-label", label);
+    Object.assign(button.style, {
+      left: `${100 * x / size}%`, top: `${100 * y / size}%`,
+      width: `${100 * width / size}%`, height: `${100 * height / size}%`,
+    });
+    skin.appendChild(button);
+    return button;
+  };
+  // Match the attached NP560+ upper-shell photograph and the opened-keyboard
+  // NP560T reference. Only switches with an existing, evidenced matrix mapping
+  // receive hotspots. The two models share this visible key arrangement; their
+  // unverified side-switch electrical identities are not assumed identical.
+  ["F1", "F2", "F3", "F4"].forEach((key, index) =>
+    add(key, `左侧 ${key}/${"ABCD"[index]}`, 87, 198 + index * 60, 125, 37));
+  // The separate left paging disc is not the right-hand cursor pad.
+  // On the vendor desktop M11/94 moves up, M19/92 confirms, and M27/95
+  // moves down; do not alias them to the right-pad contacts.
+  add("Matrix11", "左侧翻页盘上", 117, 465, 64, 40);
+  add("Matrix19", "左侧翻页盘中／确认", 117, 505, 64, 50);
+  add("Matrix27", "左侧翻页盘下", 117, 555, 64, 40);
+  add("Matrix12", "设置", 88, 634, 126, 38);
+  // Right-hand shortcut column, verified on the original guest desktop:
+  // M59/B4 -> 同步学习, M51/B7 -> 多科助考, M43/BF -> 我的硬盘,
+  // M35/97 -> MP3. These are physical contacts, not host-side navigation.
+  add("Matrix59", "同步学习", 1038, 198, 129, 37);
+  add("Matrix51", "多科助考", 1038, 258, 129, 37);
+  add("Matrix43", "我的硬盘", 1038, 318, 129, 37);
+  add("Matrix35", "MP3", 1038, 377, 129, 37);
+  // The user identified the side-mounted power switch as M63.  Its guest
+  // event 0x8F is known to enter the original screen-off path; keep this a
+  // physical matrix contact, not a host shutdown/reset command.  The switch
+  // itself is hidden in the front-facing reference. Place the visible access
+  // button below the pull-out keyboard's right edge, with an air gap.
+  const power = add("Matrix63", "电源／休眠", 1019, 1195, 56, 56);
+  power.classList.add("skin-side-power");
+  power.innerHTML = '<svg class="skin-power-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 2v10M18.36 6.64a9 9 0 1 1-12.73 0"/></svg><span class="visually-hidden">电源／休眠</span>';
+  power.setAttribute("aria-label", "侧边电源／休眠键，矩阵 M63");
+  add("ArrowUp", "上", 1080, 461, 58, 49);
+  add("ArrowLeft", "左", 1039, 501, 50, 60);
+  add("Enter", "确认", 1080, 501, 61, 60);
+  add("ArrowRight", "右", 1132, 501, 43, 60);
+  add("ArrowDown", "下", 1080, 555, 58, 42);
+  add("Escape", "返回", 88, 696, 126, 38);
+  add(" ", "发音／空格", 1039, 634, 129, 37);
+  add("Matrix26", "SHIFT／符号模式（候选映射）", 154, 1003, 94, 65);
+  const qwerty = ["Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"];
+  const home = ["A", "S", "D", "F", "G", "H", "J", "K", "L"];
+  const lower = ["Z", "X", "C", "V", "B", "N", "M"];
+  qwerty.forEach((key, index) => add(key, `${key}／${(index + 1) % 10}`, 154 + index * 94, 863, 94, 62));
+  home.forEach((key, index) => add(key, key, 154 + index * 94, 927, 94, 65));
+  // In the alphabet table these contacts emit the secondary glyphs printed
+  // on the keycaps: M57='@', M62='?', M39='*'.
+  add("Matrix57", "生词／@", 1000, 927, 94, 65);
+  lower.forEach((key, index) => add(key, key, 248 + index * 94, 1003, 94, 65));
+  add(" ", "空格／发音", 906, 1003, 94, 65);
+  add("Matrix62", "音标／?", 1000, 1003, 94, 65);
+  add("Matrix42", "英汉词典／朗文双解", 154, 1069, 94, 65);
+  add("Matrix50", "简明汉英／现代汉语", 248, 1069, 94, 65);
+  // User-confirmed in the running emulator: M07 invokes 屏幕取词.
+  add("Matrix07", "屏幕取词", 342, 1069, 94, 65);
+  add("Matrix15", "帮助", 436, 1069, 94, 65);
+  // User-confirmed in the running emulator: M58 invokes 输入法. Preserve the
+  // guest matrix path; this is not a host-side input-method implementation.
+  add("Matrix58", "输入法", 530, 1069, 94, 65);
+  add("Matrix47", "删除", 624, 1069, 94, 65);
+  // User-confirmed in the running emulator: M23 invokes 查找.
+  add("Matrix23", "查找", 718, 1069, 94, 65);
+  // User-confirmed in the running emulator: M31 invokes 添加.
+  add("Matrix31", "添加", 812, 1069, 94, 65);
+  add("Matrix39", "修改／*", 906, 1069, 94, 65);
+  add("StartMenu", "目录（返回总目录）", 1000, 1069, 94, 65);
+  const backlight = document.createElement("button");
+  backlight.type = "button";
+  backlight.className = "skin-key";
+  backlight.textContent = "背光";
+  backlight.setAttribute("aria-label", "背光亮度");
+  Object.assign(backlight.style, {
+    left: `${100 * 1039 / size}%`, top: `${100 * 696 / size}%`,
+    width: `${100 * 129 / size}%`, height: `${100 * 38 / size}%`,
+  });
+  backlight.addEventListener("click", () => {
+    const slider = document.getElementById("backlight");
+    slider.value = String((Number(slider.value) + 1) % 3);
+    slider.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  skin.appendChild(backlight);
 }
 
 function bindKeyButton(button) {
@@ -660,8 +746,166 @@ function bindKeyButton(button) {
   button.addEventListener("lostpointercapture", release);
 }
 
-buildKeyboard();
+const homeTabs = [...document.querySelectorAll('.home-tabs [role="tab"]')];
+const filesConfirmDialog = document.getElementById("files-confirm-dialog");
+const filesConfirmCancel = document.getElementById("files-confirm-cancel");
+const filesStatus = document.getElementById("files-status");
+const filesList = document.getElementById("files-list");
+const filesPathLabel = document.getElementById("files-path");
+function setFileMessage(message) { filesStatus.textContent = message; }
+function setFilesOffline(offline) {
+  filesOffline = offline;
+  statusText.textContent = offline ? "已关机 · NAND 文件管理" : "连接中";
+  statusDot.classList.toggle("online", !offline);
+  document.querySelectorAll(".run-controls button").forEach(button => { button.disabled = offline; });
+  audioToggle.disabled = offline;
+}
+async function listNandFiles(path = filesPath) {
+  const result = await api(`/api/files/list?path=${encodeURIComponent(path)}`);
+  filesPath = result.path;
+  filesPathLabel.textContent = filesPath;
+  filesList.replaceChildren();
+  for (const entry of result.entries) {
+    const item = document.createElement("li");
+    const label = document.createElement("button");
+    label.type = "button";
+    label.textContent = `${entry.directory ? "📁" : "📄"} ${entry.name}`;
+    const target = `${filesPath === "/" ? "" : filesPath}/${entry.name}`;
+    if (entry.directory) {
+      label.addEventListener("click", () => {
+        void listNandFiles(target).catch(error => setFileMessage(error.message));
+      });
+    } else {
+      label.disabled = true;
+      const size = document.createElement("span");
+      size.className = "file-size";
+      size.textContent = `${entry.size.toLocaleString()} B`;
+      item.appendChild(size);
+      const link = document.createElement("a");
+      link.href = `/api/files/download?path=${encodeURIComponent(target)}`;
+      link.textContent = "下载";
+      link.setAttribute("download", entry.name);
+      item.appendChild(link);
+    }
+    item.prepend(label);
+    filesList.appendChild(item);
+  }
+  setFileMessage(`已关机 · ${result.entries.length} 项；导入会保存到新的检查点。`);
+}
+function confirmFilesShutdown() {
+  return new Promise(resolve => {
+    filesConfirmDialog.returnValue = "cancel";
+    filesConfirmDialog.addEventListener("close", () => {
+      resolve(filesConfirmDialog.returnValue === "continue");
+    }, { once: true });
+    if (keyboardInput.hasHeldKeys()) releaseAllKeys(false);
+    filesConfirmDialog.showModal();
+    filesConfirmCancel.focus();
+  });
+}
+async function openFilesTab() {
+  if (filesOffline) { await listNandFiles(); return true; }
+  filesBusy = true;
+  try {
+    if (!await confirmFilesShutdown()) return false;
+    setFileMessage("正在暂停模拟器并导出完整 NAND，请勿关闭页面…");
+    releaseAllKeys(false);
+    await keyRequestQueue.catch(() => {});
+    audioOutput.stop();
+    setFilesOffline(true);
+    await api("/api/files/open", { method: "POST", body: "" });
+    await listNandFiles("/");
+    return true;
+  } catch (error) {
+    setFilesOffline(false);
+    setFileMessage(`进入失败：${error.message}`);
+    return false;
+  } finally { filesBusy = false; }
+}
+async function resumeFromFiles() {
+  if (!filesOffline) return true;
+  filesBusy = true;
+  setFileMessage("正在保存设备配置并重新开机…");
+  try {
+    await api("/api/files/resume", { method: "POST", body: "" });
+    setFilesOffline(false);
+    setFileMessage("模拟器已重新开机。");
+    void poll();
+    return true;
+  } catch (error) {
+    setFileMessage(`开机失败：${error.message}。文件检查点仍保留，可重试。`);
+    return false;
+  } finally { filesBusy = false; }
+}
+function selectHomeTab(selectedTab) {
+  for (const tab of homeTabs) {
+    const selected = tab === selectedTab;
+    tab.setAttribute("aria-selected", String(selected));
+    tab.tabIndex = selected ? 0 : -1;
+    document.getElementById(tab.getAttribute("aria-controls")).hidden = !selected;
+  }
+}
+async function changeHomeTab(tab) {
+  if (filesBusy) return;
+  if (tab.id === "tab-files") {
+    if (!await openFilesTab()) return;
+  } else if (filesOffline && !await resumeFromFiles()) return;
+  selectHomeTab(tab);
+  tab.focus();
+}
+homeTabs.forEach((tab, index) => {
+  tab.addEventListener("click", () => { void changeHomeTab(tab); });
+  tab.addEventListener("keydown", event => {
+    let next = index;
+    if (event.key === "ArrowRight") next = (index + 1) % homeTabs.length;
+    else if (event.key === "ArrowLeft") next = (index - 1 + homeTabs.length) % homeTabs.length;
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = homeTabs.length - 1;
+    else return;
+    event.preventDefault();
+    event.stopPropagation();
+    void changeHomeTab(homeTabs[next]);
+  });
+});
+document.getElementById("files-up").addEventListener("click", () => {
+  const parts = filesPath.split("/").filter(Boolean);
+  parts.pop();
+  void listNandFiles("/" + parts.join("/")).catch(error => setFileMessage(error.message));
+});
+document.getElementById("files-resume").addEventListener("click", async () => {
+  if (await resumeFromFiles()) selectHomeTab(document.getElementById("tab-device"));
+});
+document.getElementById("files-import").addEventListener("click", async () => {
+  if (filesBusy || !filesOffline) return;
+  const input = document.getElementById("files-upload");
+  const file = input.files?.[0];
+  if (!file) { setFileMessage("请先选择本机文件。"); return; }
+  if (file.size > 64 * 1024 * 1024) { setFileMessage("文件超过 64 MiB 上限。"); return; }
+  filesBusy = true;
+  setFileMessage(`正在导入 ${file.name}；复制与校验完整 NAND 可能需要一些时间…`);
+  try {
+    await api(`/api/files/import?path=${encodeURIComponent(filesPath)}&name=${encodeURIComponent(file.name)}`,
+      { method: "POST", body: file });
+    input.value = "";
+    await listNandFiles();
+    setFileMessage(`${file.name} 已导入并校验；点击“完成并开机”使设备使用新检查点。`);
+  } catch (error) { setFileMessage(`导入失败：${error.message}`); }
+  finally { filesBusy = false; }
+});
+void api("/api/files/status").then(state => {
+  if (state.mode === "offline") {
+    setFilesOffline(true);
+    selectHomeTab(document.getElementById("tab-files"));
+    void listNandFiles("/").catch(error => setFileMessage(error.message));
+  }
+}).catch(() => {
+  const tab = document.getElementById("tab-files");
+  tab.disabled = true;
+  tab.title = "当前网页服务仍是旧版本；保存游戏后重启服务即可启用 NAND 文件管理";
+});
+
 buildRawMatrixKeyboard();
+buildSkinKeyboard();
 document.querySelectorAll("[data-key]").forEach(bindKeyButton);
 document.getElementById("frame-settings").addEventListener("submit", event => {
   try { applySettings(event); } catch (error) { statusText.textContent = error.message; }
@@ -713,6 +957,8 @@ function editableTarget(target) {
 }
 
 window.addEventListener("keydown", event => {
+  if (filesConfirmDialog.open) return;
+  if (typeof filesOffline !== "undefined" && filesOffline) return;
   // IME composition is text input, not a physical guest key. Some browsers
   // report the composition boundary with keyCode 229 before isComposing.
   if (event.isComposing || event.keyCode === 229) return;

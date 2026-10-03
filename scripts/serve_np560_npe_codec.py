@@ -129,7 +129,9 @@ def main() -> None:
                         default="candidate")
     parser.add_argument("--dll", type=Path,
                         help="reviewed local DLL; required for candidate backend only")
-    parser.add_argument("--socket", type=Path, required=True)
+    endpoint = parser.add_mutually_exclusive_group(required=True)
+    endpoint.add_argument("--socket", type=Path)
+    endpoint.add_argument("--tcp", help="Windows loopback endpoint, 127.0.0.1:PORT")
     parser.add_argument("--trace-first", type=int, default=0,
                         help="record this many initial compressed frames for a local diagnostic")
     parser.add_argument("--trace-path", type=Path,
@@ -143,10 +145,16 @@ def main() -> None:
         parser.error("--trace-first and --trace-path must be set together")
     if args.trace_path is not None and args.trace_path.exists():
         parser.error(f"trace path already exists: {args.trace_path}")
-    if not hasattr(socket, "AF_UNIX"):
+    if args.socket is not None and not hasattr(socket, "AF_UNIX"):
         parser.error("this codec transport requires Unix-domain sockets")
-    if args.socket.exists():
+    if args.socket is not None and args.socket.exists():
         parser.error(f"socket path already exists: {args.socket}")
+    if args.tcp is not None:
+        host, separator, port_text = args.tcp.partition(":")
+        if (host != "127.0.0.1" or separator != ":" or
+                not port_text.isdecimal() or not 1 <= int(port_text) <= 65535):
+            parser.error("--tcp requires 127.0.0.1:PORT")
+        tcp_address = (host, int(port_text))
     if args.backend == "candidate":
         # Import/verify the third-party diagnostic dependency only on request.
         from probe_np560_mobivoice_sp_decoder import IsolatedDecoder
@@ -170,10 +178,12 @@ def main() -> None:
     if args.trace_path is not None:
         args.trace_path.parent.mkdir(parents=True, exist_ok=True)
         trace = args.trace_path.open("x", encoding="utf-8")
-    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    listener.bind(str(args.socket))
+    listener = socket.socket(socket.AF_INET if args.tcp else socket.AF_UNIX,
+                             socket.SOCK_STREAM)
+    listener.bind(tcp_address if args.tcp else str(args.socket))
     try:
-        os.chmod(args.socket, 0o600)
+        if args.socket is not None:
+            os.chmod(args.socket, 0o600)
         listener.listen(1)
         with listener:
             try:
@@ -187,7 +197,8 @@ def main() -> None:
             except KeyboardInterrupt:
                 pass
     finally:
-        args.socket.unlink(missing_ok=True)
+        if args.socket is not None:
+            args.socket.unlink(missing_ok=True)
         if trace is not None:
             trace.close()
 

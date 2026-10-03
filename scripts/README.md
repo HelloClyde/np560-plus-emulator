@@ -8,7 +8,7 @@ Python/JS 测试已实体迁到 `tests/`。其它历史工具仍保留原路径�
 | 类别 | 入口/范围 | 使用边界 |
 | --- | --- | --- |
 | 模拟器实现 | `../qemu-dmcu/target/dmcu/`、`../qemu-dmcu/hw/dmcu/`、`web/` | CPU/设备、Web 桥接、前端和浏览器音频 |
-| 运行与构建 | `run-np560-web.ps1`、`run-np560.ps1`、`build-np560.ps1`、`np560_lan_proxy.py` | 日常启动、编译、LAN；不是逆向探针 |
+| 运行与构建 | `start_np560_windows.ps1`、`build_np560_windows.ps1`、`run-np560-web.ps1`、`run-np560.ps1`、`build-np560.ps1`、`np560_lan_proxy.py` | Windows 原生与旧 WSL 启动/构建、LAN；不是逆向探针 |
 | 测试 | `tests/test_*.py`、`tests/test_*.js` | 自动断言；分纯工具回归、固件依赖和 QEMU 硬件集成测试 |
 | 测试包装器/参考 | 根目录 `test-*.ps1`、`test_*_reference.c` | WSL 启动包装器、编译参考；不是运行时设备代码 |
 | 静态逆向 | `analyse_*`、`analyze_*`、`audit_*`、`compare_*`、`scan_*`、`np560_disasm.py`、`np560_aux_disasm.py` | 固件/指令/资源分析；部分工具消费运行时采样 |

@@ -20,6 +20,14 @@ from tracetool import out
 PUBLIC = True
 
 
+def source_filename(filename):
+    try:
+        return os.path.relpath(filename).replace('\\', '/')
+    except ValueError:
+        # Windows cannot make a relative path across different drive letters.
+        return filename.replace('\\', '/')
+
+
 def generate_h_begin(events, group):
     out('#include "qemu/log-for-trace.h"',
         '#include "qemu/error-report.h"',
@@ -55,7 +63,7 @@ def generate_h(event, group):
         '    }',
         cond=cond,
         event_lineno=event.lineno,
-        event_filename=os.path.relpath(event.filename),
+        event_filename=source_filename(event.filename),
         name=event.name,
         fmt=event.fmt.rstrip("\n"),
         argnames=argnames)

@@ -4,14 +4,15 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>NP560+ QEMU</title>
-  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="styles.css?v=nand-dialog-20261003">
 </head>
 <body>
   <main class="app-shell">
     <header class="topbar">
-      <div>
-        <p class="eyebrow">NOAH NP560+ / QEMU</p>
-        <h1>网络学习机</h1>
+      <p class="eyebrow">NOAH NP560+ / QEMU</p>
+      <div class="audio-controls">
+        <button type="button" id="audio-toggle" aria-pressed="false">启用声音</button>
+        <span id="audio-status" role="status">声音未启用</span>
       </div>
       <div class="run-state"><span id="status-dot"></span><span id="status">连接中</span></div>
       <div class="run-controls" aria-label="模拟器运行控制">
@@ -19,78 +20,47 @@
         <button type="button" data-action="pause">暂停</button>
         <button type="button" data-action="reset">复位</button>
       </div>
-      <div class="audio-controls">
-        <button type="button" id="audio-toggle" aria-pressed="false">启用声音</button>
-        <span id="audio-status" role="status">声音未启用</span>
-      </div>
     </header>
 
-    <section class="device" aria-label="NP560+ 虚拟设备">
+    <nav class="home-tabs" role="tablist" aria-label="首页页面">
+      <button type="button" id="tab-device" role="tab" aria-controls="panel-device" aria-selected="true" tabindex="0">设备</button>
+      <button type="button" id="tab-settings" role="tab" aria-controls="panel-settings" aria-selected="false" tabindex="-1">设置</button>
+      <button type="button" id="tab-files" role="tab" aria-controls="panel-files" aria-selected="false" tabindex="-1">NAND 文件</button>
+      <button type="button" id="tab-about" role="tab" aria-controls="panel-about" aria-selected="false" tabindex="-1">关于</button>
+    </nav>
+
+    <section class="device tab-panel" id="panel-device" role="tabpanel" aria-labelledby="tab-device" aria-label="NP560+ 虚拟设备">
       <div class="screen-bezel">
         <div class="screen-header"><span>240 × 120 + 段码 · ST7529 硬件 LCD</span><span id="frame-address">CMD F00001 · DATA F00003</span></div>
-        <canvas id="lcd" width="240" height="132" role="img" aria-label="NP560+ LCD 主画面与玻璃段码状态栏"></canvas>
+        <div class="device-visual" aria-label="NP560+ 真机外观与可操作键盘">
+          <img class="device-art" src="assets/np560plus-open-cutout.png" alt="白色 NP560+ 展开键盘的机身" draggable="false">
+          <div class="lcd-window"><canvas id="lcd" width="240" height="132" role="img" aria-label="NP560+ LCD 主画面与玻璃段码状态栏"></canvas></div>
+          <div id="skin-keys" class="skin-keys" aria-label="机身按键点击区域"></div>
+        </div>
         <div class="screen-footer">
           <label for="backlight">背光</label>
           <input id="backlight" type="range" min="0" max="2" value="2" step="1">
           <span id="fps">0 fps</span>
         </div>
-      </div>
-
-      <div class="input-deck">
-        <div class="input-deck-heading">
-          <h2>实体按键（已恢复映射）</h2>
-          <p>Home 是原厂主界面/开始键：学习页可切到开始菜单，其它页面可能先返回学习页。按住时保持真实矩阵电平。</p>
-          <p>《英雄传奇》：F4 打开游戏菜单，也可在存档槽选择页取消并返回场景；Esc 不等于游戏的通用返回键。</p>
-          <p>《天降风云》实测：空格对应对白提示的“发音键”，可交谈、翻页和结束普通对白；Enter 并非通用对白继续键。场景过渡结束后，F4 打开游戏菜单。其它界面仍按游戏提示操作。</p>
-          <p>MP3 播放器：选项设置页用 F4 返回播放页，Esc 在该页不是返回键；主播放页的 F4 是最小化。同一按键的作用由原厂程序当前界面决定。</p>
-          <p>原厂关屏后可尝试上方向键唤醒：当前已验证的关屏路径中，Enter 不唤醒，上键会恢复“每日一句”。这不代表所有待机状态都相同；唤醒后再按页面提示操作。</p>
+        <div class="skin-touch-controls" aria-label="触屏放大按键">
+          <div class="skin-touch-softkeys"><button type="button" data-key="F1">F1</button><button type="button" data-key="F2">F2</button><button type="button" data-key="F3">F3</button><button type="button" data-key="F4">F4</button></div>
+          <div class="skin-touch-pad">
+            <button type="button" data-key="ArrowUp" class="up">▲</button>
+            <button type="button" data-key="ArrowLeft" class="left">◀</button>
+            <button type="button" data-key="Enter" class="enter">确认</button>
+            <button type="button" data-key="ArrowRight" class="right">▶</button>
+            <button type="button" data-key="ArrowDown" class="down">▼</button>
+          </div>
+          <div class="skin-touch-actions"><button type="button" data-key="Escape">返回</button><button type="button" data-key=" ">发音／空格</button><button type="button" data-key="Matrix35">MP3</button><button type="button" data-key="Matrix63">电源／休眠</button></div>
         </div>
-        <div class="softkeys" aria-label="功能键">
-          <button type="button" data-key="F1">F1</button><button type="button" data-key="F2">F2</button>
-          <button type="button" data-key="F3">F3</button><button type="button" data-key="F4">F4</button>
-          <button type="button" data-key="StartMenu" title="对应 Home；由原厂程序决定返回主界面或切换开始菜单">主界面 / 开始</button>
-        </div>
-        <div class="navigation" aria-label="五维导航键">
-          <button type="button" data-key="ArrowUp" class="up">▲</button>
-          <button type="button" data-key="ArrowLeft" class="left">◀</button>
-          <button type="button" data-key="Enter" class="enter">确认</button>
-          <button type="button" data-key="ArrowRight" class="right">▶</button>
-          <button type="button" data-key="ArrowDown" class="down">▼</button>
-        </div>
-        <button type="button" data-key="Escape" class="mobile-back">Esc（依程序定义）</button>
-        <button type="button" data-key=" " class="mobile-back" title="与完整键盘空格同一个矩阵键；游戏按当前模式解释">发音 / 交谈（空格）</button>
-        <label><input id="keyboard-short-tap" type="checkbox">电脑键盘短按辅助（至少 150 ms）</label>
-        <p class="unmapped-note">默认关闭，保持原始按键时序。开启可减少轻点漏键，但快速换向可能短暂重叠；不改变原机键位。切换此选项会释放当前按键。</p>
-        <details class="keyboard-panel">
-          <summary>完整键盘（字母、数字及更多功能键）</summary>
-          <p>快捷键别名：Tab、PageDown 与下方向键同键，PageUp 与上方向键同键；Backspace 与 Esc 同键，空格与点号同键。数字与字母顶排共用实体键，由原厂输入模式解释。F1–F4 是网页快捷键名称，并不保证对应游戏中的同名功能。</p>
-          <div id="keyboard" class="keyboard" aria-label="仿真键盘"></div>
-          <button type="button" data-key="Matrix35">MP3 播放器（M35）</button>
-          <p>已验证从原厂桌面进入播放器；其它界面是否响应由原厂程序决定，不是网页强制跳转。</p>
-          <button type="button" data-key="Matrix15">帮助（M15）</button>
-          <p>已验证打开 MP3 播放器的原厂帮助；上下翻页。其它应用是否响应由固件决定，不模拟通用帮助窗口。</p>
-          <p>MP3 播放器内：B 是白屏模式，再按 B 恢复画面，音乐继续；空格依次设 A 点、设 B 点循环、取消循环。这些是播放器功能，不是所有游戏的通用键义。</p>
-          <button type="button" data-key="Matrix26">大写／符号模式状态（M26）</button>
-          <p>此键通过原厂程序切换模式位和状态图标，不直接输入字符；应用强制键表时不一定改变输出。电脑 Shift 不代替此键，原机面板印字尚未确认。</p>
-          <p>桌面实测：按此键并松开后，下一次 Q 为大写 Q，之后恢复小写；Esc 同键可能先输出单引号，空格同键可能先输出点号。它不是永久大写锁定，各应用仍按自身模式处理。</p>
-          <p>模式也影响 F1–F3 和逗号键：普通模式下逗号开关输出功能事件 0x85，大写／符号模式才输出逗号；F1–F3 在两种模式下的事件也不同。网页发送的是同一个实体开关，不强制输入按钮上印的字符或功能。</p>
-        </details>
-        <p class="unmapped-note">常用区只标注已确认的映射；照片中其余侧键仍标记为未映射。下方原始矩阵区可直接操作全部开关，不表示实体名称已经确认。</p>
-        <details class="keyboard-panel">
-          <summary>原始矩阵键盘（高级，M00–M63）</summary>
-          <p>这些编号不是原机键名，也不是游戏动作。按下会发送真实矩阵电平，可能切换程序或退出游戏，请先保存。与常用区相同编号的按钮是同一个键；亮起仅代表网页持有该键，不代表原厂程序已消费。</p>
-          <p>电脑单引号键与 Esc 共用 M28：固件大写／符号模式输出单引号，其它两种键表输出 0x84。电脑 Shift 不会代替机器切换输入模式。</p>
-          <div id="matrix-keyboard" class="keyboard matrix-keyboard" aria-label="原始矩阵开关"></div>
-        </details>
       </div>
     </section>
 
-    <details class="debug-panel">
-      <summary>LCD 与调试</summary>
-      <button type="button" id="download-key-diagnostic">下载按键与画面诊断</button>
-      <span id="key-diagnostic-status" role="status"></span>
-      <p>出现错键后下载 JSON 并附上预期结果。包含本页最近 128 次矩阵提交意图（不是服务端确认或固件消费记录，刷新页面会清空）。仅手动读取，不发送按键、不暂停游戏；固件事件是累计状态，不保证属于最后一次点击。文件含按键记录、画面和本地运行路径，请按需分享。</p>
-      <div class="debug-grid">
+    <section class="settings-panel tab-panel" id="panel-settings" role="tabpanel" aria-labelledby="tab-settings" hidden>
+      <h2>设置</h2>
+      <details class="settings-group" open>
+        <summary>LCD</summary>
+        <div class="debug-grid">
         <form id="frame-settings" class="settings">
           <label>画面来源
             <select id="source"><option value="lcd">ST7529 控制器</option><option value="memory">物理内存诊断</option></select>
@@ -106,23 +76,77 @@
             <button type="submit">应用</button>
             <button type="button" id="page-next">+ 0x1000</button>
           </div>
-          <div class="scan-buttons">
-            <button type="button" id="save-nand" disabled>保存 NAND</button>
-            <span id="nand-save-state">NAND 保存未启用</span>
-          </div>
-          <p id="rom-identity" class="rom-identity">SoC ROM：等待连接…</p>
-          <p id="device-identity" class="rom-identity">设备：等待连接…</p>
           <p>默认读取 ST7529 内部显示 RAM；物理内存模式仅用于检查显式启用的 ROM-HLE 诊断位图。</p>
         </form>
         <div>
           <pre id="lcd-state" aria-label="ST7529 状态">等待 LCD…</pre>
-          <pre id="registers" aria-label="DMCU 寄存器">等待 QEMU…</pre>
         </div>
+        </div>
+      </details>
+      <details class="settings-group">
+        <summary>按键</summary>
+        <label><input id="keyboard-short-tap" type="checkbox">电脑键盘短按辅助（至少 150 ms）</label>
+        <p>默认关闭，保持原始按键时序。开启可减少轻点漏键，但快速换向可能短暂重叠；切换时会释放当前按键。机身图片上的按键不受此选项影响。</p>
+        <details class="input-deck" id="raw-matrix-panel">
+          <summary>原始矩阵 M00–M63（高级）</summary>
+          <p>仅供按键排查；编号不是原机键名，操作可能切换或退出当前程序。</p>
+          <div id="matrix-keyboard" class="keyboard matrix-keyboard" aria-label="原始矩阵开关"></div>
+        </details>
+      </details>
+      <details class="settings-group">
+        <summary>日志</summary>
+        <button type="button" id="download-key-diagnostic">下载按键与画面诊断</button>
+        <span id="key-diagnostic-status" role="status"></span>
+        <p>诊断 JSON 包含最近的按键、画面和本地运行路径；分享前请检查内容。</p>
+        <div class="log-actions">
+          <button type="button" id="save-nand" disabled>保存 NAND</button>
+          <span id="nand-save-state">NAND 保存未启用</span>
+        </div>
+        <p id="rom-identity" class="rom-identity">SoC ROM：等待连接…</p>
+        <p id="device-identity" class="rom-identity">设备：等待连接…</p>
+        <pre id="registers" aria-label="DMCU 寄存器" tabindex="0">等待 QEMU…</pre>
+      </details>
+    </section>
+    <section class="files-panel tab-panel" id="panel-files" role="tabpanel" aria-labelledby="tab-files" hidden>
+      <h2>NAND 文件</h2>
+      <p>进入前会要求确认，并关停 QEMU，导出包含当前写入日志的完整 NAND。这里是离线 FAT16 文件桥；不等于原厂 USB 传输。首版支持浏览、下载和新增导入，不覆盖、不删除。</p>
+      <p id="files-status" role="status">尚未进入文件管理。</p>
+      <div class="files-toolbar">
+        <button type="button" id="files-up">上一级</button>
+        <span id="files-path">/</span>
+        <button type="button" id="files-resume">完成并开机</button>
       </div>
-    </details>
+      <ul id="files-list" class="files-list" aria-label="NAND 文件列表"></ul>
+      <div class="files-import">
+        <label for="files-upload">导入到当前目录（8.3 文件名、最多 64 MiB）</label>
+        <input id="files-upload" type="file">
+        <button type="button" id="files-import">导入文件</button>
+      </div>
+      <p>导入时会制作独立检查点并校验；完成并开机后写入新的设备配置，原基础镜像与日志保留供恢复。文件管理仅限本机浏览器。</p>
+    </section>
+    <section class="about-panel tab-panel" id="panel-about" role="tabpanel" aria-labelledby="tab-about" hidden>
+      <h2>关于 NP560+ 模拟器</h2>
+      <p>模拟器作者：HelloClyde</p>
+      <p>Thanks：步步高电子词典游戏群（830340878）</p>
+      <h3>NP560+ 原厂产品说明书</h3>
+      <p class="manual-links">
+        <a href="assets/np560plus-manual.pdf" target="_blank" rel="noopener">在新标签打开说明书</a>
+        <a href="assets/np560plus-manual.pdf" download="NP560+产品说明书.pdf">下载 PDF</a>
+        <a href="https://web.archive.org/web/20070313044458id_/http://www.noahedu.com:80/Upload/Product/handbook//2006/37week/920e19d6f3c74e61bd0694251907701d.pdf" target="_blank" rel="noopener noreferrer">原始存档</a>
+      </p>
+      <iframe class="manual-viewer" src="assets/np560plus-manual.pdf" title="NP560+ 原厂产品说明书 PDF" loading="lazy"></iframe>
+    </section>
+    <dialog id="files-confirm-dialog" class="confirm-dialog" aria-labelledby="files-confirm-title" aria-describedby="files-confirm-description">
+      <h2 id="files-confirm-title">进入 NAND 文件管理？</h2>
+      <p id="files-confirm-description">模拟器将先保存完整 NAND，然后关机。游戏中尚未保存的运行状态会丢失；离开文件管理后可以重新开机。</p>
+      <form method="dialog" class="confirm-actions">
+        <button type="submit" value="cancel" id="files-confirm-cancel">取消</button>
+        <button type="submit" value="continue" class="confirm-primary">保存并关机</button>
+      </form>
+    </dialog>
   </main>
   <script src="keyboard_input.js"></script>
   <script src="audio_output.js"></script>
-  <script src="app.js"></script>
+  <script src="app.js?v=nand-dialog-20261003"></script>
 </body>
 </html>

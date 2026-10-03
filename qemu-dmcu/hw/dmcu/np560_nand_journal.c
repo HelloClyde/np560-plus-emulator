@@ -467,8 +467,35 @@ NP560NANDJournal *np560_nand_journal_open(const char *path,
     g_checksum_free(checksum);
 
 #ifdef _WIN32
-    error_setg(errp, "NP560 NAND journal currently requires POSIX file locks");
-    goto fail;
+    {
+        g_autofree char *lock_path = NULL;
+        struct stat lock_st;
+        OVERLAPPED offset = { 0 };
+        HANDLE handle;
+
+        s->path = g_canonicalize_filename(path, NULL);
+        lock_path = g_strdup_printf("%s.lock", s->path);
+        s->lock_fd = qemu_create(lock_path, O_RDWR | O_BINARY, 0600, errp);
+        if (s->lock_fd < 0) {
+            goto fail;
+        }
+        if (fstat(s->lock_fd, &lock_st) < 0 || !S_ISREG(lock_st.st_mode) ||
+            lock_st.st_size != 0) {
+            error_setg(errp, "NP560 NAND sidecar lock must be an empty regular file");
+            goto fail;
+        }
+        handle = (HANDLE)_get_osfhandle(s->lock_fd);
+        if (handle == INVALID_HANDLE_VALUE || !LockFileEx(handle,
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0, 1, 0, &offset)) {
+            error_setg(errp, "NP560 NAND journal is locked by another process");
+            goto fail;
+        }
+        s->fd = qemu_create(s->path, O_RDWR | O_BINARY, 0600, errp);
+        if (s->fd < 0) {
+            goto fail;
+        }
+    }
 #else
     {
         g_autofree char *lock_path = NULL;

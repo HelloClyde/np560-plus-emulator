@@ -34,18 +34,174 @@ EVENT_TABLE_COUNT = 3
 
 
 class WebKeyboardFrontendTests(unittest.TestCase):
+    def test_home_tabs_keep_device_primary_and_move_short_tap_to_settings(self) -> None:
+        self.assertNotIn("<h1>网络学习机</h1>", self.html)
+        self.assertLess(self.html.index('class="audio-controls"'), self.html.index('class="run-state"'))
+        self.assertIn('role="tablist" aria-label="首页页面"', self.html)
+        for name in ("device", "settings", "files", "about"):
+            with self.subTest(name=name):
+                self.assertIn(f'id="tab-{name}" role="tab" aria-controls="panel-{name}"', self.html)
+                self.assertIn(f'id="panel-{name}" role="tabpanel"', self.html)
+        self.assertNotIn('id="tab-input"', self.html)
+        self.assertNotIn('id="panel-input"', self.html)
+        self.assertNotIn('class="touch-keyboard-panel"', self.html)
+        self.assertNotIn('id="keyboard" class="keyboard"', self.html)
+        self.assertIn('id="keyboard-short-tap"', self.html)
+        self.assertIn('id="panel-settings" role="tabpanel" aria-labelledby="tab-settings" hidden', self.html)
+        settings = self.html.split('id="panel-settings"', 1)[1].split('id="panel-files"', 1)[0]
+        for first, second in ((">LCD</summary>", ">按键</summary>"),
+                              (">按键</summary>", ">日志</summary>")):
+            self.assertLess(settings.index(first), settings.index(second))
+        self.assertLess(settings.index('>按键</summary>'), settings.index('id="keyboard-short-tap"'))
+        self.assertLess(settings.index('>日志</summary>'), settings.index('id="registers"'))
+        self.assertIn('<details class="input-deck" id="raw-matrix-panel">', self.html)
+        self.assertIn('id="raw-matrix-panel"', self.html)
+        self.assertNotIn('id="tab-debug"', self.html)
+        self.assertNotIn('id="panel-debug"', self.html)
+        self.assertNotIn('按键说明与原始矩阵', self.html)
+        self.assertIn('event.stopPropagation();\n    void changeHomeTab(homeTabs[next]);', self.javascript)
+        self.assertIn('id="panel-files" role="tabpanel" aria-labelledby="tab-files" hidden', self.html)
+
+    def test_register_dump_has_bounded_scrollable_viewport(self) -> None:
+        self.assertIn('id="registers" aria-label="DMCU 寄存器" tabindex="0"', self.html)
+        styles = (ROOT / "scripts" / "web" / "styles.css").read_text(encoding="utf-8")
+        rule = styles.split("#registers {", 1)[1].split("}", 1)[0]
+        self.assertIn("height: min(34rem, 60vh)", rule)
+        self.assertIn("overflow: auto", rule)
+
+    def test_nand_entry_uses_html_dialog_and_cancel_does_not_stop_guest(self) -> None:
+        self.assertIn('<dialog id="files-confirm-dialog"', self.html)
+        self.assertIn('form method="dialog"', self.html)
+        self.assertIn('filesConfirmDialog.showModal()', self.javascript)
+        self.assertNotIn('confirm("进入 NAND 文件管理', self.javascript)
+        script = r'''
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const app = fs.readFileSync(process.argv[1], 'utf8');
+const start = app.indexOf('async function openFilesTab()');
+const end = app.indexOf('async function resumeFromFiles()', start);
+assert.ok(start >= 0 && end > start);
+const calls = [];
+const context = {
+  filesOffline: false, filesBusy: false,
+  confirmFilesShutdown: async () => false,
+  listNandFiles: async () => calls.push('list'),
+  setFileMessage: () => calls.push('message'),
+  releaseAllKeys: () => calls.push('release'),
+  keyRequestQueue: Promise.resolve(),
+  audioOutput: {stop: () => calls.push('audio-stop')},
+  setFilesOffline: () => calls.push('power-off'),
+  api: async () => calls.push('api'),
+};
+vm.runInNewContext(app.slice(start, end) + '; globalThis.openFilesTab = openFilesTab;', context);
+context.openFilesTab().then(result => {
+  assert.equal(result, false);
+  assert.equal(context.filesBusy, false);
+  assert.deepEqual(calls, []);
+}).catch(error => { console.error(error); process.exitCode = 1; });
+'''
+        result = subprocess.run(
+            ["node", "-e", script, str(APP)],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_about_tab_embeds_original_manual_and_credits(self) -> None:
+        manual = ROOT / "scripts" / "web" / "assets" / "np560plus-manual.pdf"
+        self.assertTrue(manual.is_file())
+        with manual.open("rb") as stream:
+            self.assertEqual(stream.read(5), b"%PDF-")
+        self.assertIn('id="panel-about" role="tabpanel" aria-labelledby="tab-about" hidden', self.html)
+        self.assertIn("模拟器作者：HelloClyde", self.html)
+        self.assertIn("Thanks：步步高电子词典游戏群（830340878）", self.html)
+        self.assertIn('src="assets/np560plus-manual.pdf"', self.html)
+
+    def test_additional_skin_keys_use_verified_matrix_contacts(self) -> None:
+        contacts = (
+            ("左侧翻页盘上", 11, (0xC1, 0x94, 0x94), 117, 465),
+            ("左侧翻页盘中／确认", 19, (0x92, 0x92, 0x92), 117, 505),
+            ("左侧翻页盘下", 27, (0xC2, 0x95, 0x95), 117, 555),
+            ("设置", 12, (0xE0, 0xE0, 0xE0), 88, 634),
+            ("生词／@", 57, (0x40, 0xE3, 0xE3), 1000, 927),
+            ("音标／?", 62, (0x3F, 0xE7, 0xE7), 1000, 1003),
+            ("英汉词典／朗文双解", 42, (0xB8, 0xB8, 0xB8), 154, 1069),
+            ("简明汉英／现代汉语", 50, (0xEE, 0xEE, 0xEE), 248, 1069),
+            ("屏幕取词", 7, (0xC0, 0xC0, 0xC0), 342, 1069),
+            ("输入法", 58, (0xED, 0x7B, 0x7B), 530, 1069),
+            ("删除", 47, (0x89, 0x89, 0x89), 624, 1069),
+            ("查找", 23, (0x8B, 0x8B, 0x8B), 718, 1069),
+            ("添加", 31, (0x88, 0x88, 0x88), 812, 1069),
+            ("修改／*", 39, (0x2A, 0x8A, 0x8A), 906, 1069),
+        )
+        for label, index, events, x, y in contacts:
+            with self.subTest(label=label):
+                self.assertIn(
+                    f'add("Matrix{index:02d}", "{label}", {x}, {y},',
+                    self.javascript,
+                )
+                for table, event in enumerate(events):
+                    offset = EVENT_TABLE_OFFSET + (table * 64 + index) * 2
+                    self.assertEqual(
+                        int.from_bytes(self.firmware[offset:offset + 2], "little"),
+                        event,
+                    )
+
+    def test_right_side_shortcuts_have_physical_skin_hotspots(self) -> None:
+        for label, index, event, y in (
+            ("同步学习", 59, 0xB4, 198),
+            ("多科助考", 51, 0xB7, 258),
+            ("我的硬盘", 43, 0xBF, 318),
+            ("MP3", 35, 0x97, 377),
+        ):
+            with self.subTest(label=label):
+                self.assertIn(
+                    f'add("Matrix{index}", "{label}", 1038, {y}, 129, 37)',
+                    self.javascript,
+                )
+                for table in range(3):
+                    offset = EVENT_TABLE_OFFSET + (table * 64 + index) * 2
+                    self.assertEqual(
+                        int.from_bytes(self.firmware[offset:offset + 2], "little"),
+                        event,
+                    )
+
+    def test_side_power_uses_guest_m63_not_host_shutdown(self) -> None:
+        self.assertIn('add("Matrix63", "电源／休眠", 1019, 1195, 56, 56)', self.javascript)
+        self.assertIn('power.classList.add("skin-side-power")', self.javascript)
+        self.assertIn('class="skin-power-icon"', self.javascript)
+        self.assertRegex(self.html, r'data-key="Matrix63"[^>]*>电源／休眠</button>')
+        for table in range(EVENT_TABLE_COUNT):
+            offset = EVENT_TABLE_OFFSET + (table * 64 + 63) * 2
+            self.assertEqual(self.firmware[offset:offset + 2], b'\x8f\x00')
+
+    def test_six_status_electrodes_are_drawn_individually(self) -> None:
+        self.assertNotIn("annunciatorGroupActive", self.javascript)
+        for bit, x in ((133, 92), (150, 110), (163, 128),
+                       (179, 146), (196, 164), (211, 182)):
+            with self.subTest(bit=bit):
+                self.assertIn(f"{{ bit: {bit}, x: {x}, pixels:", self.javascript)
+        self.assertIn("annunciatorActive(bytes, 1, artwork.bit)", self.javascript)
+        self.assertIn("drawBatteryAnnunciator(bytes, color)", self.javascript)
+
+    def test_directory_key_is_on_physical_skin_not_a_start_shortcut(self) -> None:
+        self.assertRegex(
+            self.javascript,
+            r'add\("StartMenu", "目录（返回总目录）", 1000, 1069, 94, 65\)',
+        )
+        self.assertNotIn('class="skin-quick-controls"', self.html)
+        self.assertNotIn('开始／主界面', self.html)
+        self.assertIn('add("StartMenu", "目录（返回总目录）"', self.javascript)
+
     def test_mp3_shortcut_reuses_original_matrix_contact(self) -> None:
-        self.assertRegex(self.html, r'<button[^>]*data-key="Matrix35"[^>]*>MP3 播放器（M35）</button>')
-        self.assertIn('不是网页强制跳转', self.html)
+        self.assertIn('add("Matrix35", "MP3"', self.javascript)
         for table in range(3):
             offset = EVENT_TABLE_OFFSET + (table * 64 + 35) * 2
             self.assertEqual(self.firmware[offset:offset + 2], b'\x97\x00')
 
     def test_mode_switch_uses_raw_matrix_and_factory_table_selection(self) -> None:
         # Expose the existing contact, not a host-side Shift/character injector.
-        self.assertRegex(self.html, r'<button[^>]*data-key="Matrix26"[^>]*>大写／符号模式状态（M26）</button>')
-        self.assertIn('应用强制键表时不一定改变输出', self.html)
-        self.assertIn('它不是永久大写锁定', self.html)
+        self.assertIn('add("Matrix26", "SHIFT／符号模式（候选映射）"', self.javascript)
         for table in range(3):
             offset = EVENT_TABLE_OFFSET + (table * 64 + 26) * 2
             self.assertEqual(self.firmware[offset:offset + 2], b'\x8c\x00')
@@ -61,10 +217,8 @@ class WebKeyboardFrontendTests(unittest.TestCase):
             expected = b''.join(word.to_bytes(2, 'little') for word in words)
             self.assertEqual(self.firmware[offset:offset + len(expected)], expected)
 
-    def test_game_speech_key_is_available_without_expanding_keyboard(self) -> None:
-        common_panel = self.html.split('<details class="keyboard-panel">', 1)[0]
-        self.assertRegex(common_panel, r'<button[^>]*data-key=" "[^>]*>发音 / 交谈（空格）</button>')
-        self.assertIn('Enter 并非通用对白继续键', common_panel)
+    def test_game_speech_key_is_available_on_skin_without_expanding_keyboard(self) -> None:
+        self.assertIn('add(" ", "发音／空格"', self.javascript)
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -181,7 +335,7 @@ class WebKeyboardFrontendTests(unittest.TestCase):
             self.assertEqual(tables[1][mapping[name]], event, name)
             self.assertEqual(tables[2][mapping[name]], event, name)
 
-        self.assertIn('data-key="StartMenu"', self.html)
+        self.assertIn('add("StartMenu", "目录（返回总目录）"', self.javascript)
 
         self.assertEqual(tables[0][mapping[","]], ord(","))
         self.assertEqual(tables[0][mapping["."]], ord("."))
@@ -856,21 +1010,17 @@ assert.equal(buttons[37].attrs['aria-pressed'], 'false');
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_visible_keyboard_identifies_confirmed_and_unmapped_hardware(self) -> None:
+    def test_raw_matrix_remains_available_without_verbose_key_explanations(self) -> None:
         self.assertLess(
             self.html.index('src="keyboard_input.js"'),
-            self.html.index('src="app.js"'),
+            self.html.index('src="app.js'),
         )
-        self.assertIn("实体按键（已恢复映射）", self.html)
-        self.assertIn("其余侧键仍标记为未映射", self.html)
-        self.assertIn('data-key="Matrix15">帮助（M15）', self.html)
-        self.assertIn('上下翻页', self.html)
-        self.assertIn('B 是白屏模式，再按 B 恢复画面', self.html)
-        self.assertIn('不是所有游戏的通用键义', self.html)
-        self.assertIn("Esc（依程序定义）", self.html)
-        self.assertIn("Tab、PageDown 与下方向键同键", self.html)
-        self.assertIn('Tab: "Tab / 下同键"', self.javascript)
-        self.assertIn('PageUp: "PgUp / 上同键"', self.javascript)
+        self.assertIn('原始矩阵 M00–M63（高级）', self.html)
+        self.assertIn('仅供按键排查；编号不是原机键名', self.html)
+        self.assertNotIn('实体按键（已恢复映射）', self.html)
+        self.assertIn('add("Matrix15", "帮助"', self.javascript)
+        self.assertIn('ArrowDown: 37, PageDown: 37, Tab: 37', self.javascript)
+        self.assertIn('ArrowUp: 61, PageUp: 61', self.javascript)
         self.assertNotIn('Tab: "切换"', self.javascript)
         self.assertIn("button.dataset.matrixIndex", self.javascript)
         self.assertIn('content: "M" attr(data-matrix-index)',

@@ -47,7 +47,11 @@ cd np560-qemu
 
 ## 构建与运行
 
-当前脚本面向 **Windows + PowerShell + WSL**（默认发行版 `Ubuntu2`）。构建使用 WSL 中的
+现在支持 **Windows 原生构建与运行，不需要 WSL**。使用 MSYS2 UCRT64 构建
+`qemu-system-dmcu.exe`，再由 Windows Python 启动网页前端；步骤见
+[Windows 原生运行](doc/windows_native.md)。
+
+原有的 Windows + PowerShell + WSL 路径仍保留。它使用 WSL 中的
 C 编译器、Python 3、Meson/Ninja 及 QEMU 配置所需依赖。
 默认构建路径为 `/mnt/e/qemu-dmcu-build`，可通过参数指定已有发行版和构建目录，
 无需修改脚本。`-BuildDirectory` 使用该发行版内的绝对 Linux 路径。
@@ -136,6 +140,14 @@ v3 会拒绝显式覆盖，以免新 ROM 配错服务。旧 v1/v2 文件仍可�
 
 启动时应配置 `-NandJournal` 或 `-NandSaveOnExit`；否则游戏内保存可能只留在进程内。
 NAND 基线与增量日志必须配套，不可把旧日志重放到另一个导入后的镜像上。
+
+网页的“NAND 文件”标签仅对本机浏览器开放。点击时需二次确认：桥接器先暂停
+QEMU、导出包含写入日志的完整检查点，再关机。可浏览 FAT16 目录、下载单个文件、
+向当前目录导入新文件（8.3/GB18030 短文件名，最大 64 MiB）；不覆盖、删除或扩容
+已满目录。导入会复制完整检查点并校验读回，点击“完成并开机”后设备配置才切换
+到新检查点及新日志；旧基础镜像、旧日志与配置备份保留。关机期间不要直接退出
+网页服务，否则尚未点“完成并开机”的导入只留在 `file-sessions/` 暂存目录。
+这属于离线文件桥，不代表已还原原厂 USB 文件传输。
 
 手机及 LAN 设置见 [移动端与局域网](doc/np560_mobile_lan.md)。默认只监听本机，
 局域网入口无用户鉴权，仅供可信内网使用，不要转发到公网。
