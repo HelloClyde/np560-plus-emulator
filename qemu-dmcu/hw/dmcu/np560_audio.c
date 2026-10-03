@@ -6,7 +6,7 @@
  * and hold the DAC value between guest writes using QEMU virtual time.
  * Dedicated request clock reconstruction is constrained by the five rate
  * entries at original 32:BD96, 08:38D0 and 24:9A1E. See
- * doc/np560_audio_requests.md for the inferred clock ratio and its limits.
+ * doc/audio/np560_audio_requests.md for the inferred clock ratio and its limits.
  * Analog resolution/filtering, remaining control bits and amplifier GPIO
  * are not yet known. This does not implement any missing ROM decoder.
  */

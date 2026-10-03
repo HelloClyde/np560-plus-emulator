@@ -41,7 +41,7 @@ SKELETON_HOLE = bytes.fromhex("000f")
 PROVISIONAL_AUDIO_RETURNS = {
     # These are missing services, not recovered DSP implementations. Labels
     # state the original caller's observable contract only; storage and
-    # processing side effects remain unknown (doc/np560_resident_table_modes.md).
+    # processing side effects remain unknown (doc/audio/np560_resident_table_modes.md).
     0x014674: "unknown service receiving a far pointer and ten-word count",
     0x0146CC: "unknown no-argument service selected for modes 1..13",
     0x0146D0: "unknown no-argument service selected for default mode",

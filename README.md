@@ -1,11 +1,17 @@
 # NP560+ 模拟器
 
-基于 QEMU 的诺亚舟 NP560+ 模拟器。Windows 版无需安装 WSL、MSYS2 或 Python；
-浏览器显示真机 LCD 和可点击的键盘，支持 NPE 游戏、MP3 与 NAND 文件管理。
+基于 QEMU 的诺亚舟 NP560+ 模拟器。浏览器显示真机 LCD 和可点击的键盘，
+支持 NPE 游戏、MP3 与 NAND 文件管理。
 
 ![模拟器 Web 界面](doc/images/np560-web.png)
 
 ![LCD 屏幕截图](doc/images/np560-screen.png)
+
+画面示例：
+
+| MP3 播放器 | 主界面 | NPE 游戏 |
+| --- | --- | --- |
+| ![NP560+ MP3 播放器](doc/images/np560-mp3.png) | ![NP560+ 主界面](doc/images/np560-menu.png) | ![NP560+ NPE 游戏画面](doc/images/np560-game.png) |
 
 ## 快速开始（Windows x64）
 
@@ -24,5 +30,5 @@
 `NP560.PRG` 是升级包中的 4 MiB 程序映像；`resident.bin` 是由源码重建的
 resident ROM/HLE 包，并非完整原厂 mask-ROM 转储。部分原厂功能与游戏兼容性仍在完善。
 
-开发构建、镜像来源与校验、已知限制和逆向记录见 [doc/](doc/)、
-[发布说明](doc/release_process.md) 与 [项目计划](doc/plan.md)。
+开发构建、镜像来源与校验、已知限制和逆向记录见 [文档导览](doc/README.md)、
+[发布说明](doc/guides/release_process.md) 与 [项目计划](doc/plan.md)。

@@ -21,7 +21,7 @@
 USB staging 编码已通过实际 QEMU RAM 微测试，原厂 burner 已在旧输入和最小 factory-only
 输入上完成首 48 KiB 写入/提交及逐字节/ECC 核对；完整原包已烧录并通过全字节/ECC 与
 零输入冷启动与五分类往返检查。随后验证完整 guest FTL 回读和最小出厂输入全流（详见
-`doc/np560_usb_burn_transport.md`），并追踪普通输入的重复消费；音乐播放器仍独立未完成，随后
+`doc/storage/np560_usb_burn_transport.md`），并追踪普通输入的重复消费；音乐播放器仍独立未完成，随后
 继续音频、存档与初始化，并按证据精简旧补丁。诊断和回归不得重置用户正在测试的
 8807 实例，也不得因一次连接失败自动重启并丢失游戏状态。具体任务及验收见第 8 节。
 
@@ -79,7 +79,7 @@ USB staging 编码已通过实际 QEMU RAM 微测试，原厂 burner 已在旧�
   `1652574a9e5916f4c04004015f21843cee86083c94a53af48193243ad30e7249`；只把物理块
   `0x890` 按原包统一编码，ROM/QEMU 不变。它已通过下述五分类测试，但还不是自然
   烧录生成的 canonical NAND，也没有替换用户 8807 的原副本。详见
-  `doc/np560_vma03_menu_corruption.md`，不得把原副本的已知花屏当成已修复。
+  `doc/display/np560_vma03_menu_corruption.md`，不得把原副本的已知花屏当成已修复。
 - 新增整包烧录测试版 `8809`，使用 `E:/qemu-dmcu-build/np560-usb-burn-full-v1.nand`
   （SHA-256 `9da1cc971c75fa58c1debe8d04edd8b59acb428de18b21da79d1f50a18576ef3`），
   普通 ROM/PRG 和 QEMU 不变。全原包与 ECC、零输入冷启动、五分类两轮共 18 帧逐像素
@@ -151,7 +151,7 @@ USB staging 编码已通过实际 QEMU RAM 微测试，原厂 burner 已在旧�
   两条 `D016` 证据均为普通传输取到 `FF`、`25:2240` 归一化为 `01`、`25:2476`
   返回成功：`22:9A08 → 25:2240 → 22:9A0C` 与
   `29:C22E → 25:2240 → 29:C232`。机械反汇编
-  `doc/np560_source_422240_resource_d016_continuation_reachable.asm` 与之完全一致：首字节
+  `doc/disassembly/np560_source_422240_resource_d016_continuation_reachable.asm` 与之完全一致：首字节
   `<=1` 时保留，`>1` 时由 guest 写为 `1`。因此 checkpoint 的原始 `FF` 与门值 `1`
   并不冲突；这里没有宿主 ROM 服务或强制值。
 - 七步原厂矩阵路线仍自然进入 `STATE=0078`，随后
@@ -179,7 +179,7 @@ USB staging 编码已通过实际 QEMU RAM 微测试，原厂 burner 已在旧�
 - 新增只读 observer 后，干净冷启动 `tmp/v851-action-guard-observer-first/` 已严格证明：
   第一次动作 `guard=0/pass=1/commit=1/flag=1`；原地第二次动作
   `guard=1/reject=1/commit仍为1`，全程无 fault。一次性对象提交路径已经闭合。完整证据见
-  `doc/np560_npe_world_state_and_action_selector.md`。
+  `doc/games/np560_npe_world_state_and_action_selector.md`。
 - `tmp/v858-object-action-delayed-regression/` 现把首次动作即时状态、等待原厂 5000 ms UI
   状态后的稳定状态、第二次动作后的状态严格分开。帧 hash 为
   `436d279e…f544 → 436d279e…f544 → 5e466022…2686 → 5e466022…2686`；首次动作
@@ -197,7 +197,7 @@ USB staging 编码已通过实际 QEMU RAM 微测试，原厂 burner 已在旧�
   事件：上 M61 胜过动作 M53，其余三方向均由动作 M53 胜出；胜出控制器路径严格命中一次。
   v872 证明独立返回 M28/0x84 被消费但在该主场景无操作；v873 证明真正退出 M55/0xB0
   以一个严格边沿完成 `0078→00FF` 和 root renderer `30→40`。完整证据见
-  `doc/np560_npe_input_semantics.md`。下一项转为必要音频与真实存档/恢复路径。
+  `doc/games/np560_npe_input_semantics.md`。下一项转为必要音频与真实存档/恢复路径。
 - 音频硬件边界开始实测。QEMU 已加入互不混淆的 unbanked SFR 与 banked Fxxx 只读写
   观察器；v880 用真实矩阵输入执行下键长按 5 秒、右/上/左/动作及空闲对照。unbanked
   unknown 在输入和空闲期增量均为 0；banked 候选只增加 42 次，全部是
@@ -205,7 +205,7 @@ USB staging 编码已通过实际 QEMU RAM 微测试，原厂 burner 已在旧�
   静态调用点 `44:E528` 先读取已确认的矩阵端口 `DS1:7160 → F160`，随后以固定参数
   `3,2000,8000` 调用 `32:241A`。因此该 pair 属于键盘扫描/中断控制链，不是已发现的
   音频流。当前仍未定位 NPE 的实际声音 producer、DMA 或 SFR，QEMU/Web 也尚无可验收
-  音频输出；完整边界见 `doc/np560_audio_hardware_boundary.md`。
+  音频输出；完整边界见 `doc/audio/np560_audio_hardware_boundary.md`。
 
 ### 2026-09-02 NPE 动作与稀有重绘故障进展
 
@@ -300,7 +300,7 @@ USB staging 编码已通过实际 QEMU RAM 微测试，原厂 burner 已在旧�
   SHA-256 为
   `8FEDE7BC134D16951BC3F041D874FA08BE3BD473005A304BCD263BFDFF0DE456`；
   证据目录为 `tmp/v833-game-route`、`tmp/v833-down-four`、
-  `tmp/v833-down5-trace`，静态契约见 `doc/np560_resident_0d78d2_region_move.md`。
+  `tmp/v833-down5-trace`，静态契约见 `doc/firmware/np560_resident_0d78d2_region_move.md`。
 - v833 在同一游戏前台又完成多次向上移动：draw transaction 从 16 增至 22，地图稳定
   反向滚动且旧角色像素被 guest 清除，最终仍为
   `ROM_MISSING=none / UNSUPPORTED=none / INVALID_CONTROL=none`。中心确认键
@@ -380,7 +380,7 @@ USB staging 编码已通过实际 QEMU RAM 微测试，原厂 burner 已在旧�
   实际 guest data store 的 `CE22..CFFF` 同步到 code view；`29:D000..D34F` 直接 alias
   连续 publisher RAM。该布局没有新增 subpage，也没有扩大 `PhysPageMap` 的 2048 section
   上限；不是 HLE、宿主返回值或新 CPU 指令。静态契约见
-  `doc/np560_operation_one_action_overlay.md`。
+  `doc/games/np560_operation_one_action_overlay.md`。
 - v840 同一冷启动已经显示像素正确的原生主菜单，代码总线快照为
   `29:CE22 = 05 2E ...`，七键路线 7/7 进入真实游戏地图，第一次动作得到
   `NPE_GAME_LINKED_LOADER=1 PC:29:CE22 W:2E05`，同时
@@ -411,7 +411,7 @@ USB staging 编码已通过实际 QEMU RAM 微测试，原厂 burner 已在旧�
   基线；raw nand-image 模式仍保留介质写入。动态复位后 IRQ request/entry/return 与
   matrix reads 都重新增长，完整主菜单两次回到 `STATE=00FF`。这关闭了旧
   `31:7822→E8:0000` 旧 PC/栈续跑和多次复位落入 `STATE=007E` 的问题。实现与动态
-  证据集中记录在 `doc/np560_reset_and_input_stress.md`。
+  证据集中记录在 `doc/cpu/np560_reset_and_input_stress.md`。
 
 当前最近目标已从“动作首键崩溃”推进为完整游戏前台功能补齐：四方向严格短按、600 秒
 持续操作、1,000 次单事件压力和 `B0` 正常退出/主菜单返回均已通过。动作键也已进入
@@ -423,7 +423,7 @@ USB staging 编码已通过实际 QEMU RAM 微测试，原厂 burner 已在旧�
 19/20 次取得“文字前单一背景、文字后保留背景并加入前景”的严格四阶段证据；首条按
 收紧规则为 inconclusive，但完整矩形仍有清除/绘制且层间 0 mismatch。两个十位边界
 `00:19→00:20`、`00:29→00:30` 均严格通过，20/20 back=front、GRAM=LCD，0 transient。
-证据和限定见 `doc/np560_clock_raster_pipeline.md` 与 `tmp/v838-clock-20-v2`。
+证据和限定见 `doc/display/np560_clock_raster_pipeline.md` 与 `tmp/v838-clock-20-v2`。
 
 ### 2026-08-30 历史检查点
 
@@ -1028,7 +1028,7 @@ USB staging 编码已通过实际 QEMU RAM 微测试，原厂 burner 已在旧�
   `0→1→0`，而 M15/`0x8D` 仍正常在 `28:F6DE` 完成；全程无 missing、unsupported 或
   invalid-control。`probe_np560_matrix_route.py` 现在区分 `map` 与 `candidate`，失败时会在
   释放前保存 held 快照；QEMU/Web 另提供有界只读 candidate-write 计数。证据见
-  `doc/NP560_keyboard_completion_worker.md`。
+  `doc/web/NP560_keyboard_completion_worker.md`。
 - 2026-08-29 已完成 64 个物理矩阵位的分段 live 验收。QEMU/Web 新增既有
   `20:2E9E` `KEYMAPRET` trace 的有界只读计数；探针普通步骤要求 candidate、
   `28:F6DE` map、foreground acknowledgement、F160 释放和 `A2:2A5C=0`。
@@ -1068,7 +1068,7 @@ USB staging 编码已通过实际 QEMU RAM 微测试，原厂 burner 已在旧�
   `0x97`、`0xE9`、`0x83`，三步均 map+ack+release；证据为
   `tmp/np560-v695-m35-m36-continuous-ready-predicate/route.json` 和
   `tmp/np560-v695-m37-continuous-after-dictionary/route.json`。正式反汇编为
-  `doc/np560_source_2a2f30_reachable.asm`、`doc/np560_source_506be2_reachable.asm`。
+  `doc/disassembly/np560_source_2a2f30_reachable.asm`、`doc/disassembly/np560_source_506be2_reachable.asm`。
 - [x] v695 的完整 ROM builder 回归为 `166/166` 通过（253.156 秒）；overlay preflight
   同时报告 builder overlays `540`、missing mappings `0`、non-identical overlaps `0`。
   另有 46 项 overlay parser/audit 单元测试通过。回归已明确断言 ROM-01 尾部顺序必须为
@@ -1526,7 +1526,7 @@ page-lane 后处理；关闭全部 HLE/画面特判后 golden 仍完全一致。
    `1A:0000`；source `37:0000..098B` 又恰好是从 `LINK #4` 到平衡 `RETS` 的完整
    same-PC 函数。因此 canonical ROM 恢复的是完整、独立的
    `1A:0000..098B ← 37:0000..098B`，不是从扩展字开始的 compare 补丁。证据见
-   `doc/np560_source_370000_report.md` 与 `doc/np560_source_496e0c_report.md`。
+   `doc/disassembly/np560_source_370000_report.md` 与 `doc/disassembly/np560_source_496e0c_report.md`。
 
    v732 动态复验已证明第四键能从 compare wrapper 正常返回：真实 guest 画出了娱乐
    二级菜单中的 `NPE 游戏/游戏世界/动漫欣赏/数码录音`，`ROM_MISSING`、
@@ -1649,8 +1649,8 @@ page-lane 后处理；关闭全部 HLE/画面特判后 golden 仍完全一致。
    读取为 section 1 的 4×29670-byte 连续场景块、section 0 的两个 4-byte 索引和
    section 1 的 266-byte 块，全部成功且没有访问 section 16..37。说明文字尾段又闭合到
    `22:C7FC` 的 NUL 字符串读取循环。资源/SFR 证据分别见
-   `doc/np560_npe_stream_resource_boundary.md` 和
-   `doc/np560_audio_hardware_boundary.md`。v897 将地图 1 扩展到 128 状态、58 坐标、366 条
+   `doc/games/np560_npe_stream_resource_boundary.md` 和
+   `doc/audio/np560_audio_hardware_boundary.md`。v897 将地图 1 扩展到 128 状态、58 坐标、366 条
    转移和 128 动作点；17,590 次读取、2,194,907 bytes 推进后上界仍严格为
    `0x13291A`，地图 index 始终为 1，证明继续盲走同一地图不是有效音频定位手段。
    v901 又把 `03:401C` 闭合为 `(stream, signed offset, whence)` seek wrapper，并用
@@ -1850,14 +1850,14 @@ artifact hash 和仍存在的未知项同步到相应逆向文档。
     - 静态确认 UpdateAll 命令 27 返回 `-12` 才进入分区/格式化分支；现有 harness 仍为
       固定序列，须记录 `50:001C`/ProgramGetResult 并实现错误分支，不能忽略任意错误
       或把强制重格式化等同于原厂所有输入的默认流程。证据和命令见
-      `doc/np560_usb_burn_transport.md`。
+      `doc/storage/np560_usb_burn_transport.md`。
   - [ ] 追踪普通 held-level 路线的重复消费：`repeated/` 第 32 次操作出现 2 次
     candidate/map/foreground ack，导致从学习多走到开始菜单。不是新花屏，但使
     预设分类路线失败；不得靠更换期望分类或把布尔 delivery 当计数使测试转绿。
     保留 `tmp/np560-menu-lanes-regression-v1/repeated-pixels.json`，单扫描回归只隔离
     证明了绘制链，不覆盖真实长按/释放时序。音乐和 NPE 长跑未在新 NAND 上验收。
 - 2026-09-05 用户在 8807 复现一级菜单花屏，已只读保留现场
-  `tmp/np560-user-corrupt-menu-8807/`，说明见 `doc/np560_vma03_menu_corruption.md`。
+  `tmp/np560-user-corrupt-menu-8807/`，说明见 `doc/display/np560_vma03_menu_corruption.md`。
   原生 LCD 与 front buffer 均可见顶栏错位；无 CPU fault 不代表画面正常。
   首次顶栏 source/object 按各自总线字节顺序归一后 2,650 字节全部一致，但该观察器
   只冻结首次装载，不能代表后续分类。切换“记事/系统”的资源记录已出现
@@ -1866,7 +1866,7 @@ artifact hash 和仍存在的未知项同步到相应逆向文档。
   先给每个分类分别保留资源源字节、完成对象和绘制结果，再在隔离实例做单次切换、
   往返/连续切换及选中态的逐像素回归；未关闭前不称主菜单已稳定。
 - 2026-09-05 生命周期诊断实现与故障注入证据见
-  `doc/np560_web_lifecycle.md`：已加入独立 health、唯一持久日志、构建/镜像哈希、
+  `doc/web/np560_web_lifecycle.md`：已加入独立 health、唯一持久日志、构建/镜像哈希、
   退出码观察、端口预留和失败清理。`tmp/np560-web-lifecycle-integration-v2/` 已通过
   真实子进程故障注入；历史 8807 退出原因仍未知，当前用户实例未重启。
 - 本轮自动游玩回归在行程菜单整屏指纹等待处失败，但原生 LCD 已显示正确行程菜单。
@@ -1917,7 +1917,7 @@ artifact hash 和仍存在的未知项同步到相应逆向文档。
   零矩阵输入、零键盘事件下自然进入 `00FF`；不能再断言必须 `M55/0xB0`。
   证据 `tmp/np560-vma03-journey-natural-route-v1/00-before.json`：写入者为
   `1D:F344`，与 source `3A:F340` 的 `00FF` 写入后 PC 一致（反汇编见
-  `doc/np560_source_3af2ec_natural_desktop_reachable.asm`）。仍须重复冷启动，确认
+  `doc/disassembly/np560_source_3af2ec_natural_desktop_reachable.asm`）。仍须重复冷启动，确认
   回调触发条件及耗时，区分自动进入桌面和 Start 展开/关闭菜单，不默认注入 B0。
 
 完成条件：在上述同一 VMA03 交付基线上重复生成、冷启动、进入并持续游玩真实 NPE

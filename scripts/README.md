@@ -89,7 +89,7 @@ python -m pytest -q scripts/tests/test_np560_mobivoice_decoder.py
 逐文件/分段验哈希后，对不同的 format-13 分段只比较一次独立
 解码器与隔离候选 DLL。它需要用户自行持有的 DLL，不能证明
 缺失 mask ROM 的实际 PCM 或游戏内播放控制；运行参数见
-[解码来源记录](../doc/np560_audio_codec_provenance.md)。
+[解码来源记录](../doc/audio/np560_audio_codec_provenance.md)。
 
 ## 两份 NAND 日志的只读对照
 
@@ -108,7 +108,9 @@ python scripts/compare_np560_nand_journals.py <base.nand> <first.npj> <second.np
 ```powershell
 python scripts/maintenance/catalog_scripts.py
 python scripts/maintenance/catalog_scripts.py --check
+python scripts/check_doc_links.py
 ```
 
 全表逐个列出文件及其 docstring 用途。它不修改 ROM/NAND、不连接运行实例。
+文档链接检查只读；它会跳过不随 Git 提交的 `tmp/` 实验输出。
 `organize_tests.py` 保留本轮一次性机械迁移过程；无需在日常构建中执行。

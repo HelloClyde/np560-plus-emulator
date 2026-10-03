@@ -23,4 +23,4 @@ PCM 音质对照；上游 README 的符合性成绩不是本项目的测试结�
 
 `M2L3_compl24.bit` 经头字段检查共 212 帧，全部单声道，故**不能作为 LSF-IS
 样本证据**，本次未用于 native IS 整链测试。LSF-IS 真实文件验证仍待补。
-详情见 [MP3 guest 核心 4.8](../../np560_mp3_guest_decoder.md)。
+详情见 [MP3 guest 核心 4.8](../../audio/np560_mp3_guest_decoder.md)。

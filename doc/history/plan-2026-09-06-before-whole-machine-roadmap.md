@@ -64,7 +64,7 @@ ROM 服务逐项区分 **原厂字节 / 证据支持的行为重建 / 临时桩 
 
 已修复一个生命周期问题：`np560_machine_reset()` 不再重新装载初始 NAND，
 原厂音效设置经过确认、普通 Reset 后保留；随后也通过 NAND 落盘、结束进程、全新进程冷启动
-和再次打开设置读回。详见 [原厂设置持久化](np560_native_settings_persistence.md)。
+和再次打开设置读回。详见 [原厂设置持久化](../storage/np560_native_settings_persistence.md)。
 《英雄传奇》第一槽的非默认位置也已通过跨进程原生恢复；其它设置、资料和完整游戏状态仍待完成，
 不能据此宣布持久化整体通过。
 
@@ -77,13 +77,13 @@ ROM 服务逐项区分 **原厂字节 / 证据支持的行为重建 / 临时桩 
 `01:4674/46CC/46D0` 还有直接返回的临时桩。入口地址标识待研究对象，
 不代表已经知道其全部算法，也不代表只补完这些入口就完成整机。
 
-已有 [Web 点按时序修复记录](np560_pointer_debounce.md)，但这只是输入的一项局部修复，
+已有 [Web 点按时序修复记录](../web/np560_pointer_debounce.md)，但这只是输入的一项局部修复，
 不代表原厂连发、跨应用输入或当前用户实例均已正确。具体时序和适用构建留在专题文档。
 
-另已修正普通 [MUL 小数模式及 V 标志](np560_multiply_fractional.md)：原来的有符号乘法忽略 FR，
+另已修正普通 [MUL 小数模式及 V 标志](../cpu/np560_multiply_fractional.md)：原来的有符号乘法忽略 FR，
 MUL/UMUL 留下旧溢出标志。属于 M0 的 CPU 正确性修复，不计作原厂音频 ROM 已恢复。
 
-[跨页取指一致性](np560_code_coherence.md) 也已修正：guest 改写跨页立即数后不再执行缓存旧值。
+[跨页取指一致性](../cpu/np560_code_coherence.md) 也已修正：guest 改写跨页立即数后不再执行缓存旧值。
 旧按地址同步及其它映射仍待清退，不据此认定全部代码损坏或原厂装载问题已解决。
 
 ## 4. 功能里程碑
@@ -190,7 +190,7 @@ CPU 或 ROM 的实现不能按菜单名称、游戏名称或宿主调用者特�
 
 **交付：** NPE 不再需要关闭声音才能进入，实际游戏音效/音乐与播放器内容能正常播放和控制。
 当前只有数字输出通路及部分原厂处理代码可用，不提前把此项标为通过。
-证据入口：[流后端](np560_resident_stream_backend.md)、[十项表模式服务](np560_resident_table_modes.md)。
+证据入口：[流后端](../audio/np560_resident_stream_backend.md)、[十项表模式服务](../audio/np560_resident_table_modes.md)。
 
 ### 随使用链收尾：普通输入、桌面与应用切换（M1）
 
@@ -214,7 +214,7 @@ CPU 或 ROM 的实现不能按菜单名称、游戏名称或宿主调用者特�
 - 用机制不同的真实 NPE 补齐剩余共用能力，不能按游戏名或当前菜单特判。
 
 **交付：** 用户能有声音地实际游玩、保存、退出并继续，而不只是看标题页或在首场景移动。
-已有有限通过范围见 [原生存读档](np560_npe_native_save.md)。
+已有有限通过范围见 [原生存读档](../games/np560_npe_native_save.md)。
 
 ### 后续完整化：全部应用、外设、生命周期与交付（M3–M5）
 
@@ -258,20 +258,20 @@ CPU 或 ROM 的实现不能按菜单名称、游戏名称或宿主调用者特�
 本文件是当前目标、优先级和完成条件的唯一入口。专题文档的旧“下一步”、固定测试次数
 及旧版本结论不覆盖本计划，其中未关闭的技术缺陷仍须保留。
 
-- 系统：[菜单花屏](np560_vma03_menu_corruption.md)、[游戏世界代码损坏](np560_game_world_code_write.md)、[Web 点按去抖](np560_pointer_debounce.md)
-- CPU/SoC：[中断现场](np560_interrupt_nesting.md)、[IGNDS](np560_ignds_interrupt_mask.md)、
-  [TRAP](np560_software_trap.md)、[时基](np560_timebase.md)、[Timer/DTU/DPRAM](np560_periodic_timers_and_dpram.md)
-- DSP：[寄存器运算](np560_register_dsp.md)、[X0 循环寻址](np560_x0_circular_buffer.md)、[内存 MAC](np560_memory_mac.md)
-- 普通乘法：[MUL 小数模式与溢出标志](np560_multiply_fractional.md)
-- 程序内存：[跨页取指与代码一致性](np560_code_coherence.md)
-- 内存/ROM 缺口：[普通 Y 指针内存视图](np560_y_pointer_memory.md)、[十项表模式服务](np560_resident_table_modes.md)
-- ROM/音频：[流后端](np560_resident_stream_backend.md)、[音频硬件边界](np560_audio_hardware_boundary.md)、[DAC/Web 输出](np560_dac_web_output.md)
-- 游戏/存储：[NPE 装载](np560_npe_game_launch_contract.md)、[NPE 输入](np560_npe_input_semantics.md)、
-  [原厂文件 API](np560_vendor_file_transfer.md)、[烧录与初始化](np560_usb_burn_transport.md)
-- 交付：[Web 与进程生命周期](np560_web_lifecycle.md)
-- 保存：[原厂设置与 Reset](np560_native_settings_persistence.md)
-- 游戏保存：[NPE 原生存读档](np560_npe_native_save.md)
-- 历史：[早期计划](history/plan-2026-09-05-before-replan.md)、[此前详细计划](history/plan-2026-09-05-before-capability-refinement.md)
+- 系统：[菜单花屏](../display/np560_vma03_menu_corruption.md)、[游戏世界代码损坏](../games/np560_game_world_code_write.md)、[Web 点按去抖](../web/np560_pointer_debounce.md)
+- CPU/SoC：[中断现场](../cpu/np560_interrupt_nesting.md)、[IGNDS](../cpu/np560_ignds_interrupt_mask.md)、
+  [TRAP](../cpu/np560_software_trap.md)、[时基](../hardware/np560_timebase.md)、[Timer/DTU/DPRAM](../hardware/np560_periodic_timers_and_dpram.md)
+- DSP：[寄存器运算](../cpu/np560_register_dsp.md)、[X0 循环寻址](../cpu/np560_x0_circular_buffer.md)、[内存 MAC](../cpu/np560_memory_mac.md)
+- 普通乘法：[MUL 小数模式与溢出标志](../cpu/np560_multiply_fractional.md)
+- 程序内存：[跨页取指与代码一致性](../cpu/np560_code_coherence.md)
+- 内存/ROM 缺口：[普通 Y 指针内存视图](../cpu/np560_y_pointer_memory.md)、[十项表模式服务](../audio/np560_resident_table_modes.md)
+- ROM/音频：[流后端](../audio/np560_resident_stream_backend.md)、[音频硬件边界](../audio/np560_audio_hardware_boundary.md)、[DAC/Web 输出](../audio/np560_dac_web_output.md)
+- 游戏/存储：[NPE 装载](../games/np560_npe_game_launch_contract.md)、[NPE 输入](../games/np560_npe_input_semantics.md)、
+  [原厂文件 API](../storage/np560_vendor_file_transfer.md)、[烧录与初始化](../storage/np560_usb_burn_transport.md)
+- 交付：[Web 与进程生命周期](../web/np560_web_lifecycle.md)
+- 保存：[原厂设置与 Reset](../storage/np560_native_settings_persistence.md)
+- 游戏保存：[NPE 原生存读档](../games/np560_npe_native_save.md)
+- 历史：[早期计划](plan-2026-09-05-before-replan.md)、[此前详细计划](plan-2026-09-05-before-capability-refinement.md)
 
 逆向文档放 doc/，脚本工具放 scripts/，实验产物放 tmp/、build/ 或指定大容量盘。
 详细地址推导、构建指纹和实验日志留在专题文档，不让计划退化为调试流水账。

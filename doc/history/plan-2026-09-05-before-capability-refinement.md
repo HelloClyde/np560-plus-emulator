@@ -3,7 +3,7 @@
 更新：2026-09-05，按用户“完美实现 NP560+ 模拟器”的要求重新规划。
 
 本文是唯一有效的执行计划。旧版混合了大量实验日志与过时路线，已完整保存在
-[历史计划](history/plan-2026-09-05-before-replan.md)，其中的顺序、勾选和“当前”不再作为执行指令。
+[历史计划](plan-2026-09-05-before-replan.md)，其中的顺序、勾选和“当前”不再作为执行指令。
 详细逆向证据留在专题文档；本文件只维护目标、真实缺口、实现顺序与完成条件。
 计划的计量单位是“实现了哪项真机能力”，不是脚本、截图、修补函数或测试次数。
 
@@ -48,18 +48,18 @@ mask-ROM 转储；无法确认的原厂行为、周期参数和 ROM 内容必须
 以上是分项证据，不是一个已全部通过的统一发行版。当前开发基线使用 `firmware-vma03`、
 原始 `NP560.PRG`、`np560-system-v380-vma03-resident-codec-holes-v1.bin` 与原厂文件 API
 导入的 `np560-vendor-file-import-v3.nand`；`ROM_HLE=off`、`HLE_UI=off`，显式报告 ROM 缺口。
-构建及镜像身份见 [Timer2 与位寻址](np560_timer2_and_bit_sfr_contract.md)。端口号不代表版本。
+构建及镜像身份见 [Timer2 与位寻址](../hardware/np560_timer2_and_bit_sfr_contract.md)。端口号不代表版本。
 
 共享窗口构建的一次正常菜单路径在确认“游戏世界”后停于 `22:1840 / WORD=bcd3`，未进入文件列表，
-见 [路线记录](../tmp/np560-sfr-psr-native-route-v1/route.json) 与
-[失败现场](../tmp/np560-sfr-psr-native-route-v1/04-NPEList-failed.json)。异常内容已匹配原包谚语资源。
+见 [路线记录](../../tmp/np560-sfr-psr-native-route-v1/route.json) 与
+[失败现场](../../tmp/np560-sfr-psr-native-route-v1/04-NPEList-failed.json)。异常内容已匹配原包谚语资源。
 旧构建和同一新构建的另一路线均进入过文件列表，但输入消费和前史不同，仍不能归因于
-SFR 修正或认定为缺少新指令；见 [代码写入与复现边界](np560_game_world_code_write.md)。
+SFR 修正或认定为缺少新指令；见 [代码写入与复现边界](../games/np560_game_world_code_write.md)。
 随后已修复独立确认的中断 PSR 帧编码错误并通过冷启动，不能据此宣称间歇性覆盖已修。
 继续修正了 SOCR/F100 分离导致 DI 不屏蔽中断的错误，原厂冷启动再次通过；这是对真实
 临界区语义的修复，但尚未直接捕获资源覆盖的首次写入，下一步核对正常导航和 Timer2 路径。
 此前另一构建、不同导航前史曾进入
-NPE 并停在 `02:ACD8`，见 [流后端记录](np560_resident_stream_backend.md)；该 ROM 缺口仍须修复，
+NPE 并停在 `02:ACD8`，见 [流后端记录](../audio/np560_resident_stream_backend.md)；该 ROM 缺口仍须修复，
 但不再把它描述为最新构建的首个卡点。没有重新验证的旧成果一律保留适用范围。
 
 ## 3. 实现必须遵守的架构边界
@@ -201,17 +201,17 @@ NPE 并停在 `02:ACD8`，见 [流后端记录](np560_resident_stream_backend.md
 
 ## 9. 证据入口与文档规则
 
-- [菜单花屏定位](np560_vma03_menu_corruption.md)
-- [游戏世界入口代码覆盖与复现边界](np560_game_world_code_write.md)
-- [原厂烧录、完整镜像和新菜单证据](np560_usb_burn_transport.md)
-- [原厂文件 API 与 NPE 内容导入](np560_vendor_file_transfer.md)
-- [原厂流后端、TRAP 修正及首个 ROM 缺口](np560_resident_stream_backend.md)
-- [声音启停的 Timer2 依赖与位寻址修正](np560_timer2_and_bit_sfr_contract.md)
-- [NPE 装载契约](np560_npe_game_launch_contract.md)
-- [NPE 输入语义](np560_npe_input_semantics.md)
-- [音频硬件边界](np560_audio_hardware_boundary.md)
-- [Web/QEMU 生命周期](np560_web_lifecycle.md)
-- [重规划前全部记录](history/plan-2026-09-05-before-replan.md)
+- [菜单花屏定位](../display/np560_vma03_menu_corruption.md)
+- [游戏世界入口代码覆盖与复现边界](../games/np560_game_world_code_write.md)
+- [原厂烧录、完整镜像和新菜单证据](../storage/np560_usb_burn_transport.md)
+- [原厂文件 API 与 NPE 内容导入](../storage/np560_vendor_file_transfer.md)
+- [原厂流后端、TRAP 修正及首个 ROM 缺口](../audio/np560_resident_stream_backend.md)
+- [声音启停的 Timer2 依赖与位寻址修正](../hardware/np560_timer2_and_bit_sfr_contract.md)
+- [NPE 装载契约](../games/np560_npe_game_launch_contract.md)
+- [NPE 输入语义](../games/np560_npe_input_semantics.md)
+- [音频硬件边界](../audio/np560_audio_hardware_boundary.md)
+- [Web/QEMU 生命周期](../web/np560_web_lifecycle.md)
+- [重规划前全部记录](plan-2026-09-05-before-replan.md)
 
 逆向文档在 `doc/`，工具在 `scripts/`，可再生实验产物在 `tmp/`/`build/` 或明确的大容量盘目录。
 历史文档中的地址与结论必须核对适用固件/构建，不能直接视为新基线事实。

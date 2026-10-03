@@ -15,4 +15,4 @@ SHA256：`9bca5f486a71ab159db1270901357b2a20d0c3a8c02c4ac521f8bb3f3d3910a6`。
 使用四个长子带，其它 mixed 使用两个。系数/末带决策仍另核公开源代码。
 
 未对 PDF 修改、修复或重新导出，也未复制其全文到生成代码中。
-相关实现与证据边界见 [MP3 guest 核心](../../np560_mp3_guest_decoder.md)。
+相关实现与证据边界见 [MP3 guest 核心](../../audio/np560_mp3_guest_decoder.md)。

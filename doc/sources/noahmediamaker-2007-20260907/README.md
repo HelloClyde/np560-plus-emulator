@@ -62,7 +62,7 @@
 本次未改 QEMU、resident ROM、NAND 或 Web；MP3/NPE 实际播放仍未恢复。
 
 后续同日已完成 AudioCtl、Compile 静态解包；NP560+ 分组与声音写入阶段的核对见
-[音频路径记录](../../np560_noahmedia_audio_path.md)。以上“尚未解包”保留为取得时状态，
+[音频路径记录](../../audio/np560_noahmedia_audio_path.md)。以上“尚未解包”保留为取得时状态，
 后续以该路径记录为准，仍没有取得经验证的目标 ESAC 解码器。
 
 同日补充：`MRC2PCM.DLL` 也已静态展开，结果 `MRC2PCM.rva.bin` 为 221,184 bytes，

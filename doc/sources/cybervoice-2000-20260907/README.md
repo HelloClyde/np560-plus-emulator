@@ -54,4 +54,4 @@ python scripts/extract_np560_cybervoice_evidence.py doc/sources/cybervoice-2000-
 ```
 
 脚本锁定前缀 SHA，仅保存完整且 CRC 匹配的成员，不使用安装脚本中的目标路径或执行其指令。
-分析结论见 [旧版解码器边界](../../np560_cybervoice_decoder_source.md)。
+分析结论见 [旧版解码器边界](../../audio/np560_cybervoice_decoder_source.md)。

@@ -70,4 +70,4 @@
   明确不是原版 libmad 定点逐位一致，亦未将它链接到 QEMU 或 Web 播放路径。
 
 已实现连续熵解码、定点频谱、MS/IS、重排、抗混叠、时域混合滤波及 PCM16 合成组件，原厂播放器接口尚未完成；
-细节见 [guest 解码核心](../../np560_mp3_guest_decoder.md)。
+细节见 [guest 解码核心](../../audio/np560_mp3_guest_decoder.md)。

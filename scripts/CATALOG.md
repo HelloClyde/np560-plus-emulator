@@ -3,7 +3,7 @@
 由 `maintenance/catalog_scripts.py` 生成；分类是用途，不代表生产可用或安全只读。
 具体使用入口与风险见 [README](README.md)。目录名 tests 不意味着全部是不依赖固件的单元测试。
 
-## 模拟器运行与管理（19）
+## 模拟器运行与管理（20）
 
 | 文件 | 用途 |
 | --- | --- |
@@ -23,11 +23,12 @@
 | [web/device_config.py](web/device_config.py) | Persistent device inputs; no guest-state injection or NAND image rewriting. |
 | [web/index.html](web/index.html) | 运行入口或运行实现，参数/用途见文件。 |
 | [web/keyboard_input.js](web/keyboard_input.js) | 运行入口或运行实现，参数/用途见文件。 |
+| [web/nand_files.py](web/nand_files.py) | Offline FAT16 file access for a complete NP560N1 NAND checkpoint. |
 | [web/np560_web.py](web/np560_web.py) | Local Web bridge for the QEMU NP560+ machine. |
 | [web/rom_bundle.py](web/rom_bundle.py) | Bind checked MP3/NPE ROM services to their actual image and firmware. |
 | [web/styles.css](web/styles.css) | 运行入口或运行实现，参数/用途见文件。 |
 
-## 自动测试、测试包装器与 C 参考程序（332）
+## 自动测试、测试包装器与 C 参考程序（333）
 
 | 文件 | 用途 |
 | --- | --- |
@@ -248,6 +249,7 @@
 | [tests/test_np560_nand_checkpoint.py](tests/test_np560_nand_checkpoint.py) | Verify complete NP560 NAND data/OOB checkpoint save and restore. |
 | [tests/test_np560_nand_compaction.py](tests/test_np560_nand_compaction.py) | Check atomic journal compaction using real guest NAND commands. |
 | [tests/test_np560_nand_export_stream.py](tests/test_np560_nand_export_stream.py) | Check bounded-memory NAND export/load and preservation on a short host write. |
+| [tests/test_np560_nand_files.py](tests/test_np560_nand_files.py) | Offline NAND file bridge regression tests (small synthetic FAT16 volume). |
 | [tests/test_np560_nand_journal.py](tests/test_np560_nand_journal.py) | NAND durability after SIGKILL, using only guest controller transactions. |
 | [tests/test_np560_nand_rw.py](tests/test_np560_nand_rw.py) | Exercise reconstructed BBF6/BCC6/BDD6 entirely from guest code. |
 | [tests/test_np560_native_buff_restore.py](tests/test_np560_native_buff_restore.py) | Execute the original battle zero-counter restore block, not an entire round. |
@@ -597,11 +599,13 @@
 | [seed_np560_factory_selector.py](seed_np560_factory_selector.py) | Seed the NP560+ factory selector byte in a NAND checkpoint. |
 | [seed_np560_factory_userinfo.py](seed_np560_factory_userinfo.py) | Seed a complete factory-compatible USERINFO.SYS in an NP560 checkpoint. |
 
-## 共享模块与早期实验模型（29）
+## 共享模块与早期实验模型（34）
 
 | 文件 | 用途 |
 | --- | --- |
 | [__init__.py](__init__.py) | NP560+ reverse-engineering, emulator, and diagnostic tools. |
+| [check_doc_links.py](check_doc_links.py) | Check local Markdown links in the NP560 documentation and entry READMEs. |
+| [diagnose_np560_mp3_silence.py](diagnose_np560_mp3_silence.py) | Inspect an isolated NP560+ MP3 route without modifying the user's NAND. |
 | [np560_assembler.py](np560_assembler.py) | Existing small DMCU label resolver, without ROM-builder import side effects. |
 | [np560_emulator.py](np560_emulator.py) | Instruction-level emulator for the King Billion DMCU in the Noah NP560+. |
 | [np560_host_time.py](np560_host_time.py) | Read-only Linux owned-thread CPU-time endpoints for diagnostic windows. |
@@ -629,6 +633,9 @@
 | [np560_rom_api.py](np560_rom_api.py) | Inventory calls from an NP560+ auxiliary listing into resident SoC ROM. |
 | [np560_usb_transport.py](np560_usb_transport.py) | Serialize USB wire bytes as the original loader's data-RAM stores do. |
 | [observe_np560_seek_reload.py](observe_np560_seek_reload.py) | Read-only host hardware watches for the original MP3 reload path. |
+| [package_np560_windows.ps1](package_np560_windows.ps1) | 用途与参数见源文件。 |
+| [portable/Start-NP560.ps1](portable/Start-NP560.ps1) | 用途与参数见源文件。 |
+| [replace_np560_mp3_sample.py](replace_np560_mp3_sample.py) | Replace one MP3 track in an offline NP560 checkpoint. |
 | [start_np560_windows.ps1](start_np560_windows.ps1) | 用途与参数见源文件。 |
 
 ## 仓库维护与整理（3）

@@ -3,7 +3,7 @@
 """Native DMCU Layer III Huffman core, NOT a factory ROM entry replacement.
 
 Build-time tables: saved FFmpeg LGPL-2.1+ MPEG tables. Algorithm reference:
-libmad bit.c/layer3.c, GPL-2.0+. See doc/np560_mp3_guest_decoder.md.
+libmad bit.c/layer3.c, GPL-2.0+. See doc/audio/np560_mp3_guest_decoder.md.
 No decoding is performed by a QEMU helper or host callback.
 """
 from __future__ import annotations

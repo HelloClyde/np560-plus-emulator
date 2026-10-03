@@ -173,7 +173,7 @@ ROM 的原厂字节、有依据的行为重建、临时桩和未知入口分别�
   快照不代替原厂应用存档。
   已加入 CPU 状态序列化（含双循环与嵌套中断父栈）；外设、NAND/日志时间线尚未接齐，
   整机保存/恢复暂时显式拒绝，防止继续产生不完整快照。下一步接齐设备状态与回滚策略，
-  不是把“拒绝不完整快照”当作完整保存能力。见[整机快照实现边界](../np560_machine_snapshot.md)。
+  不是把“拒绝不完整快照”当作完整保存能力。见[整机快照实现边界](../storage/np560_machine_snapshot.md)。
 
 完成条件：设备能保存资料、交换内容、正确管理电源并升级恢复，
 而不是必须常驻运行且依靠开发者修 NAND 的程序。
@@ -241,7 +241,7 @@ M6 是完整性收尾，不是把 CPU/SoC、ROM 或错误处理拖到最后的�
 没有新证据时不重复搜索相同材料或盲填算法；明确记下所缺依据，转向已有依据、能实际实现的整机缺口。
 其中 NPE 的正常技能取得、施法/装备或后续剧情仅用于定位尚未闭合的具体行为，
 验证达到目的后即回到实现；不重复已通过的移动/战斗累积进度，也不把静音玩法进展计入 M2。
-既有阿诺局部成果见[战斗与增量读回](../np560_npe_arno_battle.md)。
+既有阿诺局部成果见[战斗与增量读回](../games/np560_npe_arno_battle.md)。
 
 对尚未定位的显示、输入或运行故障写“原因待查”，不先假定 ROM 缺失。
 
@@ -273,12 +273,12 @@ M6 是完整性收尾，不是把 CPU/SoC、ROM 或错误处理拖到最后的�
 
 ## 7. 依据与归档
 
-- 系统与显示：[菜单花屏](../np560_vma03_menu_corruption.md)、[Web 点按](../np560_pointer_debounce.md)、[游戏世界代码损坏](../np560_game_world_code_write.md)。
-- CPU 与内存：[嵌套循环与滚屏](../np560_nested_repeat_scroll.md)、[段末 PC / 长指令回绕](../np560_pc_wrap.md)、[代码一致性](../np560_code_coherence.md)、[X RAM 取指](../np560_internal_x_execution.md)、[位运算标志](../np560_bit_binary_flags.md)、[中断](../np560_interrupt_nesting.md)、[TRAP](../np560_software_trap.md)、[IGNDS](../np560_ignds_interrupt_mask.md)。
-- 时钟与运算：[时基](../np560_timebase.md)、[Timer/DTU/DPRAM](../np560_periodic_timers_and_dpram.md)、[CLKCON](../np560_clock_write_protection.md)、[DSP](../np560_register_dsp.md)、[MUL](../np560_multiply_fractional.md)、[ASR 移位缓冲](../np560_asr_shift_buffer.md)、[X0](../np560_x0_circular_buffer.md)、[MAC](../np560_memory_mac.md)、[Y 指针](../np560_y_pointer_memory.md)。
-- ROM 与音频：[流后端](../np560_resident_stream_backend.md)、[算法来源边界](../np560_audio_codec_provenance.md)、[十项表临时桩](../np560_resident_table_modes.md)、[声音状态 RAM](../np560_audio_state_ram.md)、[硬件边界](../np560_audio_hardware_boundary.md)、[DAC/Web](../np560_dac_web_output.md)。
-- NPE：[装载](../np560_npe_game_launch_contract.md)、[输入语义](../np560_npe_input_semantics.md)、[原生存读档](../np560_npe_native_save.md)、[战斗与敌人图像缺口](../np560_npe_battle_observation.md)、[阿诺与跨游戏存档隔离](../np560_npe_arno_compatibility.md)。
-- 存储与生命周期：[原厂文件 API](../np560_vendor_file_transfer.md)、[烧录与初始化](../np560_usb_burn_transport.md)、[软件 RESET](../np560_software_reset.md)、[设置持久化](../np560_native_settings_persistence.md)、[NAND 增量保存](../np560_nand_journal.md)、[固定设备配置](../np560_device_config.md)、[设备备份与恢复](../np560_device_backup.md)、[Web 生命周期](../np560_web_lifecycle.md)。
+- 系统与显示：[菜单花屏](../display/np560_vma03_menu_corruption.md)、[Web 点按](../web/np560_pointer_debounce.md)、[游戏世界代码损坏](../games/np560_game_world_code_write.md)。
+- CPU 与内存：[嵌套循环与滚屏](../cpu/np560_nested_repeat_scroll.md)、[段末 PC / 长指令回绕](../cpu/np560_pc_wrap.md)、[代码一致性](../cpu/np560_code_coherence.md)、[X RAM 取指](../cpu/np560_internal_x_execution.md)、[位运算标志](../cpu/np560_bit_binary_flags.md)、[中断](../cpu/np560_interrupt_nesting.md)、[TRAP](../cpu/np560_software_trap.md)、[IGNDS](../cpu/np560_ignds_interrupt_mask.md)。
+- 时钟与运算：[时基](../hardware/np560_timebase.md)、[Timer/DTU/DPRAM](../hardware/np560_periodic_timers_and_dpram.md)、[CLKCON](../hardware/np560_clock_write_protection.md)、[DSP](../cpu/np560_register_dsp.md)、[MUL](../cpu/np560_multiply_fractional.md)、[ASR 移位缓冲](../cpu/np560_asr_shift_buffer.md)、[X0](../cpu/np560_x0_circular_buffer.md)、[MAC](../cpu/np560_memory_mac.md)、[Y 指针](../cpu/np560_y_pointer_memory.md)。
+- ROM 与音频：[流后端](../audio/np560_resident_stream_backend.md)、[算法来源边界](../audio/np560_audio_codec_provenance.md)、[十项表临时桩](../audio/np560_resident_table_modes.md)、[声音状态 RAM](../audio/np560_audio_state_ram.md)、[硬件边界](../audio/np560_audio_hardware_boundary.md)、[DAC/Web](../audio/np560_dac_web_output.md)。
+- NPE：[装载](../games/np560_npe_game_launch_contract.md)、[输入语义](../games/np560_npe_input_semantics.md)、[原生存读档](../games/np560_npe_native_save.md)、[战斗与敌人图像缺口](../games/np560_npe_battle_observation.md)、[阿诺与跨游戏存档隔离](../games/np560_npe_arno_compatibility.md)。
+- 存储与生命周期：[原厂文件 API](../storage/np560_vendor_file_transfer.md)、[烧录与初始化](../storage/np560_usb_burn_transport.md)、[软件 RESET](../hardware/np560_software_reset.md)、[设置持久化](../storage/np560_native_settings_persistence.md)、[NAND 增量保存](../storage/np560_nand_journal.md)、[固定设备配置](../storage/np560_device_config.md)、[设备备份与恢复](../storage/np560_device_backup.md)、[Web 生命周期](../web/np560_web_lifecycle.md)。
 - 历史：[整机路线重排前](../history/plan-2026-09-06-before-whole-machine-roadmap.md)、[早期计划](../history/plan-2026-09-05-before-replan.md)、[此前详细计划](../history/plan-2026-09-05-before-capability-refinement.md)。
 
 逆向与设计文档放 `doc/`，脚本工具放 `scripts/`，实验产物放 `tmp/`、`build/` 或指定大容量盘。

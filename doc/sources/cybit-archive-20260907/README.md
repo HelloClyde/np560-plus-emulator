@@ -24,4 +24,4 @@ mono、8000 Hz、16 bit、33096 samples、4.137 秒。它是演示音质的输�
 此前 CDX 查询超时、网页抓取工具的失败均只表示该访问方式失败；availability API 和
 PowerShell 只读下载成功，不再把“整个历史站点不可取得”当作来源边界。
 
-证据解读见 [声音来源文档](../../np560_audio_codec_provenance.md) 第 5 节。
+证据解读见 [声音来源文档](../../audio/np560_audio_codec_provenance.md) 第 5 节。
