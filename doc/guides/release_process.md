@@ -14,14 +14,18 @@ Python 嵌入包固定为 3.12.10，SHA-256：
 `4acbed6dd1c744b0376e3b1cf57ce906f9dc9e95e68824584c8099a63025a3c3`。
 
 完整 `system.nand` 是本地运行设备的独立数据/OOB 检查点，不能由源码 CI
-重新构造；打 tag 后需要在本地停机导出，核对 FAT 目录和 SHA-256，手动上传到
-同一 Release。不可直接复制运行中的基础镜像而遗漏 `.npj` 增量日志。
-发布页应列出 NAND 的 SHA-256、内容和来源。镜像不加入 Git 历史。
+重新构造；打 tag 后需要在本地停机导出，核对 FAT 目录和 SHA-256。
+使用 `python scripts/compress_np560_checkpoint.py system.nand system.nand.gz
+--expected-sha256 <原始镜像 SHA-256>` 生成可复验的 gzip，并将
+`system.nand.gz` 手动上传到同一 Release。不可直接复制运行中的基础镜像而
+遗漏 `.npj` 增量日志。发布页应列出原始与压缩文件各自的 SHA-256、内容和来源。
+镜像不加入 Git 历史。v0.2.3 的原始 `system.nand` 继续保留供旧版使用。
 
 最终用户下载四项即可在 Windows x64 运行：模拟器 ZIP、`NP560.PRG`、
-`resident.bin`、`system.nand`。后三项放进解压后 `images/`，双击
+`resident.bin`、`system.nand.gz`。后三项放进解压后 `images/`，双击
 `Start-NP560.cmd`；设备配置和 NAND 增量写入保留在 `device/`。
-这些是三种不同用途的镜像，不能合并为一个 NAND。
+QEMU 直接读取 gzip 并解压到 NAND 内存，不产生未压缩的磁盘副本；原始
+`system.nand` 仍可作为兼容输入。这些是三种不同用途的镜像，不能合并为一个 NAND。
 
 源码包含 QEMU 硬件实现、原厂 PRG 可复用代码的提取/组合规则以及缺失
 01/02 resident 服务的 HLE；`resident.bin` 不是完整原厂 mask-ROM 转储。

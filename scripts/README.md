@@ -15,7 +15,7 @@ Python/JS 测试已实体迁到 `tests/`。其它历史工具仍保留原路径�
 | 动态调试 | `probe_*`、`monitor_*`、`capture_*`、`dump_*`、`watch_*`、`triage_*` | 部分会按键、暂停、复位、写入诊断内存；勿盲目指向试玩实例 |
 | 性能测量 | `benchmark_np560_web_speed.py`、`benchmark_np560_cpu_kernel.py` | 性能测试不是完整硬件兼容性证明 |
 | ROM/HLE 工件 | `build_np560_*`、`patch_np560_*`、`finalize_*`、`mirror_*` | 构建/重建/历史实验工具，不是每个都属于当前运行链 |
-| NAND 与内容 | `import_np560_vendor_file.py`、`burn_np560_stream.py`、`seed_*`、`inject_*`、`repair_*` | 会产生或修改数据；尤其 inject 与原厂文件导入不能混为一谈 |
+| NAND 与内容 | `import_np560_vendor_file.py`、`burn_np560_stream.py`、`compress_np560_checkpoint.py`、`seed_*`、`inject_*`、`repair_*` | 会产生或修改数据；尤其 inject 与原厂文件导入不能混为一谈 |
 | 维护 | `maintenance/`、`cleanup_expired_nand.ps1` | 索引生成、迁移记录、清理；清理操作必须先检查目标 |
 | 共享库 | `np560_assembler.py`、`np560_qmp.py`、`np560_rom_api.py` 等 | 由工具导入，通常不是直接试玩入口 |
 

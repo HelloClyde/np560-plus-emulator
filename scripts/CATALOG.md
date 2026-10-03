@@ -28,7 +28,7 @@
 | [web/rom_bundle.py](web/rom_bundle.py) | Bind checked MP3/NPE ROM services to their actual image and firmware. |
 | [web/styles.css](web/styles.css) | 运行入口或运行实现，参数/用途见文件。 |
 
-## 自动测试、测试包装器与 C 参考程序（333）
+## 自动测试、测试包装器与 C 参考程序（335）
 
 | 文件 | 用途 |
 | --- | --- |
@@ -91,6 +91,7 @@
 | [tests/test_capture_np560_snapshot.py](tests/test_capture_np560_snapshot.py) | 测试/参考实现；依赖及运行参数见文件。 |
 | [tests/test_compare_np560_data_segments.py](tests/test_compare_np560_data_segments.py) | Tests for read-only guest data-bank state comparison. |
 | [tests/test_compare_np560_nand_journals.py](tests/test_compare_np560_nand_journals.py) | 测试/参考实现；依赖及运行参数见文件。 |
+| [tests/test_compress_np560_checkpoint.py](tests/test_compress_np560_checkpoint.py) | Small deterministic transport tests for compressed NAND checkpoints. |
 | [tests/test_diagnostic_cli_imports.py](tests/test_diagnostic_cli_imports.py) | Catch CLI imports broken by moving shared diagnostic helpers into tests. |
 | [tests/test_dump_np560_qemu_bus.py](tests/test_dump_np560_qemu_bus.py) | Unit tests for the read-only NP560 QEMU bus dump utility. |
 | [tests/test_ensure_np560_fat16_directories.py](tests/test_ensure_np560_fat16_directories.py) | 测试/参考实现；依赖及运行参数见文件。 |
@@ -250,6 +251,7 @@
 | [tests/test_np560_nand_compaction.py](tests/test_np560_nand_compaction.py) | Check atomic journal compaction using real guest NAND commands. |
 | [tests/test_np560_nand_export_stream.py](tests/test_np560_nand_export_stream.py) | Check bounded-memory NAND export/load and preservation on a short host write. |
 | [tests/test_np560_nand_files.py](tests/test_np560_nand_files.py) | Offline NAND file bridge regression tests (small synthetic FAT16 volume). |
+| [tests/test_np560_nand_gzip.py](tests/test_np560_nand_gzip.py) | Restore a real gzip NAND seed in QEMU and compare its raw export. |
 | [tests/test_np560_nand_journal.py](tests/test_np560_nand_journal.py) | NAND durability after SIGKILL, using only guest controller transactions. |
 | [tests/test_np560_nand_rw.py](tests/test_np560_nand_rw.py) | Exercise reconstructed BBF6/BCC6/BDD6 entirely from guest code. |
 | [tests/test_np560_native_buff_restore.py](tests/test_np560_native_buff_restore.py) | Execute the original battle zero-counter restore block, not an entire round. |
@@ -599,12 +601,13 @@
 | [seed_np560_factory_selector.py](seed_np560_factory_selector.py) | Seed the NP560+ factory selector byte in a NAND checkpoint. |
 | [seed_np560_factory_userinfo.py](seed_np560_factory_userinfo.py) | Seed a complete factory-compatible USERINFO.SYS in an NP560 checkpoint. |
 
-## 共享模块与早期实验模型（34）
+## 共享模块与早期实验模型（35）
 
 | 文件 | 用途 |
 | --- | --- |
 | [__init__.py](__init__.py) | NP560+ reverse-engineering, emulator, and diagnostic tools. |
 | [check_doc_links.py](check_doc_links.py) | Check local Markdown links in the NP560 documentation and entry READMEs. |
+| [compress_np560_checkpoint.py](compress_np560_checkpoint.py) | Create and verify a deterministic gzip of a complete NP560N1 NAND checkpoint. |
 | [diagnose_np560_mp3_silence.py](diagnose_np560_mp3_silence.py) | Inspect an isolated NP560+ MP3 route without modifying the user's NAND. |
 | [np560_assembler.py](np560_assembler.py) | Existing small DMCU label resolver, without ROM-builder import side effects. |
 | [np560_emulator.py](np560_emulator.py) | Instruction-level emulator for the King Billion DMCU in the Noah NP560+. |

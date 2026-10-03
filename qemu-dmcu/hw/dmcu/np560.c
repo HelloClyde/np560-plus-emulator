@@ -2,6 +2,7 @@
 
 #include "qemu/osdep.h"
 #include <glib/gstdio.h>
+#include <zlib.h>
 #include "qemu/datadir.h"
 #include "qapi/error.h"
 #include "qapi/visitor.h"
@@ -11489,6 +11490,24 @@ static gsize np560_load_be16_image(MemoryRegion *region,
     return image_size;
 }
 
+static bool np560_nand_gzread_exact(gzFile stream, void *destination,
+                                   size_t length)
+{
+    uint8_t *out = destination;
+
+    while (length) {
+        unsigned int chunk = MIN(length, (size_t)(1024 * 1024));
+        int amount = gzread(stream, out, chunk);
+
+        if (amount <= 0) {
+            return false;
+        }
+        out += amount;
+        length -= amount;
+    }
+    return true;
+}
+
 static void np560_load_nand_image(NP560MachineState *s)
 {
     static const uint8_t checkpoint_magic[8] = {
@@ -11527,8 +11546,11 @@ static void np560_load_nand_image(NP560MachineState *s)
         uint32_t data_hash;
         uint32_t oob_hash;
         uint8_t header[NP560_NAND_CHECKPOINT_HEADER_SIZE];
+        uint8_t signature[2];
+        bool compressed;
         struct stat st;
         FILE *stream;
+        gzFile gzip_stream = NULL;
 
         filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, s->nand_checkpoint);
         if (!filename) {
@@ -11542,9 +11564,38 @@ static void np560_load_nand_image(NP560MachineState *s)
                          filename, strerror(errno));
             exit(EXIT_FAILURE);
         }
-        if (fstat(fileno(stream), &st) || st.st_size != expected_size ||
-            fread(header, 1, sizeof(header), stream) != sizeof(header) ||
-            memcmp(header, checkpoint_magic, sizeof(checkpoint_magic)) ||
+        if (fread(signature, 1, sizeof(signature), stream) !=
+                sizeof(signature) || fseek(stream, 0, SEEK_SET)) {
+            fclose(stream);
+            error_report("Unable to read NP560+ NAND checkpoint '%s'",
+                         filename);
+            exit(EXIT_FAILURE);
+        }
+        compressed = signature[0] == 0x1f && signature[1] == 0x8b;
+        if (compressed) {
+            fclose(stream);
+            stream = NULL;
+            gzip_stream = gzopen(filename, "rb");
+            if (!gzip_stream ||
+                !np560_nand_gzread_exact(gzip_stream, header,
+                                          sizeof(header))) {
+                if (gzip_stream) {
+                    gzclose(gzip_stream);
+                }
+                error_report("Unable to read compressed NP560+ NAND "
+                             "checkpoint '%s'", filename);
+                exit(EXIT_FAILURE);
+            }
+        } else if (fstat(fileno(stream), &st) ||
+                   st.st_size != expected_size ||
+                   fread(header, 1, sizeof(header), stream) !=
+                       sizeof(header)) {
+            fclose(stream);
+            error_report("NP560+ NAND checkpoint '%s' has an incompatible "
+                         "header or size", filename);
+            exit(EXIT_FAILURE);
+        }
+        if (memcmp(header, checkpoint_magic, sizeof(checkpoint_magic)) ||
             ldl_le_p(header + 8) != NP560_NAND_CHECKPOINT_VERSION ||
             ldl_le_p(header + 12) != NP560_NAND_CHECKPOINT_HEADER_SIZE ||
             ldl_le_p(header + 16) != NP560_NAND_PAGE_DATA ||
@@ -11553,7 +11604,11 @@ static void np560_load_nand_image(NP560MachineState *s)
             ldl_le_p(header + 28) != NP560_NAND_BLOCKS ||
             ldq_le_p(header + 32) != NP560_NAND_DATA_SIZE ||
             ldq_le_p(header + 40) != NP560_NAND_OOB_SIZE) {
-            fclose(stream);
+            if (gzip_stream) {
+                gzclose(gzip_stream);
+            } else {
+                fclose(stream);
+            }
             error_report("NP560+ NAND checkpoint '%s' has an incompatible "
                          "header or size", filename);
             exit(EXIT_FAILURE);
@@ -11561,20 +11616,36 @@ static void np560_load_nand_image(NP560MachineState *s)
         /* Before guest startup: read directly into the device planes. A short
          * read, changed size, or bad checksum aborts; partial data never runs.
          */
-        if (fread(nand->data, 1, NP560_NAND_DATA_SIZE, stream) !=
-                NP560_NAND_DATA_SIZE ||
-            fread(nand->oob, 1, NP560_NAND_OOB_SIZE, stream) !=
-                NP560_NAND_OOB_SIZE ||
-            fgetc(stream) != EOF || ferror(stream)) {
-            fclose(stream);
-            error_report("Unable to read complete NP560+ NAND checkpoint '%s'",
-                         filename);
-            exit(EXIT_FAILURE);
-        }
-        if (fclose(stream)) {
-            error_report("Unable to close NP560+ NAND checkpoint '%s': %s",
-                         filename, strerror(errno));
-            exit(EXIT_FAILURE);
+        if (gzip_stream) {
+            bool complete =
+                np560_nand_gzread_exact(gzip_stream, nand->data,
+                                        NP560_NAND_DATA_SIZE) &&
+                np560_nand_gzread_exact(gzip_stream, nand->oob,
+                                        NP560_NAND_OOB_SIZE) &&
+                gzgetc(gzip_stream) == -1 && gzeof(gzip_stream);
+            int close_result = gzclose(gzip_stream);
+
+            if (!complete || close_result != Z_OK) {
+                error_report("Unable to read complete compressed NP560+ "
+                             "NAND checkpoint '%s'", filename);
+                exit(EXIT_FAILURE);
+            }
+        } else {
+            if (fread(nand->data, 1, NP560_NAND_DATA_SIZE, stream) !=
+                    NP560_NAND_DATA_SIZE ||
+                fread(nand->oob, 1, NP560_NAND_OOB_SIZE, stream) !=
+                    NP560_NAND_OOB_SIZE ||
+                fgetc(stream) != EOF || ferror(stream)) {
+                fclose(stream);
+                error_report("Unable to read complete NP560+ NAND checkpoint '%s'",
+                             filename);
+                exit(EXIT_FAILURE);
+            }
+            if (fclose(stream)) {
+                error_report("Unable to close NP560+ NAND checkpoint '%s': %s",
+                             filename, strerror(errno));
+                exit(EXIT_FAILURE);
+            }
         }
         data_hash = np560_nand_trace_hash(nand->data, NP560_NAND_DATA_SIZE);
         oob_hash = np560_nand_trace_hash(nand->oob, NP560_NAND_OOB_SIZE);
@@ -23053,7 +23124,7 @@ static void np560_machine_class_init(ObjectClass *oc, void *data)
                                   np560_get_nand_checkpoint,
                                   np560_set_nand_checkpoint);
     object_class_property_set_description(oc, "nand-checkpoint",
-        "Restore a complete NP560+ NAND data/OOB checkpoint");
+        "Restore a complete NP560+ NAND data/OOB checkpoint (raw or gzip)");
     object_class_property_add_str(oc, "nand-journal", np560_get_nand_journal,
                                   np560_set_nand_journal);
     object_class_property_set_description(oc, "nand-journal",

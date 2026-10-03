@@ -26,7 +26,7 @@ jobs:
       # These tests need only tracked source. Proprietary firmware, NAND and
       # locally reconstructed ROM binaries are deliberately not in Git.
       - name: Python source tests
-        run: python3 -m unittest scripts.tests.test_np560_system_nand_build scripts.tests.test_np560_owned_npe_codec
+        run: python3 -m unittest scripts.tests.test_np560_system_nand_build scripts.tests.test_np560_owned_npe_codec scripts.tests.test_compress_np560_checkpoint
       - name: Browser input test
         run: node scripts/tests/test_np560_pointer_input.js
 
