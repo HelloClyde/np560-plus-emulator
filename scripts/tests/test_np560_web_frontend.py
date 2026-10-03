@@ -69,6 +69,42 @@ class WebKeyboardFrontendTests(unittest.TestCase):
         self.assertIn("height: min(34rem, 60vh)", rule)
         self.assertIn("overflow: auto", rule)
 
+    def test_user_run_starts_audio_before_control_request(self) -> None:
+        self.assertIn('button.addEventListener("click", enableAudioOnFirstGesture);',
+                      self.javascript)
+        self.assertIn('async function resumeFromFiles() {\n  if (!filesOffline) return true;\n  enableAudioOnFirstGesture();',
+                      self.javascript)
+        self.assertIn('if (event.repeat) return;\n  enableAudioOnFirstGesture();',
+                      self.javascript)
+        script = r'''
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const app = fs.readFileSync(process.argv[1], 'utf8');
+const start = app.indexOf('document.querySelectorAll("[data-action]").forEach');
+const end = app.indexOf('document.getElementById("backlight")', start);
+assert.ok(start >= 0 && end > start);
+const order = [], handlers = {};
+const buttons = ['resume', 'pause'].map(action => ({dataset: {action},
+  addEventListener: (name, handler) => {handlers[action] = handler;}}));
+const context = {document: {querySelectorAll: () => buttons},
+  enableAudioOnFirstGesture: () => order.push('audio'),
+  api: () => {order.push('api'); return Promise.resolve();},
+  statusText: {textContent: ''}};
+vm.runInNewContext(app.slice(start, end), context);
+Promise.resolve().then(() => handlers.resume()).then(() => {
+  assert.deepEqual(order, ['audio', 'api']);
+  order.length = 0;
+  return handlers.pause();
+}).then(() => assert.deepEqual(order, ['api']))
+  .catch(error => {console.error(error); process.exitCode = 1;});
+'''
+        result = subprocess.run(
+            ["node", "-e", script, str(APP)], capture_output=True, text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_nand_entry_uses_html_dialog_and_cancel_does_not_stop_guest(self) -> None:
         self.assertIn('<dialog id="files-confirm-dialog"', self.html)
         self.assertIn('form method="dialog"', self.html)

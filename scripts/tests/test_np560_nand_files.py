@@ -1,5 +1,6 @@
 """Offline NAND file bridge regression tests (small synthetic FAT16 volume)."""
 
+import binascii
 import hashlib
 import json
 from pathlib import Path
@@ -12,6 +13,7 @@ from unittest.mock import Mock, patch
 from scripts.inject_np560_npe_fat16 import directory_entry, encode_short_name
 from scripts.web.nand_files import FatFiles, _components, rehash_checkpoint
 from scripts.web.np560_web import OfflineFileSession
+from scripts.replace_np560_mp3_sample import update as replace_mp3_track
 
 
 class Volume:
@@ -73,6 +75,27 @@ class NandFileTests(unittest.TestCase):
         self.assertEqual(volume.fats[0], volume.fats[1])
         files.import_file("/游戏", "新曲.MP3", b"new" * 300)
         self.assertEqual(files.read_file("/游戏/新曲.MP3"), b"new" * 300)
+
+    def test_replace_mp3_track_updates_crc_and_removes_old_file(self):
+        volume = Volume()
+        volume.sectors[2][:32] = directory_entry(encode_short_name("MP3"), 0x10, 2)
+        files = FatFiles(volume)
+        files.import_file("/MP3", "旧曲.MP3", b"old")
+        files.import_file("/MP3", "新曲.MP3", b"new")
+        playlist = bytearray(3074)
+        playlist[4:6] = b"\1\2"
+        playlist[6:6 + len(b"0:\\MP3\\" + "旧曲.MP3".encode("gb18030"))] = (
+            b"0:\\MP3\\" + "旧曲.MP3".encode("gb18030"))
+        playlist[-2:] = binascii.crc_hqx(playlist[:-2], 0).to_bytes(2, "big")
+        files.import_file("/MP3", "PLAYLIST.LST", bytes(playlist))
+        replace_mp3_track(files, "旧曲.MP3", "新曲.MP3", b"new")
+        self.assertEqual(files.read_file("/MP3/新曲.MP3"), b"new")
+        with self.assertRaises(FileNotFoundError):
+            files.read_file("/MP3/旧曲.MP3")
+        result = files.read_file("/MP3/PLAYLIST.LST")
+        self.assertIn("新曲.MP3".encode("gb18030"), result)
+        self.assertEqual(int.from_bytes(result[-2:], "big"),
+                         binascii.crc_hqx(result[:-2], 0))
 
     def test_rehash_matches_reference_fnv(self):
         def fnv(data):

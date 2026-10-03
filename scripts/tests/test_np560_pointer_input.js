@@ -25,6 +25,7 @@ function fixture() {
     pointerPressReady: new Map(),
     pointerReleasePending: new Set(),
     matrixIndexes: { ArrowRight: 29 },
+    enableAudioOnFirstGesture() {},
     keyRequestQueue: Promise.resolve({ applied: true }),
     setTimeout(fn, delay) {
       const id = ++nextTimer;

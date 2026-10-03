@@ -354,4 +354,37 @@ console.log("Web PCM: suspended clock discards queued sound and resumes from liv
   assert.equal(wired.enabled, false);
   assert.equal(button.textContent, '启用声音');
   console.log('Web PCM: actual UI follows external closure and supports re-enable');
+
+  const autoCalls = [];
+  const autoHandlers = {};
+  const autoButton = {disabled: false, textContent: '启用声音',
+    addEventListener: (name, fn) => {autoHandlers[name] = fn;},
+    setAttribute() {}};
+  class AutoOutput {
+    constructor(options) {this.options = options; this.enabled = false;}
+    start() {
+      autoCalls.push('start');
+      this.enabled = true;
+      this.options.onEnabledChange(true);
+      return Promise.resolve();
+    }
+    stop() {
+      autoCalls.push('stop');
+      this.enabled = false;
+      this.options.onEnabledChange(false);
+    }
+  }
+  const autoContext = {NP560AudioOutput: {AudioOutput: AutoOutput},
+    document: {getElementById: id => id === 'audio-toggle' ? autoButton : status},
+    window: {addEventListener() {}}};
+  vm.runInNewContext(app.slice(app.indexOf('const audioToggle ='),
+    app.indexOf('const { KeyboardMatrixController')), autoContext);
+  autoContext.enableAudioOnFirstGesture();
+  assert.deepEqual(autoCalls, ['start']);
+  await Promise.resolve();
+  await autoHandlers.click();
+  assert.deepEqual(autoCalls, ['start', 'stop']);
+  autoContext.enableAudioOnFirstGesture();
+  assert.deepEqual(autoCalls, ['start', 'stop'], 'manual mute must prevent re-enabling');
+  console.log('Web PCM: first user gesture enables once; manual mute stays off');
 })().catch(error => { console.error(error); process.exitCode = 1; });

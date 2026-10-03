@@ -53,7 +53,8 @@
       const context = new this.AudioContextClass();
       this.context = context;
       try {
-        // Called only from the user's enable button, never during page load.
+        // Called from a user gesture (Run, a device key or the sound button),
+        // never during page load.
         await context.resume();
         if (serial !== this.serial) {
           if (context.state !== "closed") await context.close();

@@ -1,25 +1,28 @@
 # NP560+ 发布流程
 
-根目录 `.github/workflows/release.yml` 在 `master` 推送和 PR 时运行两组
-不依赖私有固件的源码测试；推送 `v*` tag 时先运行同样测试。成功后，
-CI 从本仓库私有 `v0.1.0` Release 下载已核对的 V3.80 `NP560.PRG`，
-校验其 SHA-256，再从 tag 对应的源码重建并校验 `resident.bin`，创建
-Release 并附上 `NP560.PRG`、`resident.bin` 和其 `manifest.json`。
-已有同名 Release 时保留描述；同名三项资产在重跑时会更新。`v0.*` 标为预发布。
+`v*` tag 触发 `.github/workflows/release.yml`：Ubuntu 运行源码测试；
+Windows 2022/MSYS2 UCRT64 从 tag 源码编译 `qemu-system-dmcu.exe`，
+收集其非系统 DLL 和经过 SHA-256 校验的 Python 3.12.10 嵌入式运行时，
+生成 `np560-windows-x64.zip`。发布任务等待两项工作成功，再将模拟器包上传
+到对应的私有 GitHub Release。`master` 推送和 PR 只运行不依赖镜像的源码测试。
 
-CI **不会自动生成或上传 NAND**：512 MiB 原厂系统及游戏检查点不在 Git 仓库，
-打 tag 本身也不会重现游戏导入和整机验收。NAND 必须在本地单独校验、冷启动，
-然后将获准分发的资产用 `gh release upload TAG FILE` 附到私有 Release，
-并在说明中写明 SHA-256、来源及功能边界。不要把 NAND 放进 Git 历史，
-也不要把 HLE 重建镜像称为原厂 mask-ROM 转储。
+同一发布任务从私有 `v0.1.0` Release 下载已校验的原厂 V3.80
+`NP560.PRG`，重建并校验 `resident.bin`，上传这两项和构建清单。
+当前 PRG SHA-256：`d555609e03ece17f42c1881beeb88361572f18621161de67bc9dc765857089f5`；
+resident SHA-256：`18cca3e8bc6f9512ae017935c37d5241b268a83a45920255f8054228bfcb260a`。
+Python 嵌入包固定为 3.12.10，SHA-256：
+`4acbed6dd1c744b0376e3b1cf57ce906f9dc9e95e68824584c8099a63025a3c3`。
 
-源码中有 QEMU 硬件实现、可重建 guest ROM 的工具、原厂 PRG 可复用代码的
-提取/组合规则及缺失 01/02 服务的 HLE 实现；但没有完整原厂 mask-ROM
-字节。`scripts/build_np560_player_rom.py` 仍需原厂 `NP560.PRG` 作为输入，
-并非纯源码编译。当前私有 Release 将三个运行映像分别保存；其中 PRG 是
-固定原厂输入，resident ROM/HLE 是派生构建产物，NAND 是独立的存储检查点。
-不要将三者合并冒充真机单一 NAND；也不能由此声称完整原厂升级/恢复功能。
+完整 `system.nand` 是本地运行设备的独立数据/OOB 检查点，不能由源码 CI
+重新构造；打 tag 后需要在本地停机导出，核对 FAT 目录和 SHA-256，手动上传到
+同一 Release。不可直接复制运行中的基础镜像而遗漏 `.npj` 增量日志。
+发布页应列出 NAND 的 SHA-256、内容和来源。镜像不加入 Git 历史。
 
-2026-10-02 从该本地 V3.80 PRG 独立重建一次，输出 `resident.bin` 的
-SHA-256 为 `18cca3e8bc6f9512ae017935c37d5241b268a83a45920255f8054228bfcb260a`，
-与当前试玩设备所用包逐字节一致；这验证可重建性，不改变上述来源限制。
+最终用户下载四项即可在 Windows x64 运行：模拟器 ZIP、`NP560.PRG`、
+`resident.bin`、`system.nand`。后三项放进解压后 `images/`，双击
+`Start-NP560.cmd`；设备配置和 NAND 增量写入保留在 `device/`。
+这些是三种不同用途的镜像，不能合并为一个 NAND。
+
+源码包含 QEMU 硬件实现、原厂 PRG 可复用代码的提取/组合规则以及缺失
+01/02 resident 服务的 HLE；`resident.bin` 不是完整原厂 mask-ROM 转储。
+原厂 USB 升级/恢复全流程、全部游戏兼容性、异常断电和一致整机快照尚未完成。

@@ -25,7 +25,21 @@ const audioOutput = new NP560AudioOutput.AudioOutput({
     audioToggle.setAttribute("aria-pressed", String(enabled));
   }
 });
+let autoAudioOnNextGesture = true;
+function enableAudioOnFirstGesture() {
+  if (!autoAudioOnNextGesture || audioOutput.enabled) return;
+  autoAudioOnNextGesture = false;
+  audioToggle.disabled = true;
+  // start() creates/resumes AudioContext before its first await. Invoke it
+  // directly from the click/keydown handler, not after a control API request.
+  void audioOutput.start().catch(error => {
+    audioStatus.textContent = `声音不可用：${error.message}；可点“启用声音”重试`;
+  }).finally(() => {
+    audioToggle.disabled = typeof filesOffline !== "undefined" && filesOffline;
+  });
+}
 audioToggle.addEventListener("click", async () => {
+  autoAudioOnNextGesture = false;
   audioToggle.disabled = true;
   try {
     if (audioOutput.enabled) audioOutput.stop();
@@ -33,7 +47,7 @@ audioToggle.addEventListener("click", async () => {
   } catch (error) {
     audioStatus.textContent = `声音不可用：${error.message}`;
   } finally {
-    audioToggle.disabled = false;
+    audioToggle.disabled = typeof filesOffline !== "undefined" && filesOffline;
   }
 });
 window.addEventListener("pagehide", () => audioOutput.stop());
@@ -744,6 +758,7 @@ function bindKeyButton(button) {
   button.addEventListener("pointerup", release);
   button.addEventListener("pointercancel", release);
   button.addEventListener("lostpointercapture", release);
+  button.addEventListener("click", enableAudioOnFirstGesture);
 }
 
 const homeTabs = [...document.querySelectorAll('.home-tabs [role="tab"]')];
@@ -811,6 +826,7 @@ async function openFilesTab() {
     setFileMessage("正在暂停模拟器并导出完整 NAND，请勿关闭页面…");
     releaseAllKeys(false);
     await keyRequestQueue.catch(() => {});
+    autoAudioOnNextGesture ||= audioOutput.enabled;
     audioOutput.stop();
     setFilesOffline(true);
     await api("/api/files/open", { method: "POST", body: "" });
@@ -824,6 +840,7 @@ async function openFilesTab() {
 }
 async function resumeFromFiles() {
   if (!filesOffline) return true;
+  enableAudioOnFirstGesture();
   filesBusy = true;
   setFileMessage("正在保存设备配置并重新开机…");
   try {
@@ -920,6 +937,7 @@ document.getElementById("page-next").addEventListener("click", () => {
   document.getElementById("base").value = `0x${Math.min(0xffffff, settings.base + 0x1000).toString(16)}`; applySettings();
 });
 document.querySelectorAll("[data-action]").forEach(button => button.addEventListener("click", async () => {
+  if (button.dataset.action === "resume") enableAudioOnFirstGesture();
   try { await api("/api/control", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: button.dataset.action }) }); }
   catch (error) { statusText.textContent = error.message; }
 }));
@@ -967,6 +985,7 @@ window.addEventListener("keydown", event => {
   if (!keyboardInput.isMapped(code)) return;
   event.preventDefault();
   if (event.repeat) return;
+  enableAudioOnFirstGesture();
   keyboardContact.press(keyboardSource(event), code, keyboardShortTap?.checked ? 150 : 0);
 });
 window.addEventListener("keyup", event => {

@@ -36,6 +36,7 @@ const document = {
 const sandbox = vm.createContext({
   Element, keyboardInput: input, normalizeKeyboardEvent, document,
   filesConfirmDialog,
+  enableAudioOnFirstGesture() {},
   keyRequestQueue: Promise.resolve(), performance: { now: () => now },
   setTimeout(fn, delay) {
     assert.ok(this === undefined || this === sandbox, 'timer called with foreign receiver');

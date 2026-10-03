@@ -29,14 +29,50 @@ jobs:
       - name: Browser input test
         run: node scripts/tests/test_np560_pointer_input.js
 
+  windows-build:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v5
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-glib2
+            mingw-w64-ucrt-x86_64-pixman
+            mingw-w64-ucrt-x86_64-zlib
+            mingw-w64-ucrt-x86_64-meson
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-python-distlib
+            mingw-w64-ucrt-x86_64-python-packaging
+            mingw-w64-ucrt-x86_64-pkgconf
+      - name: Compile native Windows emulator
+        shell: pwsh
+        run: ./scripts/build_np560_windows.ps1 -BuildDir "$env:RUNNER_TEMP/np560-build" -Jobs 4
+      - name: Package self-contained Windows emulator
+        shell: pwsh
+        run: ./scripts/package_np560_windows.ps1 -Qemu "$env:RUNNER_TEMP/np560-build/qemu-system-dmcu.exe" -OutputDir "$env:RUNNER_TEMP/np560-package"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: np560-windows-x64
+          path: ${{ runner.temp }}/np560-package/np560-windows-x64.zip
+          if-no-files-found: error
+
   publish:
-    needs: source-smoke
+    needs: [source-smoke, windows-build]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: np560-windows-x64
+          path: ${{ runner.temp }}/np560-emulator
       # The private v0.1.0 release holds the reviewed vendor PRG. It is not
       # checked into Git; resident.bin cannot be rebuilt from source alone.
       - name: Fetch and verify V3.80 program image
@@ -74,6 +110,7 @@ jobs:
               --verify-tag --title "$tag" --generate-notes "${options[@]}"
           fi
           gh release upload "$tag" --repo "$GITHUB_REPOSITORY" \
+            "$RUNNER_TEMP/np560-emulator/np560-windows-x64.zip" \
             "$RUNNER_TEMP/np560-firmware/NP560.PRG" \
             "$RUNNER_TEMP/np560-resident/resident.bin" \
             "$RUNNER_TEMP/np560-resident/manifest.json" \
