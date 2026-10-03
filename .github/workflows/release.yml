@@ -36,6 +36,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: msys2/setup-msys2@v2
+        id: msys2
         with:
           msystem: UCRT64
           update: true
@@ -52,10 +53,10 @@ jobs:
             mingw-w64-ucrt-x86_64-pkgconf
       - name: Compile native Windows emulator
         shell: pwsh
-        run: ./scripts/build_np560_windows.ps1 -BuildDir "$env:RUNNER_TEMP/np560-build" -Jobs 4
+        run: ./scripts/build_np560_windows.ps1 -BuildDir "$env:RUNNER_TEMP/np560-build" -MsysRoot '${{ steps.msys2.outputs.msys2-location }}' -Jobs 4
       - name: Package self-contained Windows emulator
         shell: pwsh
-        run: ./scripts/package_np560_windows.ps1 -Qemu "$env:RUNNER_TEMP/np560-build/qemu-system-dmcu.exe" -OutputDir "$env:RUNNER_TEMP/np560-package"
+        run: ./scripts/package_np560_windows.ps1 -Qemu "$env:RUNNER_TEMP/np560-build/qemu-system-dmcu.exe" -OutputDir "$env:RUNNER_TEMP/np560-package" -MsysRoot '${{ steps.msys2.outputs.msys2-location }}'
       - uses: actions/upload-artifact@v4
         with:
           name: np560-windows-x64
