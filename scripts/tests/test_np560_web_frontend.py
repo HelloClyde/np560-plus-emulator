@@ -362,7 +362,7 @@ context.openFilesTab().then(result => {
             "PageDown": 0x83,
             "Tab": 0x83,
             "ArrowLeft": 0x80,
-            "Escape": 0x84,
+            "Escape": 0x8E,
             "Backspace": 0x84,
             "ArrowRight": 0x81,
             "Enter": 0x86,
@@ -375,7 +375,10 @@ context.openFilesTab().then(result => {
 
         self.assertEqual(tables[0][mapping[","]], ord(","))
         self.assertEqual(tables[0][mapping["."]], ord("."))
-        self.assertEqual(mapping["'"], mapping["Escape"])
+        self.assertEqual(mapping["Escape"], 4)
+        self.assertEqual(mapping["'"], 28)
+        self.assertIn('add("Escape", "返回"', self.javascript)
+        self.assertIn('data-key="Escape">返回', self.html)
         self.assertEqual([table[mapping["'"]] for table in tables],
                          [ord("'"), 0x84, 0x84])
         self.assertEqual(tables[1][mapping[" "]], ord(" "))
@@ -388,7 +391,7 @@ context.openFilesTab().then(result => {
                 0x102: (1 << 2, 45, 0x80),
                 0x103: (1 << 3, 29, 0x81),
                 0x104: (1 << 4, 53, 0x86),
-                0x105: (1 << 5, 28, 0x84),
+                0x105: (1 << 5, 4, 0x8E),
                 0x106: (1 << 6, 28, 0x84)}.items():
             self.assertEqual(matrix_key(raw), expected)
         core = (ROOT / "qemu-dmcu/hw/dmcu/np560.c").read_text(encoding="utf-8")

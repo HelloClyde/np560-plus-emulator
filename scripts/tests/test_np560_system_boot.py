@@ -207,8 +207,10 @@ def matrix_key(raw_event: int) -> tuple[int, int, int]:
         return 1 << 1, 37, 0x83
     if raw_event == 0x102:
         return 1 << 2, 45, 0x80
-    if raw_event in (0x105, 0x106):
-        return 1 << (raw_event - 0x100), 28, 0x84
+    if raw_event == 0x105:
+        return 1 << 5, 4, 0x8E
+    if raw_event == 0x106:
+        return 1 << 6, 28, 0x84
     if raw_event == 0x103:
         return 1 << 3, 29, 0x81
     if raw_event == 0x104:
