@@ -24,7 +24,7 @@ class Element {
   closest() { return this.control ? this : null; }
 }
 const input = new KeyboardMatrixController({
-  matrixIndexes: { A: 1, ArrowRight: 29, Enter: 53, "1": 2, ".": 54, "'": 28, Escape: 28 },
+  matrixIndexes: { A: 1, ArrowRight: 29, Enter: 53, "1": 2, ".": 54, "'": 28, Escape: 4 },
   keyBits: { ArrowRight: 3, Enter: 4 },
   sendPayload: packet => packets.push(packet),
 });
@@ -98,14 +98,14 @@ fire("keyup", { target: new Element(true), ctrlKey: true, isComposing: true });
 assert.equal(input.hasHeldKeys(), false);
 assert.equal(packets.at(-1).matrix_low, 0);
 
-// Distinct PC sources can hold the same switch without premature release.
+// Quote and Escape drive separate switches and can be released independently.
 for (const key of ["'", '"']) {
-  const before = packets.length;
   fire("keydown", { code: "Quote", key });
   assert.equal(packets.at(-1).matrix_low, 1 << 28);
   fire("keydown", { code: "Escape", key: "Escape" });
+  assert.equal(packets.at(-1).matrix_low, (1 << 28) | (1 << 4));
   fire("keyup", { code: "Quote", key });
-  assert.equal(packets.length, before + 1, "alias must preserve held M28");
+  assert.equal(packets.at(-1).matrix_low, 1 << 4);
   fire("keyup", { code: "Escape", key: "Escape" });
   assert.equal(packets.at(-1).matrix_low, 0);
 }

@@ -9006,9 +9006,10 @@ static uint16_t np560_keyboard_event(uint32_t raw)
     case 0x10d: /* page down */
         return 0x0083;
     case 0x102: /* left */
-    case 0x105: /* escape */
     case 0x106: /* backspace */
         return 0x0084;
+    case 0x105: /* escape */
+        return 0x008e;
     case 0x103: /* right */
     case 0x104: /* enter */
         return 0x0085;
@@ -9116,7 +9117,7 @@ static uint16_t np560_key_matrix_input(const NP560MachineState *s,
      * left/right are M45/M29, not the old back/comma guesses M28/M20.
      * Function-key labels are host shortcuts, not claimed physical names. */
     static const uint8_t legacy_matrix_indexes[16] = {
-        61, 37, 45, 29, 53, 28, 28, 37,
+        61, 37, 45, 29, 53, 4, 28, 37,
         60, 52, 44, 4, 61, 37, 54, 55,
     };
 

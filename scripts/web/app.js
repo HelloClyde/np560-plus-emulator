@@ -85,9 +85,9 @@ const matrixIndexes = {
   StartMenu: 55,
   ArrowUp: 61, PageUp: 61,
   ArrowDown: 37, PageDown: 37, Tab: 37,
-  // Live NPE-game execution proves the four-way pad uses the dedicated
-  // 0x80..0x83 event group.  Escape/Backspace remain the separate 0x84 key.
-  ArrowLeft: 45, Escape: 28, Backspace: 28,
+  // Esc and the skin's 返回 key use M04 (0x8E). M28 (0x84) selects
+  // the previous entry in a dictionary definition.
+  ArrowLeft: 45, Escape: 4, Backspace: 28,
   ArrowRight: 29, Enter: 53
 };
 // Raw switches expose the complete hardware matrix without inventing names
